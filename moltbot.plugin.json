@@ -1,0 +1,42 @@
+{
+  "id": "remoteclaw-gateway",
+  "name": "RemoteClaw Gateway",
+  "version": "0.1.0",
+  "description": "Gateway plugin for RemoteClaw — providers, rate limits, and voice endpoints",
+  "author": "Joseph Kim",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "proxyPort": {
+        "type": "number",
+        "default": 18793,
+        "description": "Port for rate-limit capture proxy"
+      },
+      "providers": {
+        "type": "object",
+        "description": "Per-provider billing config (e.g. { anthropic: { billing: 'subscription', plan: 'Max Pro', monthlyPrice: 200 } })"
+      },
+      "voice": {
+        "type": "object",
+        "description": "Voice configuration for STT/TTS",
+        "properties": {
+          "stt": {
+            "type": "object",
+            "properties": {
+              "provider": { "type": "string", "default": "openai" },
+              "model": { "type": "string", "default": "whisper-1" }
+            }
+          },
+          "tts": {
+            "type": "object",
+            "properties": {
+              "provider": { "type": "string", "default": "openai" },
+              "model": { "type": "string", "default": "tts-1" },
+              "defaultVoice": { "type": "string", "default": "nova" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

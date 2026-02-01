@@ -1,0 +1,25 @@
+{
+  "name": "@jokim1/remoteclaw-gateway",
+  "version": "0.1.0",
+  "description": "Moltbot gateway plugin for RemoteClaw — providers, rate limits, and voice",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "keywords": ["moltbot", "remoteclaw", "gateway", "plugin", "voice", "tts", "stt"],
+  "author": "Joseph Kim",
+  "license": "MIT",
+  "dependencies": {
+    "busboy": "^1.6.0"
+  },
+  "devDependencies": {
+    "@types/busboy": "^1.5.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
