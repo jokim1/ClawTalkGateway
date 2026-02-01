@@ -16,6 +16,11 @@ import { getProxyCachedLimits } from './proxy.js';
 // Usage loader — uses moltbot internals for rate-limit data
 // ---------------------------------------------------------------------------
 
+// Prevent TypeScript from downcompiling import() to require(), which cannot
+// handle file:// URLs or load ESM modules from a CJS context.
+const dynamicImport = new Function('specifier', 'return import(specifier)') as
+  (specifier: string) => Promise<any>;
+
 let _loadUsage: ((opts?: any) => Promise<UsageSummary>) | null = null;
 
 function findMoltbotRoot(): string | null {
@@ -41,7 +46,7 @@ async function ensureUsageLoader(log: Logger): Promise<typeof _loadUsage> {
   }
 
   try {
-    const mod = await import(
+    const mod = await dynamicImport(
       pathToFileURL(`${root}/dist/infra/provider-usage.load.js`).href
     );
     if (typeof mod.loadProviderUsageSummary === 'function') {
@@ -55,7 +60,7 @@ async function ensureUsageLoader(log: Logger): Promise<typeof _loadUsage> {
   }
 
   try {
-    const mod = await import(
+    const mod = await dynamicImport(
       pathToFileURL(`${root}/dist/infra/provider-usage.js`).href
     );
     if (typeof mod.loadProviderUsageSummary === 'function') {
