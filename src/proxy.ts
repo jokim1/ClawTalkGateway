@@ -170,11 +170,17 @@ export function startProxy(
     });
   }
 
+  // unref() so the proxy doesn't prevent the process from exiting during
+  // short-lived CLI commands (e.g. `moltbot gateway stop/status`).  The
+  // gateway's own HTTP server keeps the event loop alive during normal
+  // operation, so the proxy will still run as long as the gateway is up.
+  server.unref();
+
   server.on('error', (err: NodeJS.ErrnoException) => {
     if (err.code === 'EADDRINUSE' && retries < maxRetries) {
       retries++;
       logger.info(`RemoteClaw: port ${port} busy, retrying (${retries}/${maxRetries})...`);
-      setTimeout(tryListen, retryDelay);
+      setTimeout(tryListen, retryDelay).unref();
     } else {
       logger.error(`RemoteClaw: proxy server error: ${err.message}`);
     }
