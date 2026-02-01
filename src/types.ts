@@ -6,6 +6,13 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
+export interface Logger {
+  info: (msg: string) => void;
+  warn: (msg: string) => void;
+  error: (msg: string) => void;
+  debug: (msg: string) => void;
+}
+
 export interface PluginApi {
   id: string;
   config: Record<string, any>;
@@ -15,15 +22,19 @@ export interface PluginApi {
       loadConfig: () => Record<string, any>;
     };
   };
-  logger: {
-    info: (msg: string) => void;
-    warn: (msg: string) => void;
-    error: (msg: string) => void;
-    debug: (msg: string) => void;
-  };
+  logger: Logger;
   registerHttpHandler: (
     handler: (req: IncomingMessage, res: ServerResponse) => Promise<boolean>
   ) => void;
+}
+
+export interface HandlerContext {
+  req: IncomingMessage;
+  res: ServerResponse;
+  url: URL;
+  cfg: Record<string, any>;
+  pluginCfg: RemoteClawPluginConfig;
+  logger: Logger;
 }
 
 export interface ProviderBillingConfig {
@@ -45,6 +56,7 @@ export interface VoicePluginConfig {
 }
 
 export interface RemoteClawPluginConfig {
+  proxyPort?: number;
   providers?: Record<string, ProviderBillingConfig>;
   voice?: VoicePluginConfig;
 }

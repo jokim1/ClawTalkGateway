@@ -1,7 +1,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import { URL } from 'node:url';
-import type { CachedRateLimitData } from './types.js';
+import type { CachedRateLimitData, Logger } from './types.js';
 
 // ---------------------------------------------------------------------------
 // In-memory rate-limit cache (singleton across plugin reloads)
@@ -80,13 +80,6 @@ export function getProxyCachedLimits(provider: string): CachedRateLimitData | nu
 // ---------------------------------------------------------------------------
 // Proxy server
 // ---------------------------------------------------------------------------
-
-interface Logger {
-  info: (msg: string) => void;
-  warn: (msg: string) => void;
-  error: (msg: string) => void;
-  debug: (msg: string) => void;
-}
 
 export function startProxy(
   port: number,
