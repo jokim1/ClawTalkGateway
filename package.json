@@ -1,5 +1,5 @@
 {
-  "name": "@jokim1/remoteclaw-gateway",
+  "name": "@jokim1/remoteclaw",
   "version": "0.1.0",
   "description": "Moltbot gateway plugin for RemoteClaw — providers, rate limits, and voice",
   "main": "dist/index.js",
@@ -7,6 +7,9 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch"
+  },
+  "moltbot": {
+    "extensions": ["./dist/index.js"]
   },
   "keywords": ["moltbot", "remoteclaw", "gateway", "plugin", "voice", "tts", "stt"],
   "author": "Joseph Kim",

@@ -13,7 +13,9 @@ import type {
   RemoteClawPluginConfig,
   UsageSummary,
   ProviderUsageSnapshot,
+  CachedRateLimitData,
 } from './types.js';
+import { startProxy, getProxyCachedLimits } from './proxy.js';
 
 // ============================================================================
 // Helpers
@@ -260,6 +262,39 @@ function formatSnapshot(snapshot: ProviderUsageSnapshot): Record<string, any> {
 }
 
 // ============================================================================
+// Format proxy-cached rate-limit data
+// ============================================================================
+
+function formatCachedLimits(cached: CachedRateLimitData): Record<string, any> {
+  const result: Record<string, any> = {
+    provider: cached.provider,
+    status: cached.status,
+  };
+
+  if (cached.fiveHour) {
+    result.fiveHour = {
+      utilization: cached.fiveHour.utilization,
+      usedPercent: Math.round(cached.fiveHour.utilization * 100),
+      resetsAt: cached.fiveHour.resetsAt,
+      status: cached.fiveHour.status,
+    };
+  }
+
+  if (cached.sevenDay) {
+    result.sevenDay = {
+      utilization: cached.sevenDay.utilization,
+      usedPercent: Math.round(cached.sevenDay.utilization * 100),
+      resetsAt: cached.sevenDay.resetsAt,
+      status: cached.sevenDay.status,
+    };
+  }
+
+  result.lastUpdated = cached.lastUpdated;
+  result.source = 'proxy';
+  return result;
+}
+
+// ============================================================================
 // Voice helpers
 // ============================================================================
 
@@ -400,6 +435,10 @@ const plugin = {
 
     api.logger.info('RemoteClaw plugin loaded');
 
+    // Start the rate-limit capture proxy
+    const proxyPort = (pluginCfg as any).proxyPort ?? 18793;
+    const proxy = startProxy(proxyPort, api.logger);
+
     // Eagerly warm up the usage loader in background
     ensureUsageLoader(api.logger).catch(() => {});
 
@@ -486,40 +525,73 @@ const plugin = {
         if (path === '/api/rate-limits' && req.method === 'GET') {
           const providerFilter = url.searchParams.get('provider') ?? undefined;
 
+          // Try the moltbot usage loader first
+          let usedProxyFallback = false;
           const loader = await ensureUsageLoader(api.logger);
-          if (!loader) {
-            sendJson(res, 200, { error: 'usage_loader_unavailable' });
+
+          if (loader) {
+            try {
+              const summary = await loader();
+              const snapshots = summary.providers ?? [];
+
+              const filtered = providerFilter
+                ? snapshots.filter(
+                    (s) =>
+                      s.provider.toLowerCase() === providerFilter.toLowerCase()
+                  )
+                : snapshots;
+
+              // Check if filtered results have errors — if so, try proxy fallback
+              const hasErrors = filtered.some((s) => !!s.error);
+              if (filtered.length > 0 && !hasErrors) {
+                if (providerFilter && filtered.length === 1) {
+                  sendJson(res, 200, formatSnapshot(filtered[0]!));
+                  return true;
+                }
+                sendJson(res, 200, {
+                  rateLimits: filtered.map(formatSnapshot),
+                });
+                return true;
+              }
+
+              // If we got results with errors, fall through to proxy cache
+              if (hasErrors) {
+                usedProxyFallback = true;
+              }
+            } catch (err) {
+              api.logger.warn(`RemoteClaw: usage loader error: ${String(err)}`);
+              usedProxyFallback = true;
+            }
+          } else {
+            usedProxyFallback = true;
+          }
+
+          // Fallback: use proxy-captured rate-limit headers
+          if (usedProxyFallback) {
+            if (providerFilter) {
+              const cached = getProxyCachedLimits(providerFilter);
+              if (cached) {
+                sendJson(res, 200, formatCachedLimits(cached));
+                return true;
+              }
+              sendJson(res, 200, { provider: providerFilter });
+              return true;
+            }
+
+            // No filter — return all cached providers
+            const anthropicCached = getProxyCachedLimits('anthropic');
+            if (anthropicCached) {
+              sendJson(res, 200, {
+                rateLimits: [formatCachedLimits(anthropicCached)],
+              });
+              return true;
+            }
+
+            sendJson(res, 200, {});
             return true;
           }
 
-          try {
-            const summary = await loader();
-            const snapshots = summary.providers ?? [];
-
-            const filtered = providerFilter
-              ? snapshots.filter(
-                  (s) =>
-                    s.provider.toLowerCase() === providerFilter.toLowerCase()
-                )
-              : snapshots;
-
-            if (filtered.length === 0) {
-              sendJson(res, 200, {});
-              return true;
-            }
-
-            if (providerFilter && filtered.length === 1) {
-              sendJson(res, 200, formatSnapshot(filtered[0]!));
-              return true;
-            }
-
-            sendJson(res, 200, {
-              rateLimits: filtered.map(formatSnapshot),
-            });
-          } catch (err) {
-            api.logger.warn(`RemoteClaw: rate-limits fetch error: ${String(err)}`);
-            sendJson(res, 200, {});
-          }
+          sendJson(res, 200, {});
           return true;
         }
 

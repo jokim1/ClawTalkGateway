@@ -67,4 +67,18 @@ export interface UsageSummary {
   providers: ProviderUsageSnapshot[];
 }
 
+export interface RateLimitWindow {
+  utilization: number; // 0–1 fraction
+  resetsAt: number;    // Unix timestamp (seconds)
+  status: string;      // "allowed" | "rate_limited"
+}
+
+export interface CachedRateLimitData {
+  provider: string;
+  status?: string;               // overall unified status
+  fiveHour?: RateLimitWindow;
+  sevenDay?: RateLimitWindow;
+  lastUpdated: number;
+}
+
 export type { IncomingMessage, ServerResponse };

@@ -1,9 +1,16 @@
 {
   "id": "remoteclaw",
+  "name": "RemoteClaw Gateway",
+  "version": "0.1.0",
+  "description": "Exposes provider, rate-limit, and voice endpoints for RemoteClaw clients",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
     "properties": {
+      "proxyPort": {
+        "type": "number",
+        "default": 18793
+      },
       "providers": {
         "type": "object",
         "additionalProperties": {
