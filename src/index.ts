@@ -11,6 +11,7 @@ import {
   handleVoiceSynthesize,
   resolveVoiceAvailability,
 } from './voice.js';
+import { handleVoiceStreamUpgrade } from './voice-stream.js';
 import { startProxy } from './proxy.js';
 
 const ROUTES = new Set([
@@ -20,6 +21,7 @@ const ROUTES = new Set([
   '/api/voice/capabilities',
   '/api/voice/transcribe',
   '/api/voice/synthesize',
+  '/api/voice/stream',
 ]);
 
 // ============================================================================
@@ -208,6 +210,18 @@ const plugin = {
           sendJson(res, 401, {
             error: { message: 'Unauthorized', type: 'unauthorized' },
           });
+          return true;
+        }
+
+        // WebSocket upgrade for voice streaming — handled separately
+        if (url.pathname === '/api/voice/stream') {
+          const host = req.headers.host ?? 'localhost:18789';
+          const gatewayOrigin = `http://${host}`;
+          const gatewayToken = resolveGatewayToken(cfg);
+          handleVoiceStreamUpgrade(
+            req, res, api.logger,
+            pluginCfg.voice, gatewayOrigin, gatewayToken,
+          );
           return true;
         }
 

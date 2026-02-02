@@ -50,7 +50,7 @@ function parseMultipart(
 // OpenAI STT / TTS
 // ---------------------------------------------------------------------------
 
-async function transcribeViaOpenAI(
+export async function transcribeViaOpenAI(
   audioBuffer: Buffer,
   language: string,
   model: string,
@@ -79,7 +79,7 @@ async function transcribeViaOpenAI(
   return await response.json() as { text: string; language?: string; duration?: number };
 }
 
-async function synthesizeViaOpenAI(
+export async function synthesizeViaOpenAI(
   text: string,
   voice: string,
   model: string,
