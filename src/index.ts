@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { execSync } from 'node:child_process';
 import type { PluginApi, RemoteClawPluginConfig } from './types.js';
 import { sendJson, readJsonBody, handleCors } from './http.js';
 import { authorize, resolveGatewayToken, safeEqual } from './auth.js';
@@ -53,6 +54,42 @@ rateLimitCleanup.unref();
 
 function resolvePairPassword(pluginCfg: RemoteClawPluginConfig): string | undefined {
   return pluginCfg.pairPassword ?? process.env.CLAWDBOT_PAIR_PASSWORD ?? undefined;
+}
+
+// ============================================================================
+// Tailscale Funnel auto-detection
+// ============================================================================
+
+let _cachedFunnelUrl: string | null | undefined; // undefined = not yet checked
+
+function detectTailscaleFunnelUrl(log: PluginApi['logger']): string | null {
+  if (_cachedFunnelUrl !== undefined) return _cachedFunnelUrl;
+
+  try {
+    const output = execSync('tailscale status --json', {
+      timeout: 5000,
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const status = JSON.parse(output);
+    const dnsName: string | undefined = status?.Self?.DNSName;
+    if (dnsName) {
+      // DNSName has a trailing dot (e.g. "host.tailnet.ts.net.") — strip it
+      const hostname = dnsName.replace(/\.$/, '');
+      if (hostname.includes('.')) {
+        const url = `https://${hostname}`;
+        log.info(`RemoteClaw: detected Tailscale hostname: ${url}`);
+        _cachedFunnelUrl = url;
+        return url;
+      }
+    }
+    log.info('RemoteClaw: no Tailscale DNS name found');
+  } catch (err) {
+    log.info(`RemoteClaw: Tailscale detection failed: ${err}`);
+  }
+
+  _cachedFunnelUrl = null;
+  return null;
 }
 
 // ============================================================================
@@ -139,10 +176,11 @@ const plugin = {
 
           let gatewayURL: string;
           let port: number;
-          if (pluginCfg.externalUrl) {
-            gatewayURL = pluginCfg.externalUrl;
+          const resolvedUrl = pluginCfg.externalUrl ?? detectTailscaleFunnelUrl(api.logger);
+          if (resolvedUrl) {
+            gatewayURL = resolvedUrl;
             try {
-              const parsed = new URL(pluginCfg.externalUrl);
+              const parsed = new URL(resolvedUrl);
               port = parsed.port ? parseInt(parsed.port, 10) : (parsed.protocol === 'https:' ? 443 : 80);
             } catch {
               port = 18789;
