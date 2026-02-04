@@ -41,6 +41,46 @@ interface ProviderSession {
 
 // Audio format constants (matches client expectations)
 const SAMPLE_RATE = 24000;
+const ELEVENLABS_SAMPLE_RATE = 16000;
+
+// ---------------------------------------------------------------------------
+// Audio resampling helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Resample PCM16 audio from one sample rate to another using linear interpolation.
+ * Input and output are 16-bit signed integers (little-endian).
+ */
+function resamplePCM(input: Buffer, fromRate: number, toRate: number): Buffer {
+  if (fromRate === toRate) return input;
+
+  const ratio = fromRate / toRate;
+  const inputSamples = input.length / 2;
+  const outputSamples = Math.floor(inputSamples / ratio);
+  const output = Buffer.alloc(outputSamples * 2);
+
+  for (let i = 0; i < outputSamples; i++) {
+    const srcIndex = i * ratio;
+    const srcIndexFloor = Math.floor(srcIndex);
+    const srcIndexCeil = Math.min(srcIndexFloor + 1, inputSamples - 1);
+    const frac = srcIndex - srcIndexFloor;
+
+    const sample1 = input.readInt16LE(srcIndexFloor * 2);
+    const sample2 = input.readInt16LE(srcIndexCeil * 2);
+    const interpolated = Math.round(sample1 + (sample2 - sample1) * frac);
+
+    output.writeInt16LE(Math.max(-32768, Math.min(32767, interpolated)), i * 2);
+  }
+
+  return output;
+}
+
+/**
+ * Resample PCM16 audio from 16kHz (ElevenLabs) to 24kHz (client).
+ */
+function upsampleTo24kHz(input: Buffer): Buffer {
+  return resamplePCM(input, ELEVENLABS_SAMPLE_RATE, SAMPLE_RATE);
+}
 
 // Provider-specific voices
 const PROVIDER_VOICES: Record<RealtimeVoiceProvider, string[]> = {
@@ -71,18 +111,22 @@ function getWSS(): WebSocketServer {
 function getAvailableProviders(): RealtimeVoiceProvider[] {
   const providers: RealtimeVoiceProvider[] = [];
 
+  // OpenAI Realtime API - single connection handles STT + LLM + TTS
   if (process.env.OPENAI_API_KEY) {
     providers.push('openai');
   }
-  if (process.env.CARTESIA_API_KEY) {
-    providers.push('cartesia');
-  }
-  if (process.env.ELEVENLABS_API_KEY) {
+
+  // ElevenLabs Conversational AI - requires both API key and agent ID
+  if (process.env.ELEVENLABS_API_KEY && process.env.ELEVENLABS_AGENT_ID) {
     providers.push('elevenlabs');
   }
-  if (process.env.DEEPGRAM_API_KEY) {
-    providers.push('deepgram');
+
+  // Cartesia for realtime requires both Cartesia (TTS) and Deepgram (STT)
+  if (process.env.CARTESIA_API_KEY && process.env.DEEPGRAM_API_KEY) {
+    providers.push('cartesia');
   }
+
+  // Gemini Live API
   if (process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY) {
     providers.push('gemini');
   }
@@ -91,9 +135,10 @@ function getAvailableProviders(): RealtimeVoiceProvider[] {
 }
 
 function getDefaultProvider(providers: RealtimeVoiceProvider[]): RealtimeVoiceProvider | undefined {
-  // Prefer Cartesia for realtime, then OpenAI
-  if (providers.includes('cartesia')) return 'cartesia';
+  // Prefer OpenAI for realtime (most complete solution)
   if (providers.includes('openai')) return 'openai';
+  if (providers.includes('elevenlabs')) return 'elevenlabs';
+  if (providers.includes('cartesia')) return 'cartesia';
   return providers[0];
 }
 
@@ -282,6 +327,9 @@ function sendJsonMsg(ws: WebSocket, msg: RealtimeServerMessage): void {
 // OpenAI Realtime message handling
 // ---------------------------------------------------------------------------
 
+// Track accumulated transcript for streaming
+let accumulatedAITranscript = '';
+
 function handleOpenAIMessage(
   data: string,
   clientWs: WebSocket,
@@ -292,35 +340,43 @@ function handleOpenAIMessage(
 
     switch (msg.type) {
       case 'session.created':
+        logger.info('RealtimeVoice: OpenAI session created');
         sendJsonMsg(clientWs, { type: 'session.start' });
         break;
 
+      case 'session.updated':
+        logger.debug?.('RealtimeVoice: OpenAI session updated');
+        break;
+
       case 'response.audio.delta':
-        // Forward audio to client
+        // Forward audio to client (already base64 PCM 24kHz 16-bit mono)
         if (msg.delta) {
           sendJsonMsg(clientWs, { type: 'audio', data: msg.delta });
         }
         break;
 
       case 'response.audio_transcript.delta':
-        // AI transcript update
+        // AI transcript update - accumulate for streaming display
+        accumulatedAITranscript += msg.delta || '';
         sendJsonMsg(clientWs, {
           type: 'transcript.ai',
-          text: msg.delta || '',
+          text: accumulatedAITranscript,
           isFinal: false,
         });
         break;
 
       case 'response.audio_transcript.done':
+        // Final AI transcript
         sendJsonMsg(clientWs, {
           type: 'transcript.ai',
-          text: msg.transcript || '',
+          text: msg.transcript || accumulatedAITranscript,
           isFinal: true,
         });
+        accumulatedAITranscript = '';
         break;
 
       case 'conversation.item.input_audio_transcription.completed':
-        // User transcript
+        // User transcript (final)
         sendJsonMsg(clientWs, {
           type: 'transcript.user',
           text: msg.transcript || '',
@@ -329,11 +385,29 @@ function handleOpenAIMessage(
         break;
 
       case 'input_audio_buffer.speech_started':
-        // User started speaking
+        // User started speaking - could send state update
+        logger.debug?.('RealtimeVoice: User speech started');
         break;
 
       case 'input_audio_buffer.speech_stopped':
         // User stopped speaking
+        logger.debug?.('RealtimeVoice: User speech stopped');
+        break;
+
+      case 'response.created':
+        // AI is about to respond
+        accumulatedAITranscript = '';
+        break;
+
+      case 'response.done':
+        // AI response complete
+        logger.debug?.('RealtimeVoice: Response complete');
+        break;
+
+      case 'response.cancelled':
+        // Response was cancelled (barge-in)
+        logger.info('RealtimeVoice: Response cancelled (barge-in)');
+        accumulatedAITranscript = '';
         break;
 
       case 'error':
@@ -343,9 +417,123 @@ function handleOpenAIMessage(
           message: msg.error?.message || 'OpenAI error',
         });
         break;
+
+      default:
+        // Log unknown events for debugging
+        logger.debug?.(`RealtimeVoice: Unhandled OpenAI event: ${msg.type}`);
     }
   } catch (err) {
     logger.error(`RealtimeVoice: failed to parse OpenAI message: ${err}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ElevenLabs Conversational AI
+// ---------------------------------------------------------------------------
+
+async function connectToElevenLabs(
+  clientWs: WebSocket,
+  logger: Logger,
+  _voice: string,
+  _systemPrompt: string | undefined,
+): Promise<ProviderSession | null> {
+  const apiKey = process.env.ELEVENLABS_API_KEY;
+  const agentId = process.env.ELEVENLABS_AGENT_ID;
+
+  if (!apiKey || !agentId) {
+    sendJsonMsg(clientWs, { type: 'error', message: 'ElevenLabs API key or Agent ID not configured' });
+    return null;
+  }
+
+  try {
+    // ElevenLabs Conversational AI WebSocket
+    const elevenWs = new WebSocket(
+      `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${agentId}`,
+      {
+        headers: {
+          'xi-api-key': apiKey,
+        },
+      }
+    );
+
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        elevenWs.close();
+        sendJsonMsg(clientWs, { type: 'error', message: 'ElevenLabs connection timeout' });
+        resolve(null);
+      }, 10000);
+
+      elevenWs.on('open', () => {
+        clearTimeout(timeout);
+        logger.info('RealtimeVoice: connected to ElevenLabs');
+
+        const session: ProviderSession = {
+          provider: 'elevenlabs',
+          ws: elevenWs,
+        };
+
+        resolve(session);
+      });
+
+      elevenWs.on('error', (err) => {
+        clearTimeout(timeout);
+        logger.error(`RealtimeVoice: ElevenLabs error: ${err.message}`);
+        sendJsonMsg(clientWs, { type: 'error', message: `ElevenLabs error: ${err.message}` });
+        resolve(null);
+      });
+    });
+  } catch (err) {
+    logger.error(`RealtimeVoice: failed to connect to ElevenLabs: ${err}`);
+    sendJsonMsg(clientWs, { type: 'error', message: 'Failed to connect to ElevenLabs' });
+    return null;
+  }
+}
+
+function handleElevenLabsMessage(
+  data: string | Buffer,
+  clientWs: WebSocket,
+  logger: Logger,
+): void {
+  try {
+    const msg = JSON.parse(data.toString());
+
+    // ElevenLabs message types
+    if (msg.audio) {
+      // Audio response chunk - ElevenLabs sends 16kHz, we need 24kHz
+      const audioBuffer16k = Buffer.from(msg.audio, 'base64');
+      const audioBuffer24k = upsampleTo24kHz(audioBuffer16k);
+      sendJsonMsg(clientWs, { type: 'audio', data: audioBuffer24k.toString('base64') });
+    }
+
+    if (msg.user_transcription) {
+      // User speech transcript
+      sendJsonMsg(clientWs, {
+        type: 'transcript.user',
+        text: msg.user_transcription,
+        isFinal: true,
+      });
+    }
+
+    if (msg.agent_response) {
+      // AI response transcript
+      sendJsonMsg(clientWs, {
+        type: 'transcript.ai',
+        text: msg.agent_response,
+        isFinal: msg.isFinal ?? true,
+      });
+    }
+
+    if (msg.type === 'conversation_initiation_metadata') {
+      // Session started
+      logger.info('RealtimeVoice: ElevenLabs session initialized');
+    }
+
+    if (msg.type === 'error') {
+      logger.error(`RealtimeVoice: ElevenLabs error: ${msg.message}`);
+      sendJsonMsg(clientWs, { type: 'error', message: msg.message });
+    }
+  } catch (err) {
+    logger.error(`RealtimeVoice: failed to parse ElevenLabs message: ${err}`);
   }
 }
 
@@ -446,6 +634,12 @@ export function handleRealtimeVoiceStreamUpgrade(
             );
             break;
 
+          case 'elevenlabs':
+            providerSession = await connectToElevenLabs(
+              clientWs, logger, msg.voice || 'rachel', msg.systemPrompt
+            );
+            break;
+
           case 'cartesia':
             providerSession = await connectToCartesia(
               clientWs, logger, msg.voice || 'sonic-english', msg.systemPrompt
@@ -467,6 +661,9 @@ export function handleRealtimeVoiceStreamUpgrade(
           switch (provider) {
             case 'openai':
               handleOpenAIMessage(providerData.toString(), clientWs, logger);
+              break;
+            case 'elevenlabs':
+              handleElevenLabsMessage(providerData, clientWs, logger);
               break;
             case 'cartesia':
               handleCartesiaMessage(providerData, clientWs, logger);
@@ -491,14 +688,22 @@ export function handleRealtimeVoiceStreamUpgrade(
 
       // Handle audio data
       if (msg.type === 'audio' && providerSession && msg.data) {
-        const audioBuffer = Buffer.from(msg.data, 'base64');
-
         switch (provider) {
           case 'openai':
             // Send audio to OpenAI in their expected format
             providerSession.ws.send(JSON.stringify({
               type: 'input_audio_buffer.append',
               audio: msg.data,  // Already base64
+            }));
+            break;
+
+          case 'elevenlabs':
+            // ElevenLabs expects 16kHz audio, our client sends 24kHz
+            // Resample from 24kHz to 16kHz (downsample by 2/3)
+            const audioBuffer24k = Buffer.from(msg.data, 'base64');
+            const resampledBuffer = resamplePCM(audioBuffer24k, 24000, 16000);
+            providerSession.ws.send(JSON.stringify({
+              user_audio_chunk: resampledBuffer.toString('base64'),
             }));
             break;
 
@@ -517,6 +722,12 @@ export function handleRealtimeVoiceStreamUpgrade(
           case 'openai':
             providerSession.ws.send(JSON.stringify({
               type: 'response.cancel',
+            }));
+            break;
+
+          case 'elevenlabs':
+            providerSession.ws.send(JSON.stringify({
+              type: 'interruption',
             }));
             break;
         }
