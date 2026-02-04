@@ -9,6 +9,8 @@ import {
   handleVoiceCapabilities,
   handleVoiceTranscribe,
   handleVoiceSynthesize,
+  handleSTTProviderSwitch,
+  handleTTSProviderSwitch,
   resolveVoiceAvailability,
 } from './voice.js';
 import { handleVoiceStreamUpgrade } from './voice-stream.js';
@@ -26,6 +28,8 @@ const ROUTES = new Set([
   '/api/voice/transcribe',
   '/api/voice/synthesize',
   '/api/voice/stream',
+  '/api/voice/stt/provider',
+  '/api/voice/tts/provider',
   '/api/realtime-voice/capabilities',
   '/api/realtime-voice/stream',
 ]);
@@ -257,6 +261,12 @@ const plugin = {
             break;
           case '/api/voice/synthesize':
             await handleVoiceSynthesize(ctx);
+            break;
+          case '/api/voice/stt/provider':
+            await handleSTTProviderSwitch(ctx);
+            break;
+          case '/api/voice/tts/provider':
+            await handleTTSProviderSwitch(ctx);
             break;
           case '/api/realtime-voice/capabilities':
             await handleRealtimeVoiceCapabilities(ctx);

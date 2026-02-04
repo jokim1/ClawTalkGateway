@@ -10,6 +10,7 @@ import { sendJson, readJsonBody } from './http.js';
 
 const OPENAI_TTS_VOICES = ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'];
 const CARTESIA_TTS_VOICES = ['sonic-english', 'sonic-multilingual'];
+const ELEVENLABS_TTS_VOICES = ['rachel', 'drew', 'clyde', 'paul', 'domi', 'dave', 'fin', 'sarah'];
 const MAX_FILE_SIZE = 25 * 1024 * 1024; // 25MB
 const MAX_TEXT_LENGTH = 4096;
 
@@ -18,6 +19,73 @@ const CARTESIA_VOICE_IDS: Record<string, string> = {
   'sonic-english': 'a0e99841-438c-4a64-b679-ae501e7d6091', // Example voice ID
   'sonic-multilingual': 'a0e99841-438c-4a64-b679-ae501e7d6091',
 };
+
+// Runtime state for active providers (can be switched via API)
+let activeSTTProvider: string | null = null;
+let activeTTSProvider: string | null = null;
+
+// Provider types
+export type STTProvider = 'openai' | 'deepgram' | 'groq';
+export type TTSProvider = 'openai' | 'cartesia' | 'elevenlabs';
+
+// Get available STT providers based on API keys
+function getAvailableSTTProviders(): STTProvider[] {
+  const providers: STTProvider[] = [];
+  if (process.env.OPENAI_API_KEY) providers.push('openai');
+  if (process.env.DEEPGRAM_API_KEY) providers.push('deepgram');
+  if (process.env.GROQ_API_KEY) providers.push('groq');
+  return providers;
+}
+
+// Get available TTS providers based on API keys
+function getAvailableTTSProviders(): TTSProvider[] {
+  const providers: TTSProvider[] = [];
+  if (process.env.OPENAI_API_KEY) providers.push('openai');
+  if (process.env.CARTESIA_API_KEY) providers.push('cartesia');
+  if (process.env.ELEVENLABS_API_KEY) providers.push('elevenlabs');
+  return providers;
+}
+
+// Get active STT provider (falls back to first available)
+export function getActiveSTTProvider(): STTProvider | null {
+  const available = getAvailableSTTProviders();
+  if (available.length === 0) return null;
+  if (activeSTTProvider && available.includes(activeSTTProvider as STTProvider)) {
+    return activeSTTProvider as STTProvider;
+  }
+  return available[0];
+}
+
+// Get active TTS provider (falls back to first available, preferring cartesia)
+export function getActiveTTSProvider(): TTSProvider | null {
+  const available = getAvailableTTSProviders();
+  if (available.length === 0) return null;
+  if (activeTTSProvider && available.includes(activeTTSProvider as TTSProvider)) {
+    return activeTTSProvider as TTSProvider;
+  }
+  // Prefer Cartesia if available
+  if (available.includes('cartesia')) return 'cartesia';
+  return available[0];
+}
+
+// Set active providers
+export function setActiveSTTProvider(provider: string): boolean {
+  const available = getAvailableSTTProviders();
+  if (available.includes(provider as STTProvider)) {
+    activeSTTProvider = provider;
+    return true;
+  }
+  return false;
+}
+
+export function setActiveTTSProvider(provider: string): boolean {
+  const available = getAvailableTTSProviders();
+  if (available.includes(provider as TTSProvider)) {
+    activeTTSProvider = provider;
+    return true;
+  }
+  return false;
+}
 
 // ---------------------------------------------------------------------------
 // Multipart parser
@@ -167,30 +235,26 @@ export async function synthesizeViaCartesia(
 // Voice availability helper
 // ---------------------------------------------------------------------------
 
-export function resolveVoiceAvailability(voiceCfg: VoicePluginConfig | undefined): {
+export function resolveVoiceAvailability(_voiceCfg: VoicePluginConfig | undefined): {
   sttAvailable: boolean;
   ttsAvailable: boolean;
-  ttsProvider: 'openai' | 'cartesia' | null;
+  sttProvider: STTProvider | null;
+  ttsProvider: TTSProvider | null;
+  sttProviders: STTProvider[];
+  ttsProviders: TTSProvider[];
 } {
-  const hasOpenAIKey = !!process.env.OPENAI_API_KEY;
-  const hasCartesiaKey = !!process.env.CARTESIA_API_KEY;
-
-  // Determine TTS provider (prefer config, then Cartesia if available, then OpenAI)
-  let ttsProvider: 'openai' | 'cartesia' | null = null;
-  if (voiceCfg?.tts?.provider === 'cartesia' && hasCartesiaKey) {
-    ttsProvider = 'cartesia';
-  } else if (voiceCfg?.tts?.provider === 'openai' && hasOpenAIKey) {
-    ttsProvider = 'openai';
-  } else if (hasCartesiaKey) {
-    ttsProvider = 'cartesia';
-  } else if (hasOpenAIKey) {
-    ttsProvider = 'openai';
-  }
+  const sttProviders = getAvailableSTTProviders();
+  const ttsProviders = getAvailableTTSProviders();
+  const sttProvider = getActiveSTTProvider();
+  const ttsProvider = getActiveTTSProvider();
 
   return {
-    sttAvailable: !!(voiceCfg?.stt?.provider || hasOpenAIKey),
-    ttsAvailable: ttsProvider !== null,
+    sttAvailable: sttProviders.length > 0,
+    ttsAvailable: ttsProviders.length > 0,
+    sttProvider,
     ttsProvider,
+    sttProviders,
+    ttsProviders,
   };
 }
 
@@ -208,19 +272,33 @@ export async function handleVoiceCapabilities(ctx: HandlerContext): Promise<void
   }
 
   const voiceCfg = ctx.pluginCfg.voice;
-  const { sttAvailable, ttsAvailable, ttsProvider } = resolveVoiceAvailability(voiceCfg);
+  const { sttAvailable, ttsAvailable, sttProvider, ttsProvider, sttProviders, ttsProviders } = resolveVoiceAvailability(voiceCfg);
 
   // Select voices based on provider
-  const ttsVoices = ttsProvider === 'cartesia' ? CARTESIA_TTS_VOICES : OPENAI_TTS_VOICES;
+  let ttsVoices: string[];
+  switch (ttsProvider) {
+    case 'cartesia':
+      ttsVoices = CARTESIA_TTS_VOICES;
+      break;
+    case 'elevenlabs':
+      ttsVoices = ELEVENLABS_TTS_VOICES;
+      break;
+    default:
+      ttsVoices = OPENAI_TTS_VOICES;
+  }
+
   const defaultVoice = ttsProvider === 'cartesia'
     ? (voiceCfg?.tts?.defaultVoice ?? 'sonic-english')
+    : ttsProvider === 'elevenlabs'
+    ? (voiceCfg?.tts?.defaultVoice ?? 'rachel')
     : (voiceCfg?.tts?.defaultVoice ?? 'nova');
 
   sendJson(ctx.res, 200, {
     stt: {
       available: sttAvailable,
+      provider: sttProvider,
+      providers: sttProviders,
       ...(sttAvailable && {
-        provider: voiceCfg?.stt?.provider ?? 'openai',
         model: voiceCfg?.stt?.model ?? 'whisper-1',
         maxDurationSeconds: 120,
         maxFileSizeMB: 25,
@@ -228,8 +306,9 @@ export async function handleVoiceCapabilities(ctx: HandlerContext): Promise<void
     },
     tts: {
       available: ttsAvailable,
+      provider: ttsProvider,
+      providers: ttsProviders,
       ...(ttsAvailable && {
-        provider: ttsProvider,
         model: voiceCfg?.tts?.model ?? (ttsProvider === 'cartesia' ? 'sonic-english' : 'tts-1'),
         voices: ttsVoices,
         defaultVoice,
@@ -371,4 +450,84 @@ export async function handleVoiceSynthesize(ctx: HandlerContext): Promise<void> 
       error: err instanceof Error ? err.message : 'Synthesis failed',
     });
   }
+}
+
+// ---------------------------------------------------------------------------
+// Provider switching endpoints
+// ---------------------------------------------------------------------------
+
+export async function handleSTTProviderSwitch(ctx: HandlerContext): Promise<void> {
+  if (ctx.req.method !== 'POST') {
+    ctx.res.statusCode = 405;
+    ctx.res.setHeader('Allow', 'POST, OPTIONS');
+    ctx.res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    ctx.res.end('Method Not Allowed');
+    return;
+  }
+
+  let body: { provider?: string };
+  try {
+    body = await readJsonBody(ctx.req) as { provider?: string };
+  } catch {
+    sendJson(ctx.res, 400, { error: 'Invalid JSON body' });
+    return;
+  }
+
+  if (!body.provider) {
+    sendJson(ctx.res, 400, { error: 'Missing provider field' });
+    return;
+  }
+
+  const success = setActiveSTTProvider(body.provider);
+  if (!success) {
+    const available = getAvailableSTTProviders();
+    sendJson(ctx.res, 400, {
+      error: `Invalid provider "${body.provider}". Available: ${available.join(', ')}`,
+    });
+    return;
+  }
+
+  ctx.logger.info(`RemoteClaw: STT provider switched to ${body.provider}`);
+  sendJson(ctx.res, 200, {
+    ok: true,
+    provider: body.provider,
+  });
+}
+
+export async function handleTTSProviderSwitch(ctx: HandlerContext): Promise<void> {
+  if (ctx.req.method !== 'POST') {
+    ctx.res.statusCode = 405;
+    ctx.res.setHeader('Allow', 'POST, OPTIONS');
+    ctx.res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    ctx.res.end('Method Not Allowed');
+    return;
+  }
+
+  let body: { provider?: string };
+  try {
+    body = await readJsonBody(ctx.req) as { provider?: string };
+  } catch {
+    sendJson(ctx.res, 400, { error: 'Invalid JSON body' });
+    return;
+  }
+
+  if (!body.provider) {
+    sendJson(ctx.res, 400, { error: 'Missing provider field' });
+    return;
+  }
+
+  const success = setActiveTTSProvider(body.provider);
+  if (!success) {
+    const available = getAvailableTTSProviders();
+    sendJson(ctx.res, 400, {
+      error: `Invalid provider "${body.provider}". Available: ${available.join(', ')}`,
+    });
+    return;
+  }
+
+  ctx.logger.info(`RemoteClaw: TTS provider switched to ${body.provider}`);
+  sendJson(ctx.res, 200, {
+    ok: true,
+    provider: body.provider,
+  });
 }
