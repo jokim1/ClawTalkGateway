@@ -246,8 +246,9 @@ async function connectToOpenAI(
 
   try {
     // OpenAI Realtime API WebSocket
+    // Using the latest preview model available
     const openaiWs = new WebSocket(
-      'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01',
+      'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17',
       {
         headers: {
           'Authorization': `Bearer ${apiKey}`,
@@ -671,8 +672,8 @@ export function handleRealtimeVoiceStreamUpgrade(
           }
         });
 
-        providerSession.ws.on('close', () => {
-          logger.info('RealtimeVoice: provider connection closed');
+        providerSession.ws.on('close', (code, reason) => {
+          logger.info(`RealtimeVoice: provider connection closed (code=${code}, reason=${reason?.toString() || 'none'})`);
           sendJsonMsg(clientWs, { type: 'session.end' });
           clientWs.close(1000, 'Provider disconnected');
         });
@@ -744,8 +745,8 @@ export function handleRealtimeVoiceStreamUpgrade(
       }
     });
 
-    clientWs.on('close', () => {
-      logger.info('RealtimeVoice: client disconnected');
+    clientWs.on('close', (code, reason) => {
+      logger.info(`RealtimeVoice: client disconnected (code=${code}, reason=${reason?.toString() || 'none'})`);
       if (providerSession) {
         providerSession.ws.close();
       }
