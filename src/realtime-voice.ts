@@ -43,6 +43,9 @@ interface ProviderSession {
 const SAMPLE_RATE = 24000;
 const ELEVENLABS_SAMPLE_RATE = 16000;
 
+// Keepalive interval (30 seconds)
+const KEEPALIVE_INTERVAL_MS = 30000;
+
 // ---------------------------------------------------------------------------
 // Audio resampling helper
 // ---------------------------------------------------------------------------
@@ -245,10 +248,9 @@ async function connectToOpenAI(
   }
 
   try {
-    // OpenAI Realtime API WebSocket
-    // Using the latest preview model available
+    // OpenAI Realtime API WebSocket — GA model
     const openaiWs = new WebSocket(
-      'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17',
+      'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2025-06-03',
       {
         headers: {
           'Authorization': `Bearer ${apiKey}`,
@@ -325,107 +327,104 @@ function sendJsonMsg(ws: WebSocket, msg: RealtimeServerMessage): void {
 }
 
 // ---------------------------------------------------------------------------
-// OpenAI Realtime message handling
+// OpenAI Realtime message handling (per-session closure)
 // ---------------------------------------------------------------------------
 
-// Track accumulated transcript for streaming
-let accumulatedAITranscript = '';
+function createOpenAIMessageHandler(clientWs: WebSocket, logger: Logger) {
+  let accumulatedAITranscript = '';
 
-function handleOpenAIMessage(
-  data: string,
-  clientWs: WebSocket,
-  logger: Logger,
-): void {
-  try {
-    const msg = JSON.parse(data);
+  return function handleOpenAIMessage(data: string): void {
+    try {
+      const msg = JSON.parse(data);
 
-    switch (msg.type) {
-      case 'session.created':
-        logger.info('RealtimeVoice: OpenAI session created');
-        sendJsonMsg(clientWs, { type: 'session.start' });
-        break;
+      switch (msg.type) {
+        case 'session.created':
+          logger.info('RealtimeVoice: OpenAI session created');
+          sendJsonMsg(clientWs, { type: 'session.start' });
+          break;
 
-      case 'session.updated':
-        logger.debug?.('RealtimeVoice: OpenAI session updated');
-        break;
+        case 'session.updated':
+          logger.debug?.('RealtimeVoice: OpenAI session updated');
+          break;
 
-      case 'response.audio.delta':
-        // Forward audio to client (already base64 PCM 24kHz 16-bit mono)
-        if (msg.delta) {
-          sendJsonMsg(clientWs, { type: 'audio', data: msg.delta });
-        }
-        break;
+        case 'response.audio.delta':
+          // Forward audio to client (already base64 PCM 24kHz 16-bit mono)
+          if (msg.delta) {
+            sendJsonMsg(clientWs, { type: 'audio', data: msg.delta });
+          }
+          break;
 
-      case 'response.audio_transcript.delta':
-        // AI transcript update - accumulate for streaming display
-        accumulatedAITranscript += msg.delta || '';
-        sendJsonMsg(clientWs, {
-          type: 'transcript.ai',
-          text: accumulatedAITranscript,
-          isFinal: false,
-        });
-        break;
+        case 'response.audio_transcript.delta':
+          // AI transcript update - accumulate for streaming display
+          accumulatedAITranscript += msg.delta || '';
+          sendJsonMsg(clientWs, {
+            type: 'transcript.ai',
+            text: accumulatedAITranscript,
+            isFinal: false,
+          });
+          break;
 
-      case 'response.audio_transcript.done':
-        // Final AI transcript
-        sendJsonMsg(clientWs, {
-          type: 'transcript.ai',
-          text: msg.transcript || accumulatedAITranscript,
-          isFinal: true,
-        });
-        accumulatedAITranscript = '';
-        break;
+        case 'response.audio_transcript.done':
+          // Final AI transcript
+          sendJsonMsg(clientWs, {
+            type: 'transcript.ai',
+            text: msg.transcript || accumulatedAITranscript,
+            isFinal: true,
+          });
+          accumulatedAITranscript = '';
+          break;
 
-      case 'conversation.item.input_audio_transcription.completed':
-        // User transcript (final)
-        sendJsonMsg(clientWs, {
-          type: 'transcript.user',
-          text: msg.transcript || '',
-          isFinal: true,
-        });
-        break;
+        case 'conversation.item.input_audio_transcription.completed':
+          // User transcript (final)
+          sendJsonMsg(clientWs, {
+            type: 'transcript.user',
+            text: msg.transcript || '',
+            isFinal: true,
+          });
+          break;
 
-      case 'input_audio_buffer.speech_started':
-        // User started speaking - could send state update
-        logger.debug?.('RealtimeVoice: User speech started');
-        break;
+        case 'input_audio_buffer.speech_started':
+          // User started speaking - could send state update
+          logger.debug?.('RealtimeVoice: User speech started');
+          break;
 
-      case 'input_audio_buffer.speech_stopped':
-        // User stopped speaking
-        logger.debug?.('RealtimeVoice: User speech stopped');
-        break;
+        case 'input_audio_buffer.speech_stopped':
+          // User stopped speaking
+          logger.debug?.('RealtimeVoice: User speech stopped');
+          break;
 
-      case 'response.created':
-        // AI is about to respond
-        accumulatedAITranscript = '';
-        break;
+        case 'response.created':
+          // AI is about to respond
+          accumulatedAITranscript = '';
+          break;
 
-      case 'response.done':
-        // AI response complete
-        logger.debug?.('RealtimeVoice: Response complete');
-        break;
+        case 'response.done':
+          // AI response complete
+          logger.debug?.('RealtimeVoice: Response complete');
+          break;
 
-      case 'response.cancelled':
-        // Response was cancelled (barge-in)
-        logger.info('RealtimeVoice: Response cancelled (barge-in)');
-        accumulatedAITranscript = '';
-        break;
+        case 'response.cancelled':
+          // Response was cancelled (barge-in)
+          logger.info('RealtimeVoice: Response cancelled (barge-in)');
+          accumulatedAITranscript = '';
+          break;
 
-      case 'error':
-        logger.error(`RealtimeVoice: OpenAI error: ${JSON.stringify(msg.error)}`);
-        sendJsonMsg(clientWs, {
-          type: 'error',
-          message: msg.error?.message || 'OpenAI error',
-        });
-        break;
+        case 'error':
+          logger.error(`RealtimeVoice: OpenAI error: ${JSON.stringify(msg.error)}`);
+          sendJsonMsg(clientWs, {
+            type: 'error',
+            message: msg.error?.message || 'OpenAI error',
+          });
+          break;
 
-      default:
-        // Log unknown events for debugging
-        logger.debug?.(`RealtimeVoice: Unhandled OpenAI event: ${msg.type}`);
+        default:
+          // Log unknown events for debugging
+          logger.debug?.(`RealtimeVoice: Unhandled OpenAI event: ${msg.type}`);
+      }
+    } catch (err) {
+      logger.error(`RealtimeVoice: failed to parse OpenAI message: ${err}`);
     }
-  } catch (err) {
-    logger.error(`RealtimeVoice: failed to parse OpenAI message: ${err}`);
-  }
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -611,6 +610,70 @@ export function handleRealtimeVoiceStreamUpgrade(
 
     let providerSession: ProviderSession | null = null;
     let configReceived = false;
+    let sessionEnded = false;
+
+    // Buffer audio messages that arrive before provider is connected
+    const pendingAudioMessages: RealtimeClientMessage[] = [];
+
+    // Keepalive: ping client every 30s to prevent NAT/firewall timeout
+    const keepaliveInterval = setInterval(() => {
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.ping();
+      }
+    }, KEEPALIVE_INTERVAL_MS);
+
+    // Keepalive for provider connection (set up after provider connects)
+    let providerKeepaliveInterval: NodeJS.Timeout | null = null;
+
+    /** Clean shutdown of the session. */
+    function cleanupSession(): void {
+      if (sessionEnded) return;
+      sessionEnded = true;
+      clearInterval(keepaliveInterval);
+      if (providerKeepaliveInterval) {
+        clearInterval(providerKeepaliveInterval);
+        providerKeepaliveInterval = null;
+      }
+    }
+
+    /** Flush buffered audio to provider after connection is established. */
+    function flushPendingAudio(): void {
+      while (pendingAudioMessages.length > 0) {
+        const pending = pendingAudioMessages.shift()!;
+        forwardAudioToProvider(pending);
+      }
+    }
+
+    /** Forward a single audio message to the upstream provider. */
+    function forwardAudioToProvider(msg: RealtimeClientMessage): void {
+      if (!providerSession || !msg.data) return;
+      if (providerSession.ws.readyState !== WebSocket.OPEN) return;
+
+      switch (provider) {
+        case 'openai':
+          providerSession.ws.send(JSON.stringify({
+            type: 'input_audio_buffer.append',
+            audio: msg.data,
+          }));
+          break;
+
+        case 'elevenlabs': {
+          const audioBuffer24k = Buffer.from(msg.data, 'base64');
+          const resampledBuffer = resamplePCM(audioBuffer24k, 24000, 16000);
+          providerSession.ws.send(JSON.stringify({
+            user_audio_chunk: resampledBuffer.toString('base64'),
+          }));
+          break;
+        }
+
+        case 'cartesia':
+          // Cartesia STT integration not yet implemented
+          break;
+      }
+    }
+
+    // Create per-session OpenAI message handler (avoids module-level state)
+    const handleOpenAIMsg = createOpenAIMessageHandler(clientWs, logger);
 
     clientWs.on('message', async (data: Buffer | string) => {
       // Parse client message
@@ -653,7 +716,9 @@ export function handleRealtimeVoiceStreamUpgrade(
         }
 
         if (!providerSession) {
+          sendJsonMsg(clientWs, { type: 'error', message: `Failed to connect to ${provider}` });
           clientWs.close(1011, 'Failed to connect to provider');
+          cleanupSession();
           return;
         }
 
@@ -661,7 +726,7 @@ export function handleRealtimeVoiceStreamUpgrade(
         providerSession.ws.on('message', (providerData: Buffer | string) => {
           switch (provider) {
             case 'openai':
-              handleOpenAIMessage(providerData.toString(), clientWs, logger);
+              handleOpenAIMsg(providerData.toString());
               break;
             case 'elevenlabs':
               handleElevenLabsMessage(providerData, clientWs, logger);
@@ -673,9 +738,16 @@ export function handleRealtimeVoiceStreamUpgrade(
         });
 
         providerSession.ws.on('close', (code, reason) => {
-          logger.info(`RealtimeVoice: provider connection closed (code=${code}, reason=${reason?.toString() || 'none'})`);
+          const reasonStr = reason?.toString() || 'none';
+          logger.info(`RealtimeVoice: provider connection closed (code=${code}, reason=${reasonStr})`);
+          // Forward close reason as error so client can display it
+          sendJsonMsg(clientWs, {
+            type: 'error',
+            message: `Provider disconnected (code=${code}${reasonStr !== 'none' ? `, reason=${reasonStr}` : ''})`,
+          });
           sendJsonMsg(clientWs, { type: 'session.end' });
           clientWs.close(1000, 'Provider disconnected');
+          cleanupSession();
         });
 
         providerSession.ws.on('error', (err) => {
@@ -683,36 +755,31 @@ export function handleRealtimeVoiceStreamUpgrade(
           sendJsonMsg(clientWs, { type: 'error', message: err.message });
         });
 
+        // Keepalive for provider WebSocket
+        providerKeepaliveInterval = setInterval(() => {
+          if (providerSession?.ws.readyState === WebSocket.OPEN) {
+            providerSession.ws.ping();
+          }
+        }, KEEPALIVE_INTERVAL_MS);
+
         sendJsonMsg(clientWs, { type: 'session.start' });
+
+        // Flush any audio that arrived while connecting to provider
+        flushPendingAudio();
         return;
       }
 
       // Handle audio data
-      if (msg.type === 'audio' && providerSession && msg.data) {
-        switch (provider) {
-          case 'openai':
-            // Send audio to OpenAI in their expected format
-            providerSession.ws.send(JSON.stringify({
-              type: 'input_audio_buffer.append',
-              audio: msg.data,  // Already base64
-            }));
-            break;
-
-          case 'elevenlabs':
-            // ElevenLabs expects 16kHz audio, our client sends 24kHz
-            // Resample from 24kHz to 16kHz (downsample by 2/3)
-            const audioBuffer24k = Buffer.from(msg.data, 'base64');
-            const resampledBuffer = resamplePCM(audioBuffer24k, 24000, 16000);
-            providerSession.ws.send(JSON.stringify({
-              user_audio_chunk: resampledBuffer.toString('base64'),
-            }));
-            break;
-
-          case 'cartesia':
-            // Cartesia expects binary audio or specific format
-            // For now, we'll handle TTS differently
-            // This would need Cartesia's STT integration
-            break;
+      if (msg.type === 'audio' && msg.data) {
+        if (providerSession) {
+          forwardAudioToProvider(msg);
+        } else if (configReceived) {
+          // Provider still connecting — buffer the audio
+          pendingAudioMessages.push(msg);
+          // Cap buffer to prevent memory growth (keep ~5 seconds of audio at 24kHz)
+          while (pendingAudioMessages.length > 200) {
+            pendingAudioMessages.shift();
+          }
         }
         return;
       }
@@ -741,6 +808,7 @@ export function handleRealtimeVoiceStreamUpgrade(
           providerSession.ws.close();
         }
         clientWs.close(1000, 'Session ended');
+        cleanupSession();
         return;
       }
     });
@@ -750,6 +818,7 @@ export function handleRealtimeVoiceStreamUpgrade(
       if (providerSession) {
         providerSession.ws.close();
       }
+      cleanupSession();
     });
 
     clientWs.on('error', (err) => {
