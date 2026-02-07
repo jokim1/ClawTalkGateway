@@ -31,6 +31,25 @@ export interface TalkChatContext {
   logger: Logger;
 }
 
+/** Extract ```job``` blocks from AI response text. */
+function parseJobBlocks(text: string): Array<{ schedule: string; prompt: string }> {
+  const results: Array<{ schedule: string; prompt: string }> = [];
+  const regex = /```job\s*\n([\s\S]*?)```/g;
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    const block = match[1];
+    const scheduleLine = block.match(/^schedule:\s*(.+)$/m);
+    const promptLine = block.match(/^prompt:\s*([\s\S]+?)$/m);
+    if (scheduleLine && promptLine) {
+      results.push({
+        schedule: scheduleLine[1].trim(),
+        prompt: promptLine[1].trim(),
+      });
+    }
+  }
+  return results;
+}
+
 export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
   const { req, res, talkId, store, gatewayOrigin, authToken, logger } = ctx;
 
@@ -202,8 +221,14 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
     };
     await store.appendMessage(talkId, assistantMsg);
 
-    // Send the assistant message ID as a trailing custom event (already ended — use persist only)
-    // The client can fetch the message ID from the meta event or GET /messages
+    // Auto-create jobs from ```job``` blocks in the response
+    const jobBlocks = parseJobBlocks(fullContent);
+    for (const { schedule, prompt } of jobBlocks) {
+      const job = store.addJob(talkId, schedule, prompt);
+      if (job) {
+        logger.info(`TalkChat: auto-created job ${job.id} [${schedule}] for talk ${talkId}`);
+      }
+    }
 
     // Trigger async context update
     scheduleContextUpdate({

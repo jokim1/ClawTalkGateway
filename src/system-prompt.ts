@@ -60,10 +60,24 @@ export function composeSystemPrompt(input: SystemPromptInput): string | undefine
     );
   }
 
-  // If there's nothing beyond the base instruction, no system prompt needed
-  if (sections.length === 1 && !meta.objective && !contextMd.trim() && pinnedMessages.length === 0 && activeJobs.length === 0) {
-    return undefined;
-  }
+  // Job creation instructions (always included)
+  sections.push(
+    `## Job Creation\n` +
+    `You can create recurring scheduled jobs for this conversation. When the user asks\n` +
+    `for recurring monitoring, scheduled check-ins, or periodic tasks, output a job block:\n\n` +
+    '```job\n' +
+    `schedule: <cron expression>\n` +
+    `prompt: <self-contained instruction for each run>\n` +
+    '```\n\n' +
+    `Common cron patterns:\n` +
+    '- `0 8 * * *` — daily at 8 AM\n' +
+    '- `0 9 * * 1` — weekly Monday at 9 AM\n' +
+    '- `0 */2 * * *` — every 2 hours\n' +
+    '- `30 17 * * 1-5` — weekdays at 5:30 PM\n\n' +
+    `The prompt should be a complete, self-contained instruction for what to check/do on\n` +
+    `each run. The job executes in this conversation's full context.\n` +
+    `Only create jobs when the user explicitly asks for something recurring or scheduled.`,
+  );
 
   return sections.join('\n\n');
 }
