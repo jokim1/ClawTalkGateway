@@ -1,39 +1,46 @@
-# RemoteClawGateway
+# ClawTalkGateway
 
-A [Moltbot](https://github.com/jokim1/moltbot) plugin that powers [RemoteClaw](https://github.com/jokim1/RemoteClaw) and [ClawTalk](https://github.com/jokim1/ClawTalk).
+An [OpenClaw](https://github.com/jokim1/openclaw) plugin that powers [ClawTalk](https://github.com/jokim1/ClawTalk) (terminal), [ClawTalkMobile](https://github.com/jokim1/ClawTalkMobile) (iOS), and [ClawTalkTerminal](https://github.com/jokim1/ClawTalkTerminal) (voice-first terminal).
 
-This plugin runs on your server alongside Moltbot. It adds HTTP endpoints that RemoteClaw (terminal client) and ClawTalk (iOS app) use to discover providers, track rate limits, and do voice input/output. Your API keys stay on the server — the client never sees them.
+Built by [Claude Opus 4.5](https://anthropic.com), [Claude Opus 4.6](https://anthropic.com), and [Joseph Kim](https://github.com/jokim1).
+
+This plugin runs on your server alongside OpenClaw. It adds HTTP endpoints that ClawTalk clients use to discover providers, track rate limits, manage conversations (Talks), run scheduled jobs, and do voice input/output. Your API keys stay on the server — clients never see them.
 
 ## What it does
 
 - **`/api/providers`** — lists available LLM providers and billing info
 - **`/api/rate-limits`** — reports usage and rate-limit data for subscription plans (e.g. Anthropic Max)
+- **`/api/talks`** — persistent conversation management (create, list, update, delete)
+- **`/api/talks/:id/chat`** — talk-aware chat with context injection and system prompts
+- **`/api/talks/:id/jobs`** — scheduled jobs (cron-based recurring prompts)
 - **`/api/voice/capabilities`** — reports whether speech-to-text and text-to-speech are available
 - **`/api/voice/transcribe`** — accepts audio, returns transcribed text (via OpenAI Whisper)
 - **`/api/voice/synthesize`** — accepts text, returns spoken audio (via OpenAI TTS)
-- **`/api/pair`** — lets ClawTalk (iOS) auto-configure by exchanging a pairing password for the full gateway config (disabled by default)
+- **`/api/voice/stream`** — WebSocket endpoint for live voice mode
+- **`/api/realtime-voice/stream`** — real-time voice conversation (OpenAI, Cartesia, ElevenLabs, Deepgram, Gemini)
+- **`/api/pair`** — lets ClawTalkMobile auto-configure by exchanging a pairing password for the full gateway config (disabled by default)
 
 ## Setup
 
 ### Step 1: Install the plugin
 
-Copy or clone this repo into your Moltbot plugins directory:
+Copy or clone this repo into your OpenClaw plugins directory:
 
 ```bash
-cd /path/to/moltbot/plugins
-git clone https://github.com/jokim1/RemoteClawGateway.git remoteclaw
+cd /path/to/openclaw/plugins
+git clone https://github.com/jokim1/ClawTalkGateway.git remoteclaw
 cd remoteclaw
 npm install
 npm run build
 ```
 
-Then restart Moltbot. You should see `RemoteClaw plugin loaded` in the logs.
+Then restart OpenClaw. You should see `RemoteClaw plugin loaded` in the logs.
 
 ### Step 2: Set an auth token (recommended)
 
 If your server is accessible over the network, set a token so only you can use the endpoints.
 
-Either set it in your Moltbot config:
+Either set it in your OpenClaw config:
 
 ```yaml
 gateway:
@@ -49,10 +56,10 @@ export CLAWDBOT_GATEWAY_TOKEN="pick-a-strong-random-token"
 
 If no token is set, the plugin only allows requests from localhost (127.0.0.1 / ::1).
 
-Use this same token when configuring RemoteClaw on your local machine:
+Use this same token when configuring ClawTalk on your local machine:
 
 ```bash
-remoteclaw config --gateway http://your-server:18789 --token pick-a-strong-random-token
+clawtalk config --gateway http://your-server:18789 --token pick-a-strong-random-token
 ```
 
 ### Step 3: Enable voice (optional)
@@ -63,9 +70,9 @@ Voice features require an OpenAI API key on the server for Whisper (STT) and TTS
 export OPENAI_API_KEY="sk-..."
 ```
 
-That's it. The plugin auto-detects the key and enables voice endpoints. RemoteClaw will discover voice support automatically.
+That's it. The plugin auto-detects the key and enables voice endpoints. ClawTalk will discover voice support automatically.
 
-You can customize the voice models in your Moltbot plugin config:
+You can customize the voice models in your OpenClaw plugin config:
 
 ```yaml
 plugins:
@@ -80,7 +87,7 @@ plugins:
 
 ### Step 4: Configure provider billing (optional)
 
-If you're on a subscription plan (e.g. Anthropic Max), tell the plugin so RemoteClaw can show rate-limit bars instead of per-token pricing:
+If you're on a subscription plan (e.g. Anthropic Max), tell the plugin so ClawTalk can show rate-limit bars instead of per-token pricing:
 
 ```yaml
 plugins:
@@ -94,11 +101,11 @@ plugins:
         billing: "api"
 ```
 
-### Step 5: Enable ClawTalk pairing (optional)
+### Step 5: Enable ClawTalkMobile pairing (optional)
 
-If you use [ClawTalk](https://github.com/jokim1/ClawTalk) (the iOS app), you can enable a pairing flow so new devices only need your server's Tailscale IP and a password — no manual token or URL entry.
+If you use [ClawTalkMobile](https://github.com/jokim1/ClawTalkMobile) (the iOS app), you can enable a pairing flow so new devices only need your server's Tailscale IP and a password — no manual token or URL entry.
 
-Set a pairing password in your Moltbot plugin config:
+Set a pairing password in your OpenClaw plugin config:
 
 ```yaml
 plugins:
@@ -114,7 +121,7 @@ Or use an environment variable instead:
 export CLAWDBOT_PAIR_PASSWORD="pick-a-secret"
 ```
 
-**How it works:** The user opens ClawTalk, taps Add Gateway, enters the server IP and the pairing password, and taps Connect. The gateway validates the password, then returns the full config (URL, auth token, agent ID). The app fills everything in automatically.
+**How it works:** The user opens ClawTalkMobile, taps Add Gateway, enters the server IP and the pairing password, and taps Connect. The gateway validates the password, then returns the full config (URL, auth token, agent ID). The app fills everything in automatically.
 
 **`externalUrl`** — By default, the pairing response uses the URL the client connected to. Set `externalUrl` if you want clients to use a different address long-term, e.g. a Tailscale Funnel hostname (`https://myhost.tail1234.ts.net`) even when pairing happens over a direct Tailscale IP.
 
@@ -123,32 +130,32 @@ export CLAWDBOT_PAIR_PASSWORD="pick-a-secret"
 - Passwords are compared using timing-safe equality.
 - Rate limited to 5 attempts per IP per minute.
 
-**Don't use ClawTalk?** You don't need to do anything. Without a `pairPassword`, the `/api/pair` endpoint returns 404 and is invisible to clients. RemoteClaw (the terminal client) doesn't use it.
+**Don't use ClawTalkMobile?** You don't need to do anything. Without a `pairPassword`, the `/api/pair` endpoint returns 404 and is invisible to clients.
 
 ## How it all fits together
 
 ```
 Your machines                      Your server
-┌──────────────┐                  ┌──────────────────────────────┐
-│  RemoteClaw   │                 │  Moltbot                      │
-│  (terminal)   │───── HTTP ─────▶│  ├── /v1/chat/completions     │ ← chat (built into Moltbot)
-│               │                 │  ├── /v1/models               │ ← model list (built in)
-└──────────────┘                  │  │                             │
-                                  │  └── RemoteClawGateway plugin  │ ← this repo
-┌──────────────┐                  │      ├── /api/pair             │ ← ClawTalk pairing (opt-in)
-│  ClawTalk     │                 │      ├── /api/providers        │
-│  (iOS)        │───── HTTP ─────▶│      ├── /api/rate-limits      │
-│               │                 │      ├── /api/voice/capabilities│
-└──────────────┘                  │      ├── /api/voice/transcribe │
-                                  │      └── /api/voice/synthesize │
-                                  └──────────────────────────────┘
+┌──────────────┐                  ┌──────────────────────────────────┐
+│  ClawTalk     │                 │  OpenClaw                         │
+│  (terminal)   │───── HTTP ─────▶│  ├── /v1/chat/completions         │ ← chat (built into OpenClaw)
+│               │                 │  ├── /v1/models                   │ ← model list (built in)
+└──────────────┘                  │  │                                 │
+                                  │  └── ClawTalkGateway plugin        │ ← this repo
+┌──────────────┐                  │      ├── /api/pair                 │ ← mobile pairing (opt-in)
+│  ClawTalkMobile│                │      ├── /api/providers            │
+│  (iOS)        │───── HTTP ─────▶│      ├── /api/rate-limits          │
+│               │                 │      ├── /api/talks                │ ← conversation management
+└──────────────┘                  │      ├── /api/voice/*              │ ← voice I/O
+                                  │      └── /api/realtime-voice/*     │ ← real-time voice
+                                  └──────────────────────────────────┘
 ```
 
-Moltbot handles chat and model routing. This plugin adds the extra endpoints that RemoteClaw and ClawTalk need for provider info, rate limits, voice, and mobile pairing.
+OpenClaw handles chat and model routing. This plugin adds the extra endpoints that ClawTalk clients need for provider info, rate limits, voice, conversations, and mobile pairing.
 
 ## API reference
 
-All endpoints require authentication (bearer token or localhost).
+All endpoints require authentication (bearer token or localhost) unless noted.
 
 ### GET /api/providers
 
@@ -164,7 +171,7 @@ Returns the list of configured LLM providers with billing info.
 }
 ```
 
-Providers are auto-detected from Moltbot's config and environment variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `GOOGLE_API_KEY`).
+Providers are auto-detected from OpenClaw's config and environment variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `GOOGLE_API_KEY`).
 
 ### GET /api/rate-limits
 
@@ -182,53 +189,36 @@ Returns usage data for all providers. Optionally filter with `?provider=anthropi
 }
 ```
 
-### GET /api/voice/capabilities
+### Talks API
 
-Returns what voice features are available.
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST /api/talks` | Create a new Talk |
+| `GET /api/talks` | List all Talks |
+| `PATCH /api/talks/:id` | Update Talk metadata (title, objective, model) |
+| `DELETE /api/talks/:id` | Delete a Talk |
+| `GET /api/talks/:id/messages` | Get Talk message history |
+| `POST /api/talks/:id/chat` | Send a message with Talk context |
+| `POST /api/talks/:id/pin` | Pin a message |
+| `DELETE /api/talks/:id/pin/:msgId` | Unpin a message |
+| `POST /api/talks/:id/jobs` | Create a scheduled job |
+| `GET /api/talks/:id/jobs` | List jobs for a Talk |
+| `PATCH /api/talks/:id/jobs/:jobId` | Update a job |
+| `DELETE /api/talks/:id/jobs/:jobId` | Delete a job |
+| `GET /api/talks/:id/reports` | Get job execution reports |
 
-```json
-{
-  "stt": {
-    "available": true,
-    "provider": "openai",
-    "model": "whisper-1",
-    "maxDurationSeconds": 120,
-    "maxFileSizeMB": 25
-  },
-  "tts": {
-    "available": true,
-    "provider": "openai",
-    "model": "tts-1",
-    "voices": ["alloy", "echo", "fable", "onyx", "nova", "shimmer"],
-    "defaultVoice": "nova"
-  }
-}
-```
+### Voice endpoints
 
-### POST /api/voice/transcribe
-
-Upload audio, get text back.
-
-- **Content-Type**: `multipart/form-data`
-- **Fields**: `audio` (WAV file, max 25MB), `language` (optional, default `en`)
-
-```json
-{
-  "text": "Hello, how are you?",
-  "language": "en",
-  "duration": 2.4
-}
-```
-
-### POST /api/voice/synthesize
-
-Send text, get audio back.
-
-- **Content-Type**: `application/json`
-- **Body**: `{ "text": "Hello!", "voice": "nova", "speed": 1.0 }`
-- **Response**: `audio/mpeg` binary (MP3)
-
-`voice` and `speed` are optional.
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET /api/voice/capabilities` | Voice feature availability |
+| `POST /api/voice/transcribe` | Speech-to-text (multipart audio upload) |
+| `POST /api/voice/synthesize` | Text-to-speech (returns audio/mpeg) |
+| `GET /api/voice/stream` | WebSocket live voice mode |
+| `POST /api/voice/stt/provider` | Switch STT provider |
+| `POST /api/voice/tts/provider` | Switch TTS provider |
+| `GET /api/realtime-voice/capabilities` | Real-time voice support info |
+| `GET /api/realtime-voice/stream` | WebSocket real-time voice |
 
 ### POST /api/pair
 
@@ -253,7 +243,6 @@ Exchange a pairing password for the full gateway config. **Does not require bear
 | 400 | Missing password or bad JSON |
 | 403 | Wrong password |
 | 404 | Pairing not configured |
-| 405 | Non-POST method |
 | 429 | Rate limited (5 attempts/min per IP) |
 
 ## Authentication
@@ -270,8 +259,15 @@ Token comparison uses timing-safe equality to prevent timing attacks.
 ## Requirements
 
 - **Node.js 20+**
-- **Moltbot** running on the same machine
+- **OpenClaw** running on the same machine
 - **`OPENAI_API_KEY`** environment variable (only needed for voice features)
+
+## Related projects
+
+- **[ClawTalk](https://github.com/jokim1/ClawTalk)** — Terminal TUI client
+- **[ClawTalkMobile](https://github.com/jokim1/ClawTalkMobile)** — iOS client
+- **[ClawTalkTerminal](https://github.com/jokim1/ClawTalkTerminal)** — Voice-first terminal plugin
+- **[OpenClaw](https://github.com/jokim1/openclaw)** — The host server
 
 ## Development
 
@@ -279,6 +275,7 @@ Token comparison uses timing-safe equality to prevent timing attacks.
 npm install
 npm run build
 npm run dev    # watch mode
+npm test       # run tests
 ```
 
 ## License
