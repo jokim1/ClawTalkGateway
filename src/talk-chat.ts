@@ -90,7 +90,9 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
 
   // Resolve model (request override → talk default)
   const model = body.model || meta.model || 'moltbot';
-  if (body.model && body.model !== meta.model) {
+  // Only update the talk's default model for non-agent messages.
+  // Agent messages use their own model without changing the talk default.
+  if (body.model && body.model !== meta.model && !body.agentName) {
     store.updateTalk(talkId, { model: body.model });
   }
 
