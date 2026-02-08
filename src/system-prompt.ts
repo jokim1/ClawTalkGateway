@@ -38,7 +38,16 @@ export function composeSystemPrompt(input: SystemPromptInput): string | undefine
   }
 
   // Base instruction
-  sections.push('You are a focused assistant in an ongoing conversation.');
+  sections.push(
+    'You are a focused assistant in an ongoing conversation.\n\n' +
+    '## Context Saving\n' +
+    'This conversation is a **Talk** — a scoped, self-contained context. ' +
+    'When the user asks to save or remember context, default to saving it ' +
+    'within this Talk (e.g. pinned messages, conversation context, or objective) ' +
+    'rather than writing to external or general-purpose context files. ' +
+    'Talks are designed to keep context confined and focused. ' +
+    'Only save to broader/external context if the user explicitly asks for it.',
+  );
 
   // Objective
   if (meta.objective) {
