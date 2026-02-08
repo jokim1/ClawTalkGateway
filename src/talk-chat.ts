@@ -10,7 +10,7 @@
 import { randomUUID } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { TalkStore } from './talk-store.js';
-import type { TalkMessage, Logger } from './types.js';
+import type { TalkMessage, ImageAttachmentMeta, Logger } from './types.js';
 import { sendJson, readJsonBody } from './http.js';
 import { composeSystemPrompt } from './system-prompt.js';
 import { scheduleContextUpdate } from './context-updater.js';
@@ -58,7 +58,7 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
     return;
   }
 
-  // Parse request body
+  // Parse request body (allow up to 5MB for image attachments)
   let body: {
     message: string;
     model?: string;
@@ -66,9 +66,11 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
     agentRole?: string;
     agentRoleInstructions?: string;
     otherAgents?: { name: string; role: string; model: string }[];
+    imageBase64?: string;
+    imageMimeType?: string;
   };
   try {
-    body = (await readJsonBody(req)) as typeof body;
+    body = (await readJsonBody(req, 5 * 1024 * 1024)) as typeof body;
   } catch {
     sendJson(res, 400, { error: 'Invalid JSON body' });
     return;
@@ -113,16 +115,41 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
   const history = await store.getRecentMessages(talkId, MAX_CONTEXT_MESSAGES);
 
   // Build message array for LLM
-  const messages: Array<{ role: string; content: string }> = [];
+  const messages: Array<{ role: string; content: string | Array<{ type: string; text?: string; image_url?: { url: string } }> }> = [];
   if (systemPrompt) {
     messages.push({ role: 'system', content: systemPrompt });
   }
   for (const m of history) {
     messages.push({ role: m.role, content: m.content });
   }
-  messages.push({ role: 'user', content: body.message });
 
-  // Persist user message
+  // Build user message content (multimodal when image attached)
+  if (body.imageBase64 && body.imageMimeType) {
+    messages.push({
+      role: 'user',
+      content: [
+        { type: 'image_url', image_url: { url: `data:${body.imageMimeType};base64,${body.imageBase64}` } },
+        { type: 'text', text: body.message },
+      ],
+    });
+  } else {
+    messages.push({ role: 'user', content: body.message });
+  }
+
+  // Build attachment metadata (base64 is NOT persisted)
+  let attachmentMeta: ImageAttachmentMeta | undefined;
+  if (body.imageBase64 && body.imageMimeType) {
+    const base64Bytes = Math.ceil(body.imageBase64.length * 3 / 4);
+    attachmentMeta = {
+      filename: 'image',
+      mimeType: body.imageMimeType,
+      width: 0,
+      height: 0,
+      sizeBytes: base64Bytes,
+    };
+  }
+
+  // Persist user message (metadata only, no base64)
   const userMsg: TalkMessage = {
     id: randomUUID(),
     role: 'user',
@@ -130,6 +157,7 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
     timestamp: Date.now(),
     ...(body.agentName && { agentName: body.agentName }),
     ...(body.agentRole && { agentRole: body.agentRole as any }),
+    ...(attachmentMeta && { attachment: attachmentMeta }),
   };
   await store.appendMessage(talkId, userMsg);
 

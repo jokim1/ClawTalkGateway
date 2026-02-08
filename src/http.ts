@@ -9,10 +9,19 @@ export function sendJson(res: ServerResponse, status: number, body: unknown): vo
   res.end(JSON.stringify(body));
 }
 
-export function readJsonBody(req: IncomingMessage): Promise<unknown> {
+export function readJsonBody(req: IncomingMessage, maxBytes = 1024 * 1024): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    let totalSize = 0;
+    req.on('data', (chunk: Buffer) => {
+      totalSize += chunk.length;
+      if (totalSize > maxBytes) {
+        req.destroy();
+        reject(new Error(`Request body exceeds ${maxBytes} byte limit`));
+        return;
+      }
+      chunks.push(chunk);
+    });
     req.on('end', () => {
       try {
         resolve(JSON.parse(Buffer.concat(chunks).toString('utf-8')));

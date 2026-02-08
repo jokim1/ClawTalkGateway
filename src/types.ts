@@ -112,6 +112,14 @@ export interface TalkAgent {
   isPrimary: boolean;
 }
 
+export interface ImageAttachmentMeta {
+  filename: string;
+  mimeType: string;
+  width: number;
+  height: number;
+  sizeBytes: number;
+}
+
 export interface TalkMessage {
   id: string;
   role: 'user' | 'assistant' | 'system';
@@ -120,6 +128,7 @@ export interface TalkMessage {
   model?: string;
   agentName?: string;
   agentRole?: AgentRole;
+  attachment?: ImageAttachmentMeta;
 }
 
 export interface TalkJob {
