@@ -46,7 +46,17 @@ export function composeSystemPrompt(input: SystemPromptInput): string | undefine
     'within this Talk (e.g. pinned messages, conversation context, or objective) ' +
     'rather than writing to external or general-purpose context files. ' +
     'Talks are designed to keep context confined and focused. ' +
-    'Only save to broader/external context if the user explicitly asks for it.',
+    'Only save to broader/external context if the user explicitly asks for it.\n\n' +
+    '## Formatting\n' +
+    'This conversation is displayed in a terminal. ' +
+    'NEVER use markdown tables (pipes/dashes) or HTML tables — they render poorly in terminals. ' +
+    'When presenting tabular data, use a fenced code block with manually aligned columns, or ' +
+    'use plain spaced columns without pipes. For example:\n' +
+    '```\n' +
+    'Name            Score   Result\n' +
+    'Alice             95   Passed\n' +
+    'Bob               82   Passed\n' +
+    '```',
   );
 
   // Objective
