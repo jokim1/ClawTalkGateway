@@ -1,6 +1,6 @@
 # ClawTalkGateway
 
-An [OpenClaw](https://github.com/jokim1/openclaw) plugin that powers [ClawTalk](https://github.com/jokim1/ClawTalk) (terminal), [ClawTalkMobile](https://github.com/jokim1/ClawTalkMobile) (iOS), and [ClawTalkTerminal](https://github.com/jokim1/ClawTalkTerminal) (voice-first terminal).
+An [OpenClaw](https://github.com/jokim1/openclaw) plugin that powers [ClawTalk](https://github.com/jokim1/ClawTalk) (terminal) and [ClawTalkMobile](https://github.com/jokim1/ClawTalkMobile) (iOS).
 
 Built by [Claude Opus 4.5](https://anthropic.com), [Claude Opus 4.6](https://anthropic.com), and [Joseph Kim](https://github.com/jokim1).
 
@@ -266,7 +266,6 @@ Token comparison uses timing-safe equality to prevent timing attacks.
 
 - **[ClawTalk](https://github.com/jokim1/ClawTalk)** — Terminal TUI client
 - **[ClawTalkMobile](https://github.com/jokim1/ClawTalkMobile)** — iOS client
-- **[ClawTalkTerminal](https://github.com/jokim1/ClawTalkTerminal)** — Voice-first terminal plugin
 - **[OpenClaw](https://github.com/jokim1/openclaw)** — The host server
 
 ## Development
