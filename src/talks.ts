@@ -95,6 +95,25 @@ export async function handleTalks(ctx: HandlerContext, store: TalkStore): Promis
     return;
   }
 
+  // POST/GET /api/talks/:id/agents
+  const agentsMatch = pathname.match(/^\/api\/talks\/([\w-]+)\/agents$/);
+  if (agentsMatch) {
+    const talkId = agentsMatch[1];
+    if (req.method === 'POST') return handleAddAgent(ctx, store, talkId);
+    if (req.method === 'GET') return handleListAgents(ctx, store, talkId);
+    sendJson(res, 405, { error: 'Method not allowed' });
+    return;
+  }
+
+  // DELETE /api/talks/:id/agents/:name
+  const agentMatch = pathname.match(/^\/api\/talks\/([\w-]+)\/agents\/([\w-]+)$/);
+  if (agentMatch) {
+    const [, talkId, agentName] = agentMatch;
+    if (req.method === 'DELETE') return handleDeleteAgent(ctx, store, talkId, agentName);
+    sendJson(res, 405, { error: 'Method not allowed' });
+    return;
+  }
+
   sendJson(res, 404, { error: 'Not found' });
 }
 
@@ -133,12 +152,22 @@ async function handleGetTalk(ctx: HandlerContext, store: TalkStore, talkId: stri
 }
 
 async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: string): Promise<void> {
-  let body: { topicTitle?: string; objective?: string; model?: string };
+  let body: { topicTitle?: string; objective?: string; model?: string; agents?: any[] };
   try {
     body = (await readJsonBody(ctx.req)) as typeof body;
   } catch {
     sendJson(ctx.res, 400, { error: 'Invalid JSON body' });
     return;
+  }
+
+  const talk = store.getTalk(talkId);
+  if (!talk) {
+    sendJson(ctx.res, 404, { error: 'Talk not found' });
+    return;
+  }
+
+  if (body.agents !== undefined) {
+    await store.setAgents(talkId, body.agents);
   }
 
   const updated = store.updateTalk(talkId, body);
@@ -293,4 +322,64 @@ async function handleGetReports(ctx: HandlerContext, store: TalkStore, talkId: s
   const limit = parseInt(ctx.url.searchParams.get('limit') ?? '20', 10);
   const reports = await store.getRecentReports(talkId, limit, jobId);
   sendJson(ctx.res, 200, { reports });
+}
+
+// ---------------------------------------------------------------------------
+// Agent handlers
+// ---------------------------------------------------------------------------
+
+async function handleAddAgent(ctx: HandlerContext, store: TalkStore, talkId: string): Promise<void> {
+  const talk = store.getTalk(talkId);
+  if (!talk) {
+    sendJson(ctx.res, 404, { error: 'Talk not found' });
+    return;
+  }
+
+  let body: { name?: string; model?: string; role?: string; isPrimary?: boolean };
+  try {
+    body = (await readJsonBody(ctx.req)) as typeof body;
+  } catch {
+    sendJson(ctx.res, 400, { error: 'Invalid JSON body' });
+    return;
+  }
+
+  if (!body.name || !body.model || !body.role) {
+    sendJson(ctx.res, 400, { error: 'Missing name, model, or role' });
+    return;
+  }
+
+  const agent = await store.addAgent(talkId, {
+    name: body.name,
+    model: body.model,
+    role: body.role as any,
+    isPrimary: body.isPrimary ?? false,
+  });
+  sendJson(ctx.res, 201, agent);
+}
+
+async function handleListAgents(ctx: HandlerContext, store: TalkStore, talkId: string): Promise<void> {
+  const talk = store.getTalk(talkId);
+  if (!talk) {
+    sendJson(ctx.res, 404, { error: 'Talk not found' });
+    return;
+  }
+
+  const agents = store.listAgents(talkId);
+  sendJson(ctx.res, 200, { agents });
+}
+
+async function handleDeleteAgent(ctx: HandlerContext, store: TalkStore, talkId: string, agentName: string): Promise<void> {
+  const talk = store.getTalk(talkId);
+  if (!talk) {
+    sendJson(ctx.res, 404, { error: 'Talk not found' });
+    return;
+  }
+
+  try {
+    await store.removeAgent(talkId, agentName);
+  } catch {
+    sendJson(ctx.res, 404, { error: 'Agent not found' });
+    return;
+  }
+  sendJson(ctx.res, 200, { ok: true });
 }

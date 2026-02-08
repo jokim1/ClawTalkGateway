@@ -11,12 +11,31 @@ export interface SystemPromptInput {
   meta: TalkMeta;
   contextMd: string;
   pinnedMessages: TalkMessage[];
+  agentOverride?: {
+    name: string;
+    role: string;
+    roleInstructions: string;
+    otherAgents: { name: string; role: string; model: string }[];
+  };
 }
 
 export function composeSystemPrompt(input: SystemPromptInput): string | undefined {
-  const { meta, contextMd, pinnedMessages } = input;
+  const { meta, contextMd, pinnedMessages, agentOverride } = input;
 
   const sections: string[] = [];
+
+  // Agent identity (prepended before base instruction when present)
+  if (agentOverride) {
+    let identitySection = `## Your Identity\nYou are **${agentOverride.name}**, acting as the **${agentOverride.role}** in this conversation.\n\n${agentOverride.roleInstructions}`;
+    if (agentOverride.otherAgents.length > 0) {
+      const agentLines = agentOverride.otherAgents.map(
+        a => `- **${a.name}** (${a.role}) — using ${a.model}`,
+      );
+      identitySection += `\n\n### Other Agents in This Conversation\n${agentLines.join('\n')}`;
+    }
+    identitySection += '\n\n---';
+    sections.push(identitySection);
+  }
 
   // Base instruction
   sections.push('You are a focused assistant in an ongoing conversation.');

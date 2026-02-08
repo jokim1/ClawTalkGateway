@@ -59,7 +59,14 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
   }
 
   // Parse request body
-  let body: { message: string; model?: string };
+  let body: {
+    message: string;
+    model?: string;
+    agentName?: string;
+    agentRole?: string;
+    agentRoleInstructions?: string;
+    otherAgents?: { name: string; role: string; model: string }[];
+  };
   try {
     body = (await readJsonBody(req)) as typeof body;
   } catch {
@@ -94,7 +101,13 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
   }
 
   // Compose system prompt
-  const systemPrompt = composeSystemPrompt({ meta, contextMd, pinnedMessages });
+  const agentOverride = body.agentName ? {
+    name: body.agentName,
+    role: body.agentRole || '',
+    roleInstructions: body.agentRoleInstructions || '',
+    otherAgents: body.otherAgents || [],
+  } : undefined;
+  const systemPrompt = composeSystemPrompt({ meta, contextMd, pinnedMessages, agentOverride });
 
   // Load recent history
   const history = await store.getRecentMessages(talkId, MAX_CONTEXT_MESSAGES);
@@ -115,6 +128,8 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
     role: 'user',
     content: body.message,
     timestamp: Date.now(),
+    ...(body.agentName && { agentName: body.agentName }),
+    ...(body.agentRole && { agentRole: body.agentRole as any }),
   };
   await store.appendMessage(talkId, userMsg);
 
@@ -218,6 +233,8 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
       content: fullContent,
       timestamp: Date.now(),
       model: responseModel || model,
+      ...(body.agentName && { agentName: body.agentName }),
+      ...(body.agentRole && { agentRole: body.agentRole as any }),
     };
     await store.appendMessage(talkId, assistantMsg);
 

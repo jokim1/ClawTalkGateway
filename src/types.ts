@@ -103,12 +103,23 @@ export interface CachedRateLimitData {
 // Talk types
 // ---------------------------------------------------------------------------
 
+export type AgentRole = 'analyst' | 'critic' | 'strategist' | 'devils-advocate' | 'synthesizer' | 'editor';
+
+export interface TalkAgent {
+  name: string;
+  model: string;
+  role: AgentRole;
+  isPrimary: boolean;
+}
+
 export interface TalkMessage {
   id: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
   timestamp: number;
   model?: string;
+  agentName?: string;
+  agentRole?: AgentRole;
 }
 
 export interface TalkJob {
@@ -139,6 +150,7 @@ export interface TalkMeta {
   model?: string;
   pinnedMessageIds: string[];
   jobs: TalkJob[];
+  agents?: TalkAgent[];
   createdAt: number;
   updatedAt: number;
 }

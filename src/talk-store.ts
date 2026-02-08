@@ -11,7 +11,7 @@ import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import * as readline from 'node:readline';
-import type { TalkMeta, TalkMessage, TalkJob, JobReport, Logger } from './types.js';
+import type { TalkMeta, TalkMessage, TalkJob, TalkAgent, JobReport, Logger } from './types.js';
 
 const DEFAULT_DATA_DIR = path.join(
   process.env.HOME || '~',
@@ -55,6 +55,7 @@ export class TalkStore {
             // Ensure arrays exist (for older files)
             meta.pinnedMessageIds ??= [];
             meta.jobs ??= [];
+            meta.agents ??= [];
             this.talks.set(meta.id, meta);
           } catch (err) {
             this.logger.warn(`TalkStore: skipping corrupted talk ${dir}: ${err}`);
@@ -287,6 +288,43 @@ export class TalkStore {
       }
     }
     return result;
+  }
+
+  // -------------------------------------------------------------------------
+  // Agent management
+  // -------------------------------------------------------------------------
+
+  async addAgent(talkId: string, agent: TalkAgent): Promise<TalkAgent> {
+    const meta = this.talks.get(talkId);
+    if (!meta) throw new Error('Talk not found');
+    if (!meta.agents) meta.agents = [];
+    meta.agents.push(agent);
+    meta.updatedAt = Date.now();
+    this.persistMeta(meta);
+    return agent;
+  }
+
+  async removeAgent(talkId: string, agentName: string): Promise<void> {
+    const meta = this.talks.get(talkId);
+    if (!meta) throw new Error('Talk not found');
+    const idx = (meta.agents ?? []).findIndex(a => a.name === agentName);
+    if (idx === -1) throw new Error('Agent not found');
+    meta.agents!.splice(idx, 1);
+    meta.updatedAt = Date.now();
+    this.persistMeta(meta);
+  }
+
+  listAgents(talkId: string): TalkAgent[] {
+    const meta = this.talks.get(talkId);
+    return meta?.agents ?? [];
+  }
+
+  async setAgents(talkId: string, agents: TalkAgent[]): Promise<void> {
+    const meta = this.talks.get(talkId);
+    if (!meta) throw new Error('Talk not found');
+    meta.agents = agents;
+    meta.updatedAt = Date.now();
+    this.persistMeta(meta);
   }
 
   // -------------------------------------------------------------------------
