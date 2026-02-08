@@ -98,23 +98,38 @@ export function composeSystemPrompt(input: SystemPromptInput): string | undefine
     );
   }
 
-  // Job creation instructions (always included)
+  // Talk jobs explanation + creation instructions (always included)
   sections.push(
-    `## Job Creation\n` +
-    `You can create recurring scheduled jobs for this conversation. When the user asks\n` +
-    `for recurring monitoring, scheduled check-ins, or periodic tasks, output a job block:\n\n` +
+    `## Talk Jobs\n` +
+    `This Talk has a **built-in job scheduler**. Jobs are recurring tasks that belong to ` +
+    `this Talk and run server-side on a schedule. Each job execution has full access to ` +
+    `this Talk's context (objective, pinned messages, conversation summary). ` +
+    `Jobs produce reports that the user can review.\n\n` +
+    `**This is NOT the system cron.** Talk jobs are a feature of ClawTalk — they are ` +
+    `scoped to this Talk, managed via slash commands, and run automatically by the gateway.\n\n` +
+    `### Managing Jobs\n` +
+    `The user manages jobs with these slash commands:\n` +
+    '- `/job add "schedule" prompt` — create a new job\n' +
+    '- `/jobs` — list all jobs in this Talk\n' +
+    '- `/job pause N` — pause job #N\n' +
+    '- `/job resume N` — resume job #N\n' +
+    '- `/job delete N` — delete job #N\n' +
+    '- `/reports` — view job execution reports\n\n' +
+    `### Creating Jobs via Response\n` +
+    `You can also create a job by outputting a fenced job block in your response:\n\n` +
     '```job\n' +
-    `schedule: <cron expression>\n` +
+    `schedule: <cron or human-readable schedule>\n` +
     `prompt: <self-contained instruction for each run>\n` +
     '```\n\n' +
-    `Common cron patterns:\n` +
-    '- `0 8 * * *` — daily at 8 AM\n' +
-    '- `0 9 * * 1` — weekly Monday at 9 AM\n' +
-    '- `0 */2 * * *` — every 2 hours\n' +
-    '- `30 17 * * 1-5` — weekdays at 5:30 PM\n\n' +
-    `The prompt should be a complete, self-contained instruction for what to check/do on\n` +
-    `each run. The job executes in this conversation's full context.\n` +
-    `Only create jobs when the user explicitly asks for something recurring or scheduled.`,
+    `Schedule formats:\n` +
+    '- Cron: `0 8 * * *` (daily 8 AM), `0 9 * * 1` (Monday 9 AM), `30 17 * * 1-5` (weekdays 5:30 PM)\n' +
+    '- Human-readable: `daily 8am`, `every 2h`, `every 30m`\n\n' +
+    `The prompt must be self-contained — it runs independently with only the Talk context. ` +
+    `Only create jobs when the user explicitly asks for something recurring or scheduled.\n\n` +
+    `### Moving External Tasks to Talk Jobs\n` +
+    `If the user asks to move an external cron job, scheduled task, or recurring reminder ` +
+    `into this Talk, create a Talk job for it. Talk jobs are the preferred way to handle ` +
+    `recurring work within a Talk's scope.`,
   );
 
   return sections.join('\n\n');
