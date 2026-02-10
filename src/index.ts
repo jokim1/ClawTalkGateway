@@ -23,6 +23,7 @@ import { TalkStore } from './talk-store.js';
 import { handleTalks } from './talks.js';
 import { handleTalkChat } from './talk-chat.js';
 import { startJobScheduler } from './job-scheduler.js';
+import { handleFileUpload } from './file-upload.js';
 
 const ROUTES = new Set([
   '/api/pair',
@@ -36,6 +37,7 @@ const ROUTES = new Set([
   '/api/voice/tts/provider',
   '/api/realtime-voice/capabilities',
   '/api/realtime-voice/stream',
+  '/api/files/upload',
 ]);
 
 // ============================================================================
@@ -289,6 +291,9 @@ const plugin = {
         }
 
         switch (url.pathname) {
+          case '/api/files/upload':
+            await handleFileUpload(ctx, pluginCfg.uploadDir);
+            break;
           case '/api/providers':
             await handleProviders(ctx);
             break;

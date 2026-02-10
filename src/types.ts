@@ -173,6 +173,7 @@ export interface RemoteClawPluginConfig {
   externalUrl?: string;
   name?: string;
   dataDir?: string;
+  uploadDir?: string;
 }
 
 export type { IncomingMessage, ServerResponse };
