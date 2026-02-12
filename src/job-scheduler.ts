@@ -337,8 +337,9 @@ Provide a concise report of your findings or actions. Start with a one-line summ
       logger.info(`JobScheduler: job ${job.id} completed — "${summary}"`);
     }
   } catch (err) {
+    const cause = err instanceof Error && (err as any).cause ? ` (cause: ${(err as any).cause})` : '';
     const errorMsg = err instanceof Error ? err.message : String(err);
-    logger.warn(`JobScheduler: job ${job.id} failed: ${errorMsg}`);
+    logger.warn(`JobScheduler: job ${job.id} failed: ${errorMsg}${cause}`);
 
     const report: JobReport = {
       id: randomUUID(),

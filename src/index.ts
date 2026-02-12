@@ -137,10 +137,13 @@ const plugin = {
     // Start job scheduler
     const cfg0 = api.runtime.config.loadConfig();
     const gatewayToken0 = resolveGatewayToken(cfg0);
-    const gatewayOrigin0 = pluginCfg.externalUrl ?? 'http://localhost:18789';
+    // For self-calls (job scheduler), always use 127.0.0.1 — never the
+    // externalUrl, which is a client-facing URL that may not be reachable
+    // from the server itself (e.g. Tailscale funnel HTTPS hairpin issues).
+    const schedulerOrigin = 'http://127.0.0.1:18789';
     const stopScheduler = startJobScheduler({
       store: talkStore,
-      gatewayOrigin: gatewayOrigin0,
+      gatewayOrigin: schedulerOrigin,
       authToken: gatewayToken0,
       logger: api.logger,
     });
