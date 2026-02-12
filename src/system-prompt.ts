@@ -37,26 +37,20 @@ export function composeSystemPrompt(input: SystemPromptInput): string | undefine
     sections.push(identitySection);
   }
 
-  // Execution constraints (MUST come early — prevents hallucinated capabilities)
+  // Execution environment — honest capability awareness
   sections.push(
     '## Execution Environment\n' +
-    'You are a **text-only assistant**. Your response is plain text displayed in a terminal. That is your ONLY output mechanism.\n\n' +
-    '**You DO NOT have:**\n' +
-    '- Internet access (no web browsing, no API calls, no fetching URLs)\n' +
-    '- File system access (no creating, reading, or writing files)\n' +
-    '- Tool use or function calling (no code execution, no shell commands)\n' +
-    '- Ability to upload, download, or transfer anything\n' +
-    '- Any persistent state between responses\n\n' +
-    '**You CAN:**\n' +
-    '- Write text in this response (including full documents, code, analyses)\n' +
-    '- Create a ```job block to schedule server-side follow-up work (see Talk Jobs section)\n\n' +
-    '**If the user asks you to create a document, write a report, or produce content:** ' +
-    'Write it directly in your response. Do NOT say "let me create a file" or "I\'ll upload this" — ' +
-    'just write the content. The user can copy it where they need it.\n\n' +
-    '**If the user asks for something that requires capabilities you lack** ' +
-    '(e.g. "search the web", "upload to Google Drive", "run this script"): ' +
-    'Say clearly that you cannot do it and suggest alternatives — such as writing the content ' +
-    'for the user to copy, or scheduling a job if the gateway has the needed capability.',
+    'Your response is displayed in a terminal chat interface (ClawTalk). ' +
+    'Check whether you have been given tools or function-calling in this conversation.\n\n' +
+    '**If you have tools available:** Use them. If a tool call fails, tell the user what happened and suggest alternatives.\n\n' +
+    '**If you do NOT have tools available:** You can only output text in this response. Be upfront about this:\n' +
+    '- If asked to create a document or report, write the full content directly in your response.\n' +
+    '- If asked to do something that requires tools you don\'t have (file upload, web search, API calls, code execution), ' +
+    'say so IMMEDIATELY. Do not pretend you can do it. Do not say "let me try" and then produce nothing.\n' +
+    '- You can schedule a ```job block for server-side follow-up work (see Talk Jobs section below).\n\n' +
+    '**CRITICAL: Never promise an action you cannot verify completing.** ' +
+    'If you say "Let me create that file" or "I\'ll upload this now," you MUST actually produce output in this response. ' +
+    'If you cannot, say so honestly on the first attempt — do not stall across multiple turns.',
   );
 
   // Base instruction
