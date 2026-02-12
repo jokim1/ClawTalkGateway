@@ -19,6 +19,9 @@ import type { ToolExecutor, ToolExecResult } from './tool-executor.js';
 /** Maximum tool loop iterations per message. */
 const MAX_ITERATIONS = 10;
 
+/** Timeout per LLM streaming call (5 min — Opus can be slow with large outputs). */
+const LLM_CALL_TIMEOUT_MS = 300_000;
+
 /** Accumulated tool call fragment from streaming delta. */
 interface ToolCallAccumulator {
   id: string;
@@ -77,7 +80,7 @@ export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoop
           stream: true,
           stream_options: { include_usage: true },
         }),
-        signal: AbortSignal.timeout(120_000),
+        signal: AbortSignal.timeout(LLM_CALL_TIMEOUT_MS),
       });
     } catch (err) {
       logger.error(`ToolLoop: LLM fetch failed (iteration ${iteration}): ${err}`);
