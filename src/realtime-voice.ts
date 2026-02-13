@@ -626,6 +626,15 @@ function handleCartesiaMessage(
 }
 
 // ---------------------------------------------------------------------------
+// Voice session state machine
+// ---------------------------------------------------------------------------
+
+type VoiceSessionState = 'idle' | 'connecting' | 'connected' | 'closing' | 'closed';
+
+/** Maximum buffered audio messages during 'connecting' state. */
+const MAX_PENDING_AUDIO = 200;
+
+// ---------------------------------------------------------------------------
 // WS /api/realtime-voice/stream
 // ---------------------------------------------------------------------------
 
@@ -667,8 +676,7 @@ export function handleRealtimeVoiceStreamUpgrade(
     logger.info(`RealtimeVoice: client connected (provider=${provider})`);
 
     let providerSession: ProviderSession | null = null;
-    let configReceived = false;
-    let sessionEnded = false;
+    let sessionState: VoiceSessionState = 'idle';
 
     // Buffer audio messages that arrive before provider is connected
     const pendingAudioMessages: RealtimeClientMessage[] = [];
@@ -685,13 +693,18 @@ export function handleRealtimeVoiceStreamUpgrade(
 
     /** Clean shutdown of the session. */
     function cleanupSession(): void {
-      if (sessionEnded) return;
-      sessionEnded = true;
+      if (sessionState === 'closing' || sessionState === 'closed') return;
+      sessionState = 'closing';
       clearInterval(keepaliveInterval);
       if (providerKeepaliveInterval) {
         clearInterval(providerKeepaliveInterval);
         providerKeepaliveInterval = null;
       }
+      // Close provider WS if still open
+      if (providerSession?.ws.readyState === WebSocket.OPEN || providerSession?.ws.readyState === WebSocket.CONNECTING) {
+        providerSession.ws.close();
+      }
+      sessionState = 'closed';
     }
 
     /** Flush buffered audio to provider after connection is established. */
@@ -745,8 +758,9 @@ export function handleRealtimeVoiceStreamUpgrade(
 
       // Handle config message (establishes provider connection)
       if (msg.type === 'config') {
-        if (configReceived) return;
-        configReceived = true;
+        // Only accept config in 'idle' state
+        if (sessionState !== 'idle') return;
+        sessionState = 'connecting';
 
         // Connect to provider
         switch (provider) {
@@ -785,7 +799,8 @@ export function handleRealtimeVoiceStreamUpgrade(
           return;
         }
 
-        // Setup provider message handling
+        // Attach provider message handlers BEFORE transitioning to 'connected'
+        // to prevent lost early messages
         providerSession.ws.on('message', (providerData: Buffer | string) => {
           switch (provider) {
             case 'openai':
@@ -803,7 +818,6 @@ export function handleRealtimeVoiceStreamUpgrade(
         providerSession.ws.on('close', (code, reason) => {
           const reasonStr = reason?.toString() || 'none';
           logger.info(`RealtimeVoice: provider connection closed (code=${code}, reason=${reasonStr})`);
-          // Forward close reason as error so client can display it
           sendJsonMsg(clientWs, {
             type: 'error',
             message: `Provider disconnected (code=${code}${reasonStr !== 'none' ? `, reason=${reasonStr}` : ''})`,
@@ -825,6 +839,8 @@ export function handleRealtimeVoiceStreamUpgrade(
           }
         }, KEEPALIVE_INTERVAL_MS);
 
+        // Now transition to 'connected' — handlers are already attached
+        sessionState = 'connected';
         sendJsonMsg(clientWs, { type: 'session.start' });
 
         // Flush any audio that arrived while connecting to provider
@@ -834,21 +850,23 @@ export function handleRealtimeVoiceStreamUpgrade(
 
       // Handle audio data
       if (msg.type === 'audio' && msg.data) {
-        if (providerSession) {
+        if (sessionState === 'connected' && providerSession) {
           forwardAudioToProvider(msg);
-        } else if (configReceived) {
+        } else if (sessionState === 'connecting') {
           // Provider still connecting — buffer the audio
           pendingAudioMessages.push(msg);
           // Cap buffer to prevent memory growth (keep ~5 seconds of audio at 24kHz)
-          while (pendingAudioMessages.length > 200) {
+          if (pendingAudioMessages.length > MAX_PENDING_AUDIO) {
+            logger.warn(`RealtimeVoice: audio buffer hit cap (${MAX_PENDING_AUDIO}), dropping oldest`);
             pendingAudioMessages.shift();
           }
         }
+        // Drop audio in other states (idle, closing, closed)
         return;
       }
 
       // Handle interrupt (barge-in)
-      if (msg.type === 'interrupt' && providerSession) {
+      if (msg.type === 'interrupt' && sessionState === 'connected' && providerSession) {
         switch (provider) {
           case 'openai':
             providerSession.ws.send(JSON.stringify({
@@ -867,9 +885,6 @@ export function handleRealtimeVoiceStreamUpgrade(
 
       // Handle end
       if (msg.type === 'end') {
-        if (providerSession) {
-          providerSession.ws.close();
-        }
         clientWs.close(1000, 'Session ended');
         cleanupSession();
         return;
@@ -878,9 +893,6 @@ export function handleRealtimeVoiceStreamUpgrade(
 
     clientWs.on('close', (code, reason) => {
       logger.info(`RealtimeVoice: client disconnected (code=${code}, reason=${reason?.toString() || 'none'})`);
-      if (providerSession) {
-        providerSession.ws.close();
-      }
       cleanupSession();
     });
 

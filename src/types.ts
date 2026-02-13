@@ -13,6 +13,29 @@ export interface Logger {
   debug: (msg: string) => void;
 }
 
+export interface PluginCommandContext {
+  args: string[];
+  rawArgs: string;
+  reply: (text: string) => void;
+}
+
+export interface PluginCommandDefinition {
+  name: string;
+  description: string;
+  usage?: string;
+  handler: (ctx: PluginCommandContext) => void | Promise<void>;
+}
+
+export interface PluginServiceContext {
+  logger: Logger;
+}
+
+export interface PluginService {
+  id: string;
+  start: (ctx: PluginServiceContext) => void | Promise<void>;
+  stop: (ctx: PluginServiceContext) => void | Promise<void>;
+}
+
 export interface PluginApi {
   id: string;
   config: Record<string, any>;
@@ -21,11 +44,17 @@ export interface PluginApi {
     config: {
       loadConfig: () => Record<string, any>;
     };
+    state?: {
+      resolveStateDir: () => string;
+    };
   };
   logger: Logger;
   registerHttpHandler: (
     handler: (req: IncomingMessage, res: ServerResponse) => Promise<boolean>
   ) => void;
+  registerCommand: (cmd: PluginCommandDefinition) => void;
+  registerService: (svc: PluginService) => void;
+  on: (hookName: string, handler: (...args: any[]) => void | Promise<void>) => void;
 }
 
 export interface HandlerContext {

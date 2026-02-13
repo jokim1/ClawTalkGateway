@@ -60,12 +60,16 @@ function makeWavHeader(pcmByteLength: number): Buffer {
 // Voice Stream Session
 // ---------------------------------------------------------------------------
 
+/** Maximum audio buffer size before force-processing a turn. */
+const MAX_AUDIO_BUFFER_BYTES = 5 * 1024 * 1024; // 5MB
+
 interface SessionState {
   model: string;
   messages: Array<{ role: string; content: string }>;
   agentId: string;
   sessionKey: string;
   audioChunks: Buffer[];
+  audioChunksBytes: number;
   speechDetected: boolean;
   speechStartedAt: number;
   lastSpeechAt: number;
@@ -80,6 +84,7 @@ function createSession(): SessionState {
     agentId: '',
     sessionKey: '',
     audioChunks: [],
+    audioChunksBytes: 0,
     speechDetected: false,
     speechStartedAt: 0,
     lastSpeechAt: 0,
@@ -121,6 +126,7 @@ async function processTurn(
 
   const pcmData = Buffer.concat(session.audioChunks);
   session.audioChunks = [];
+  session.audioChunksBytes = 0;
   session.speechDetected = false;
   session.speechStartedAt = 0;
   session.lastSpeechAt = 0;
@@ -301,6 +307,20 @@ export function handleVoiceStreamUpgrade(
       const rms = calculateRMS(pcmBuffer);
       const now = Date.now();
 
+      /** Force-process the current turn (used by silence timer and buffer cap). */
+      function forceProcessTurn() {
+        session.processing = true;
+        processTurn(session, ws, logger, voiceCfg, gatewayOrigin, authToken)
+          .catch((err) => {
+            logger.error(`VoiceStream: processTurn error: ${err}`);
+            sendJsonMsg(ws, { type: 'error', message: 'Processing error' });
+            sendJsonMsg(ws, { type: 'ready' });
+          })
+          .finally(() => {
+            session.processing = false;
+          });
+      }
+
       if (rms > RMS_SPEECH_THRESHOLD) {
         // Speech detected
         if (!session.speechDetected) {
@@ -309,15 +329,27 @@ export function handleVoiceStreamUpgrade(
         }
         session.lastSpeechAt = now;
         session.audioChunks.push(pcmBuffer);
+        session.audioChunksBytes += pcmBuffer.length;
 
         // Clear any pending silence timer
         if (session.silenceTimer) {
           clearTimeout(session.silenceTimer);
           session.silenceTimer = null;
         }
+
+        // Force-process if audio buffer exceeds cap
+        if (session.audioChunksBytes >= MAX_AUDIO_BUFFER_BYTES) {
+          logger.warn(`VoiceStream: audio buffer hit ${MAX_AUDIO_BUFFER_BYTES} byte cap, force-processing turn`);
+          if (session.silenceTimer) {
+            clearTimeout(session.silenceTimer);
+            session.silenceTimer = null;
+          }
+          forceProcessTurn();
+        }
       } else if (session.speechDetected) {
         // Silence after speech — still collect audio (captures trailing speech)
         session.audioChunks.push(pcmBuffer);
+        session.audioChunksBytes += pcmBuffer.length;
 
         // Start/reset silence timer
         if (!session.silenceTimer) {
@@ -329,6 +361,7 @@ export function handleVoiceStreamUpgrade(
             if (speechDuration < MIN_SPEECH_DURATION_MS) {
               // Too short — discard and reset
               session.audioChunks = [];
+              session.audioChunksBytes = 0;
               session.speechDetected = false;
               session.speechStartedAt = 0;
               session.lastSpeechAt = 0;
@@ -336,16 +369,7 @@ export function handleVoiceStreamUpgrade(
             }
 
             // Process the turn
-            session.processing = true;
-            processTurn(session, ws, logger, voiceCfg, gatewayOrigin, authToken)
-              .catch((err) => {
-                logger.error(`VoiceStream: processTurn error: ${err}`);
-                sendJsonMsg(ws, { type: 'error', message: 'Processing error' });
-                sendJsonMsg(ws, { type: 'ready' });
-              })
-              .finally(() => {
-                session.processing = false;
-              });
+            forceProcessTurn();
           }, SILENCE_DURATION_MS);
         }
       }

@@ -369,7 +369,9 @@ Provide a concise report of your findings or actions. Start with a one-line summ
       fullOutput: errorMsg,
     };
 
-    await store.appendReport(talkId, report).catch(() => {});
+    await store.appendReport(talkId, report).catch((reportErr) => {
+      logger.error(`JobScheduler: failed to persist error report for job ${job.id}: ${reportErr}`);
+    });
     store.updateJob(talkId, job.id, { lastRunAt: runAt, lastStatus: 'error' });
   }
 }

@@ -26,6 +26,7 @@ import { startJobScheduler } from './job-scheduler.js';
 import { handleFileUpload } from './file-upload.js';
 import { ToolRegistry } from './tool-registry.js';
 import { ToolExecutor } from './tool-executor.js';
+import { registerCommands } from './commands.js';
 
 const ROUTES = new Set([
   '/api/pair',
@@ -136,29 +137,58 @@ const plugin = {
     // Eagerly warm up the usage loader in background
     warmUsageLoader(api.logger);
 
-    // Initialize Talk store
+    // Initialize Talk store (async)
     const talkStore = new TalkStore(pluginCfg.dataDir, api.logger);
+    talkStore.init().catch(err => api.logger.error(`TalkStore init failed: ${err}`));
 
     // Initialize tool registry and executor
     const toolRegistry = new ToolRegistry(pluginCfg.dataDir, api.logger);
     const toolExecutor = new ToolExecutor(toolRegistry, api.logger);
 
-    // Start job scheduler
-    const cfg0 = api.runtime.config.loadConfig();
-    const gatewayToken0 = resolveGatewayToken(cfg0);
-    // For self-calls (job scheduler), always use 127.0.0.1 — never the
-    // externalUrl, which is a client-facing URL that may not be reachable
-    // from the server itself (e.g. Tailscale funnel HTTPS hairpin issues).
-    const schedulerOrigin = 'http://127.0.0.1:18789';
-    const stopScheduler = startJobScheduler({
-      store: talkStore,
-      gatewayOrigin: schedulerOrigin,
-      authToken: gatewayToken0,
-      logger: api.logger,
-      registry: toolRegistry,
-      executor: toolExecutor,
-      jobTimeoutMs: pluginCfg.jobTimeoutMs,
+    // Register job scheduler as a managed service
+    let stopScheduler: (() => void) | null = null;
+    api.registerService({
+      id: 'clawtalk-job-scheduler',
+      start: () => {
+        const cfg0 = api.runtime.config.loadConfig();
+        const gatewayToken0 = resolveGatewayToken(cfg0);
+        // For self-calls (job scheduler), always use 127.0.0.1 — never the
+        // externalUrl, which is a client-facing URL that may not be reachable
+        // from the server itself (e.g. Tailscale funnel HTTPS hairpin issues).
+        const schedulerOrigin = 'http://127.0.0.1:18789';
+        stopScheduler = startJobScheduler({
+          store: talkStore,
+          gatewayOrigin: schedulerOrigin,
+          authToken: gatewayToken0,
+          logger: api.logger,
+          registry: toolRegistry,
+          executor: toolExecutor,
+          jobTimeoutMs: pluginCfg.jobTimeoutMs,
+        });
+      },
+      stop: () => {
+        if (stopScheduler) {
+          stopScheduler();
+          stopScheduler = null;
+        }
+      },
     });
+
+    // Register lifecycle hooks
+    api.on('gateway_start', () => {
+      api.logger.info('ClawTalk: gateway_start event received');
+    });
+
+    api.on('gateway_stop', () => {
+      api.logger.info('ClawTalk: gateway_stop event received — cleaning up');
+      if (stopScheduler) {
+        stopScheduler();
+        stopScheduler = null;
+      }
+    });
+
+    // Register plugin commands
+    registerCommands(api, talkStore);
 
     // Log voice availability
     const { sttAvailable, ttsAvailable } = resolveVoiceAvailability(pluginCfg.voice);

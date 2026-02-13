@@ -18,6 +18,7 @@ const mockLogger: Logger = {
 beforeEach(async () => {
   tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'talkstore-test-'));
   store = new TalkStore(tmpDir, mockLogger);
+  await store.init();
 });
 
 afterEach(async () => {
@@ -105,6 +106,7 @@ describe('Talk CRUD', () => {
 
     // Create a new store from the same directory
     const store2 = new TalkStore(tmpDir, mockLogger);
+    await store2.init();
     const loaded = store2.getTalk(talk.id);
     expect(loaded).not.toBeNull();
     expect(loaded!.topicTitle).toBe('Persisted Talk');

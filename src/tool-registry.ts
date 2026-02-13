@@ -158,10 +158,18 @@ export class ToolRegistry {
     return result;
   }
 
-  /** Register a new dynamic tool. Returns false if name conflicts with a built-in. */
+  /** Maximum number of dynamic tools allowed. */
+  private static readonly MAX_DYNAMIC_TOOLS = 200;
+
+  /** Register a new dynamic tool. Returns false if name conflicts with a built-in or limit reached. */
   registerTool(name: string, description: string, parameters: ToolDefinition['function']['parameters']): boolean {
     if (BUILTIN_TOOLS.has(name)) {
       this.logger.warn(`ToolRegistry: cannot override built-in tool "${name}"`);
+      return false;
+    }
+    // Reject if at capacity (updates to existing tools are still allowed)
+    if (!this.dynamicTools.has(name) && this.dynamicTools.size >= ToolRegistry.MAX_DYNAMIC_TOOLS) {
+      this.logger.warn(`ToolRegistry: dynamic tool limit reached (${ToolRegistry.MAX_DYNAMIC_TOOLS}), rejecting "${name}"`);
       return false;
     }
     const tool: ToolDefinition = {
@@ -219,8 +227,8 @@ export class ToolRegistry {
         }
       }
       this.logger.info(`ToolRegistry: loaded ${this.dynamicTools.size} dynamic tool(s)`);
-    } catch {
-      // No file or parse error — start fresh
+    } catch (err) {
+      this.logger.warn(`ToolRegistry: failed to load tools from ${this.persistPath}: ${err}`);
     }
   }
 

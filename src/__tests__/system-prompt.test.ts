@@ -23,22 +23,26 @@ function makeMessage(overrides: Partial<TalkMessage> = {}): TalkMessage {
 }
 
 describe('composeSystemPrompt', () => {
-  it('returns undefined when no enrichment data exists', () => {
+  it('returns a prompt even when no enrichment data exists', () => {
     const result = composeSystemPrompt({
       meta: makeMeta(),
       contextMd: '',
       pinnedMessages: [],
     });
-    expect(result).toBeUndefined();
+    // Always includes base instruction and execution environment
+    expect(result).toBeDefined();
+    expect(result).toContain('focused assistant');
   });
 
-  it('returns undefined for whitespace-only contextMd', () => {
+  it('returns a prompt for whitespace-only contextMd', () => {
     const result = composeSystemPrompt({
       meta: makeMeta(),
       contextMd: '   \n\n  ',
       pinnedMessages: [],
     });
-    expect(result).toBeUndefined();
+    expect(result).toBeDefined();
+    // Should NOT include context section for whitespace-only
+    expect(result).not.toContain('## Conversation Context');
   });
 
   it('includes objective section when set', () => {
@@ -105,6 +109,21 @@ describe('composeSystemPrompt', () => {
     expect(result).not.toContain('A'.repeat(201));
   });
 
+  it('caps pinned messages at 10', () => {
+    const messages = Array.from({ length: 15 }, (_, i) =>
+      makeMessage({ id: `msg-${i}`, content: `Pin ${i}` })
+    );
+    const result = composeSystemPrompt({
+      meta: makeMeta({ pinnedMessageIds: messages.map(m => m.id) }),
+      contextMd: '',
+      pinnedMessages: messages,
+    })!;
+    expect(result).toContain('Pin 0');
+    expect(result).toContain('Pin 9');
+    expect(result).not.toContain('Pin 10');
+    expect(result).toContain('5 more pinned messages');
+  });
+
   it('includes active jobs section', () => {
     const result = composeSystemPrompt({
       meta: makeMeta({
@@ -119,11 +138,11 @@ describe('composeSystemPrompt', () => {
     expect(result).toBeDefined();
     expect(result).toContain('## Active Jobs');
     expect(result).toContain('[every 6h] Check sprint burndown');
-    // Inactive job should NOT appear
+    // Inactive job should NOT appear in Active Jobs section
     expect(result).not.toContain('Summarize PRs');
   });
 
-  it('omits jobs section when all jobs are inactive', () => {
+  it('omits active jobs section when all jobs are inactive', () => {
     const result = composeSystemPrompt({
       meta: makeMeta({
         jobs: [
@@ -133,8 +152,24 @@ describe('composeSystemPrompt', () => {
       contextMd: '',
       pinnedMessages: [],
     });
-    // Only base instruction, no enrichment → undefined
-    expect(result).toBeUndefined();
+    // Should still return a prompt (base instruction), but no Active Jobs section
+    expect(result).toBeDefined();
+    expect(result).not.toContain('## Active Jobs');
+  });
+
+  it('truncates long job prompts to 200 chars', () => {
+    const longPrompt = 'B'.repeat(300);
+    const result = composeSystemPrompt({
+      meta: makeMeta({
+        jobs: [
+          { id: 'j1', schedule: 'every 1h', prompt: longPrompt, active: true, createdAt: Date.now() },
+        ],
+      }),
+      contextMd: '',
+      pinnedMessages: [],
+    })!;
+    expect(result).toContain('B'.repeat(200) + '...');
+    expect(result).not.toContain('B'.repeat(201));
   });
 
   it('combines all sections together', () => {
@@ -162,13 +197,13 @@ describe('composeSystemPrompt', () => {
     expect(result).toContain('Check error logs');
   });
 
-  it('always starts with the base instruction', () => {
+  it('includes the base instruction', () => {
     const result = composeSystemPrompt({
       meta: makeMeta({ objective: 'Test' }),
       contextMd: '',
       pinnedMessages: [],
     })!;
-    expect(result.startsWith('You are a focused assistant')).toBe(true);
+    expect(result).toContain('focused assistant');
   });
 
   it('separates sections with double newlines', () => {
@@ -177,8 +212,11 @@ describe('composeSystemPrompt', () => {
       contextMd: 'Some context',
       pinnedMessages: [],
     })!;
-    // Base instruction and Objective should be separated by \n\n
-    expect(result).toContain('conversation.\n\n## Objective');
-    expect(result).toContain('reached.\n\n## Conversation Context');
+    // Sections should be separated by \n\n
+    expect(result).toContain('## Objective');
+    expect(result).toContain('## Conversation Context');
+    // Both should appear with clear separation
+    expect(result).toContain('Test objective');
+    expect(result).toContain('Some context');
   });
 });

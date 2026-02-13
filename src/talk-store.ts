@@ -20,6 +20,12 @@ const DEFAULT_DATA_DIR = path.join(
   'clawtalk',
 );
 
+/** Threshold below which getRecentMessages does a full load + slice. */
+const SMALL_FILE_BYTES = 64 * 1024; // 64KB
+
+/** TTL for context.md cache entries. */
+const CONTEXT_CACHE_TTL_MS = 30_000;
+
 /** Validate that a talk ID is safe for use as a directory name. */
 function isValidId(id: string): boolean {
   return /^[\w-]+$/.test(id) && !id.includes('..');
@@ -30,34 +36,43 @@ export class TalkStore {
   private readonly talks: Map<string, TalkMeta> = new Map();
   private readonly logger: Logger;
 
+  // Caches
+  private listTalksCache: TalkMeta[] | null = null;
+  private contextCache = new Map<string, { content: string; expiresAt: number }>();
+
   constructor(dataDir: string | undefined, logger: Logger) {
     this.talksDir = path.join(dataDir || DEFAULT_DATA_DIR, 'talks');
     this.logger = logger;
-    this.ensureDir();
-    this.loadAll();
+    // Constructor no longer calls sync loadAll — use init() instead
   }
 
-  private ensureDir(): void {
-    if (!fs.existsSync(this.talksDir)) {
-      fs.mkdirSync(this.talksDir, { recursive: true });
-    }
+  /** Async initialization — call this before using the store. */
+  async init(): Promise<void> {
+    await this.ensureDir();
+    await this.loadAllAsync();
   }
 
-  private loadAll(): void {
+  private async ensureDir(): Promise<void> {
+    await fsp.mkdir(this.talksDir, { recursive: true });
+  }
+
+  private async loadAllAsync(): Promise<void> {
     try {
-      const dirs = fs.readdirSync(this.talksDir);
+      const dirs = await fsp.readdir(this.talksDir);
       for (const dir of dirs) {
         if (!isValidId(dir)) continue;
         const metaPath = path.join(this.talksDir, dir, 'talk.json');
-        if (fs.existsSync(metaPath)) {
-          try {
-            const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8')) as TalkMeta;
-            // Ensure arrays exist (for older files)
-            meta.pinnedMessageIds ??= [];
-            meta.jobs ??= [];
-            meta.agents ??= [];
-            this.talks.set(meta.id, meta);
-          } catch (err) {
+        try {
+          const raw = await fsp.readFile(metaPath, 'utf-8');
+          const meta = JSON.parse(raw) as TalkMeta;
+          // Ensure arrays exist (for older files)
+          meta.pinnedMessageIds ??= [];
+          meta.jobs ??= [];
+          meta.agents ??= [];
+          this.talks.set(meta.id, meta);
+        } catch (err) {
+          // File may not exist or be corrupted — skip it
+          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
             this.logger.warn(`TalkStore: skipping corrupted talk ${dir}: ${err}`);
           }
         }
@@ -66,6 +81,11 @@ export class TalkStore {
     } catch (err) {
       this.logger.warn(`TalkStore: failed to read talks dir: ${err}`);
     }
+  }
+
+  /** Invalidate listTalks sorted cache. */
+  private invalidateListCache(): void {
+    this.listTalksCache = null;
   }
 
   // -------------------------------------------------------------------------
@@ -84,6 +104,7 @@ export class TalkStore {
       updatedAt: now,
     };
     this.talks.set(id, meta);
+    this.invalidateListCache();
     this.persistMeta(meta);
     return meta;
   }
@@ -93,8 +114,11 @@ export class TalkStore {
   }
 
   listTalks(): TalkMeta[] {
-    return Array.from(this.talks.values())
+    if (this.listTalksCache) return this.listTalksCache;
+    const sorted = Array.from(this.talks.values())
       .sort((a, b) => b.updatedAt - a.updatedAt);
+    this.listTalksCache = sorted;
+    return sorted;
   }
 
   updateTalk(id: string, updates: Partial<Pick<TalkMeta, 'topicTitle' | 'objective' | 'model'>>): TalkMeta | null {
@@ -106,6 +130,7 @@ export class TalkStore {
     if (updates.model !== undefined) meta.model = updates.model;
     meta.updatedAt = Date.now();
 
+    this.invalidateListCache();
     this.persistMeta(meta);
     return meta;
   }
@@ -113,9 +138,13 @@ export class TalkStore {
   deleteTalk(id: string): boolean {
     if (!this.talks.has(id)) return false;
     this.talks.delete(id);
+    this.invalidateListCache();
+    this.contextCache.delete(id);
     if (isValidId(id)) {
       const talkDir = path.join(this.talksDir, id);
-      fsp.rm(talkDir, { recursive: true, force: true }).catch(() => {});
+      fsp.rm(talkDir, { recursive: true, force: true }).catch((err) => {
+        this.logger.error(`TalkStore: failed to delete talk directory ${id}: ${err}`);
+      });
     }
     return true;
   }
@@ -136,6 +165,7 @@ export class TalkStore {
     const meta = this.talks.get(talkId);
     if (meta) {
       meta.updatedAt = Date.now();
+      this.invalidateListCache();
       this.persistMeta(meta);
     }
   }
@@ -161,16 +191,106 @@ export class TalkStore {
     return messages;
   }
 
-  /** Read the last N messages from history. */
+  /**
+   * Read the last N messages from history.
+   * For files < 64KB, does a full load + slice.
+   * For larger files, reads backwards in chunks (tail-first).
+   */
   async getRecentMessages(talkId: string, limit: number): Promise<TalkMessage[]> {
-    const all = await this.getMessages(talkId);
-    return all.slice(-limit);
+    if (!isValidId(talkId)) return [];
+    const historyPath = path.join(this.talksDir, talkId, 'history.jsonl');
+
+    let stat: fs.Stats;
+    try {
+      stat = await fsp.stat(historyPath);
+    } catch {
+      return [];
+    }
+
+    // Small files: full load + slice (simpler, fast enough)
+    if (stat.size < SMALL_FILE_BYTES) {
+      const all = await this.getMessages(talkId);
+      return all.slice(-limit);
+    }
+
+    // Large files: read backwards in chunks
+    const fd = await fsp.open(historyPath, 'r');
+    try {
+      const messages: TalkMessage[] = [];
+      const chunkSize = 16 * 1024; // 16KB chunks
+      let position = stat.size;
+      let trailing = '';
+
+      while (position > 0 && messages.length < limit) {
+        const readSize = Math.min(chunkSize, position);
+        position -= readSize;
+        const buf = Buffer.alloc(readSize);
+        await fd.read(buf, 0, readSize, position);
+        const chunk = buf.toString('utf-8') + trailing;
+        trailing = '';
+
+        const lines = chunk.split('\n');
+        // First element may be a partial line (unless we're at the start of file)
+        if (position > 0) {
+          trailing = lines.shift()!;
+        }
+
+        // Process lines in reverse order
+        for (let i = lines.length - 1; i >= 0; i--) {
+          const line = lines[i].trim();
+          if (!line) continue;
+          try {
+            messages.unshift(JSON.parse(line) as TalkMessage);
+            if (messages.length >= limit) break;
+          } catch {
+            // skip malformed lines
+          }
+        }
+      }
+
+      // Handle any remaining trailing data from the start of the file
+      if (trailing.trim() && messages.length < limit) {
+        try {
+          messages.unshift(JSON.parse(trailing) as TalkMessage);
+        } catch {
+          // skip malformed
+        }
+      }
+
+      return messages.slice(-limit);
+    } finally {
+      await fd.close();
+    }
   }
 
-  /** Get a specific message by ID. */
+  /**
+   * Get a specific message by ID.
+   * Streams JSONL line-by-line and stops on match instead of loading all.
+   */
   async getMessage(talkId: string, messageId: string): Promise<TalkMessage | null> {
-    const all = await this.getMessages(talkId);
-    return all.find(m => m.id === messageId) ?? null;
+    if (!isValidId(talkId)) return null;
+    const historyPath = path.join(this.talksDir, talkId, 'history.jsonl');
+    if (!fs.existsSync(historyPath)) return null;
+
+    const stream = fs.createReadStream(historyPath, 'utf-8');
+    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+
+    try {
+      for await (const line of rl) {
+        if (!line.trim()) continue;
+        try {
+          const msg = JSON.parse(line) as TalkMessage;
+          if (msg.id === messageId) {
+            return msg;
+          }
+        } catch {
+          // skip malformed lines
+        }
+      }
+    } finally {
+      stream.destroy();
+    }
+    return null;
   }
 
   // -------------------------------------------------------------------------
@@ -183,6 +303,7 @@ export class TalkStore {
     if (meta.pinnedMessageIds.includes(messageId)) return false;
     meta.pinnedMessageIds.push(messageId);
     meta.updatedAt = Date.now();
+    this.invalidateListCache();
     this.persistMeta(meta);
     return true;
   }
@@ -194,19 +315,32 @@ export class TalkStore {
     if (idx === -1) return false;
     meta.pinnedMessageIds.splice(idx, 1);
     meta.updatedAt = Date.now();
+    this.invalidateListCache();
     this.persistMeta(meta);
     return true;
   }
 
   // -------------------------------------------------------------------------
-  // Context document
+  // Context document (with TTL cache)
   // -------------------------------------------------------------------------
 
   async getContextMd(talkId: string): Promise<string> {
     if (!isValidId(talkId)) return '';
+
+    // Check cache first
+    const cached = this.contextCache.get(talkId);
+    if (cached && Date.now() < cached.expiresAt) {
+      return cached.content;
+    }
+
     const ctxPath = path.join(this.talksDir, talkId, 'context.md');
     try {
-      return await fsp.readFile(ctxPath, 'utf-8');
+      const content = await fsp.readFile(ctxPath, 'utf-8');
+      this.contextCache.set(talkId, {
+        content,
+        expiresAt: Date.now() + CONTEXT_CACHE_TTL_MS,
+      });
+      return content;
     } catch {
       return '';
     }
@@ -217,6 +351,11 @@ export class TalkStore {
     const dir = path.join(this.talksDir, talkId);
     await fsp.mkdir(dir, { recursive: true });
     await fsp.writeFile(path.join(dir, 'context.md'), content, 'utf-8');
+    // Invalidate cache
+    this.contextCache.set(talkId, {
+      content,
+      expiresAt: Date.now() + CONTEXT_CACHE_TTL_MS,
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -238,6 +377,7 @@ export class TalkStore {
 
     meta.jobs.push(job);
     meta.updatedAt = Date.now();
+    this.invalidateListCache();
     this.persistMeta(meta);
     return job;
   }
@@ -265,6 +405,7 @@ export class TalkStore {
     if (updates.lastRunAt !== undefined) job.lastRunAt = updates.lastRunAt;
     if (updates.lastStatus !== undefined) job.lastStatus = updates.lastStatus;
     meta.updatedAt = Date.now();
+    this.invalidateListCache();
     this.persistMeta(meta);
     return job;
   }
@@ -276,6 +417,7 @@ export class TalkStore {
     if (idx === -1) return false;
     meta.jobs.splice(idx, 1);
     meta.updatedAt = Date.now();
+    this.invalidateListCache();
     this.persistMeta(meta);
     return true;
   }
@@ -301,6 +443,7 @@ export class TalkStore {
     if (!meta.agents) meta.agents = [];
     meta.agents.push(agent);
     meta.updatedAt = Date.now();
+    this.invalidateListCache();
     this.persistMeta(meta);
     return agent;
   }
@@ -312,6 +455,7 @@ export class TalkStore {
     if (idx === -1) throw new Error('Agent not found');
     meta.agents!.splice(idx, 1);
     meta.updatedAt = Date.now();
+    this.invalidateListCache();
     this.persistMeta(meta);
   }
 
@@ -325,6 +469,7 @@ export class TalkStore {
     if (!meta) throw new Error('Talk not found');
     meta.agents = agents;
     meta.updatedAt = Date.now();
+    this.invalidateListCache();
     this.persistMeta(meta);
   }
 

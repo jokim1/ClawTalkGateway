@@ -8,6 +8,18 @@
 import type { TalkMeta, TalkMessage, TalkJob } from './types.js';
 import type { ToolRegistry } from './tool-registry.js';
 
+/** Maximum pinned messages included in the prompt. */
+const MAX_PINNED_IN_PROMPT = 10;
+
+/** Maximum tools listed in the prompt. */
+const MAX_TOOLS_IN_PROMPT = 20;
+
+/** Maximum characters per job prompt display. */
+const MAX_JOB_PROMPT_CHARS = 200;
+
+/** Maximum total prompt size in bytes. */
+const MAX_PROMPT_BYTES = 100 * 1024; // 100KB
+
 export interface SystemPromptInput {
   meta: TalkMeta;
   contextMd: string;
@@ -23,6 +35,9 @@ export interface SystemPromptInput {
 
 export function composeSystemPrompt(input: SystemPromptInput): string | undefined {
   const { meta, contextMd, pinnedMessages, agentOverride, registry } = input;
+
+  // Priority-ordered sections: identity > objective > context > pinned > jobs > tools
+  // Each section is built and then assembled, truncating lower-priority sections if needed.
 
   const sections: string[] = [];
 
@@ -43,13 +58,18 @@ export function composeSystemPrompt(input: SystemPromptInput): string | undefine
   if (registry) {
     const tools = registry.listTools();
     if (tools.length > 0) {
-      const toolLines = tools.map(t => `- **${t.name}**: ${t.description.slice(0, 120)}`);
+      // Cap tool listing at MAX_TOOLS_IN_PROMPT
+      const displayTools = tools.slice(0, MAX_TOOLS_IN_PROMPT);
+      const toolLines = displayTools.map(t => `- **${t.name}**: ${t.description.slice(0, 120)}`);
+      const overflow = tools.length > MAX_TOOLS_IN_PROMPT
+        ? `\n- ... and ${tools.length - MAX_TOOLS_IN_PROMPT} more tools`
+        : '';
       sections.push(
         '## Execution Environment\n' +
         'Your response is displayed in a terminal chat interface (ClawTalk). ' +
         'You have **tools available** via function calling.\n\n' +
         '### Available Tools\n' +
-        toolLines.join('\n') + '\n\n' +
+        toolLines.join('\n') + overflow + '\n\n' +
         '### Tool Usage Guidelines\n' +
         '- **Use tools proactively** when the user asks you to perform actions (file ops, web requests, installations, etc.).\n' +
         '- If a tool call fails, tell the user what happened and suggest alternatives.\n' +
@@ -129,24 +149,33 @@ export function composeSystemPrompt(input: SystemPromptInput): string | undefine
     );
   }
 
-  // Pinned references
+  // Pinned references (capped at MAX_PINNED_IN_PROMPT)
   if (pinnedMessages.length > 0) {
-    const pinLines = pinnedMessages.map(m => {
+    const capped = pinnedMessages.slice(0, MAX_PINNED_IN_PROMPT);
+    const pinLines = capped.map(m => {
       const preview = m.content.length > 200
         ? m.content.slice(0, 200) + '...'
         : m.content;
       const ts = new Date(m.timestamp).toISOString().slice(0, 16).replace('T', ' ');
       return `- ${m.role} (${ts}): ${preview}`;
     });
+    const overflow = pinnedMessages.length > MAX_PINNED_IN_PROMPT
+      ? `\n- ... and ${pinnedMessages.length - MAX_PINNED_IN_PROMPT} more pinned messages`
+      : '';
     sections.push(
-      `## Pinned References\nThe user has pinned these as important:\n${pinLines.join('\n')}`,
+      `## Pinned References\nThe user has pinned these as important:\n${pinLines.join('\n')}${overflow}`,
     );
   }
 
-  // Active jobs
+  // Active jobs (cap prompt display at MAX_JOB_PROMPT_CHARS each)
   const activeJobs = meta.jobs.filter(j => j.active);
   if (activeJobs.length > 0) {
-    const jobLines = activeJobs.map(j => `- [${j.schedule}] ${j.prompt}`);
+    const jobLines = activeJobs.map(j => {
+      const promptPreview = j.prompt.length > MAX_JOB_PROMPT_CHARS
+        ? j.prompt.slice(0, MAX_JOB_PROMPT_CHARS) + '...'
+        : j.prompt;
+      return `- [${j.schedule}] ${promptPreview}`;
+    });
     sections.push(
       `## Active Jobs\nBackground tasks monitoring this conversation:\n${jobLines.join('\n')}`,
     );
@@ -191,5 +220,22 @@ export function composeSystemPrompt(input: SystemPromptInput): string | undefine
     `recurring work within a Talk's scope.`,
   );
 
-  return sections.join('\n\n');
+  let result = sections.join('\n\n');
+
+  // Truncate at MAX_PROMPT_BYTES to prevent excessive prompt sizes
+  if (Buffer.byteLength(result, 'utf-8') > MAX_PROMPT_BYTES) {
+    // Truncate from the end (lower-priority sections: jobs, tools are at bottom)
+    const encoder = new TextEncoder();
+    const encoded = encoder.encode(result);
+    const truncated = encoded.slice(0, MAX_PROMPT_BYTES);
+    result = new TextDecoder().decode(truncated);
+    // Ensure we end at a clean line boundary
+    const lastNewline = result.lastIndexOf('\n');
+    if (lastNewline > MAX_PROMPT_BYTES * 0.9) {
+      result = result.slice(0, lastNewline);
+    }
+    result += '\n\n[System prompt truncated due to size]';
+  }
+
+  return result;
 }

@@ -33,6 +33,9 @@ Output only the updated document, nothing else.`;
 /** Rate-limit: minimum interval between context updates per talk. */
 const MIN_UPDATE_INTERVAL_MS = 30_000;
 
+/** Maximum entries in the lastUpdateTime map. */
+const MAX_UPDATE_TIME_ENTRIES = 500;
+
 /** Track last update time per talk to rate-limit. */
 const lastUpdateTime = new Map<string, number>();
 
@@ -59,6 +62,19 @@ export function scheduleContextUpdate(opts: ContextUpdateOptions): void {
     return;
   }
   lastUpdateTime.set(opts.talkId, now);
+
+  // Prune oldest entries if map exceeds cap
+  if (lastUpdateTime.size > MAX_UPDATE_TIME_ENTRIES) {
+    let oldestKey: string | undefined;
+    let oldestTime = Infinity;
+    for (const [key, time] of lastUpdateTime) {
+      if (time < oldestTime) {
+        oldestTime = time;
+        oldestKey = key;
+      }
+    }
+    if (oldestKey) lastUpdateTime.delete(oldestKey);
+  }
 
   doContextUpdate(opts).catch(err => {
     opts.logger.warn(`ContextUpdater: failed for ${opts.talkId}: ${err}`);
