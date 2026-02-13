@@ -9,6 +9,7 @@ import type { HandlerContext } from './types.js';
 import type { TalkStore } from './talk-store.js';
 import type { ToolRegistry } from './tool-registry.js';
 import { sendJson, readJsonBody } from './http.js';
+import { validateSchedule } from './job-scheduler.js';
 
 /**
  * Route a /api/talks request to the appropriate handler.
@@ -268,6 +269,12 @@ async function handleCreateJob(ctx: HandlerContext, store: TalkStore, talkId: st
     return;
   }
 
+  const scheduleError = validateSchedule(body.schedule);
+  if (scheduleError) {
+    sendJson(ctx.res, 400, { error: scheduleError });
+    return;
+  }
+
   const job = store.addJob(talkId, body.schedule, body.prompt);
   if (!job) {
     sendJson(ctx.res, 500, { error: 'Failed to create job' });
@@ -294,6 +301,14 @@ async function handleUpdateJob(ctx: HandlerContext, store: TalkStore, talkId: st
   } catch {
     sendJson(ctx.res, 400, { error: 'Invalid JSON body' });
     return;
+  }
+
+  if (body.schedule) {
+    const scheduleError = validateSchedule(body.schedule);
+    if (scheduleError) {
+      sendJson(ctx.res, 400, { error: scheduleError });
+      return;
+    }
   }
 
   const updated = store.updateJob(talkId, jobId, body);

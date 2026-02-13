@@ -137,7 +137,14 @@ function getAvailableProviders(): RealtimeVoiceProvider[] {
   return providers;
 }
 
-function getDefaultProvider(providers: RealtimeVoiceProvider[]): RealtimeVoiceProvider | undefined {
+function getDefaultProvider(
+  providers: RealtimeVoiceProvider[],
+  cfg?: RealtimeVoicePluginConfig,
+): RealtimeVoiceProvider | undefined {
+  // Use configured default if available and the provider is active
+  if (cfg?.defaultProvider && providers.includes(cfg.defaultProvider)) {
+    return cfg.defaultProvider;
+  }
   // Prefer OpenAI for realtime (most complete solution)
   if (providers.includes('openai')) return 'openai';
   if (providers.includes('elevenlabs')) return 'elevenlabs';
@@ -159,7 +166,8 @@ export async function handleRealtimeVoiceCapabilities(ctx: HandlerContext): Prom
   }
 
   const providers = getAvailableProviders();
-  const defaultProvider = getDefaultProvider(providers);
+  const realtimeVoiceCfg = ctx.pluginCfg.realtimeVoice;
+  const defaultProvider = getDefaultProvider(providers, realtimeVoiceCfg);
 
   // Build voices map for available providers only
   const voices: Partial<Record<RealtimeVoiceProvider, string[]>> = {};
@@ -240,6 +248,7 @@ async function connectToOpenAI(
   logger: Logger,
   voice: string,
   systemPrompt: string | undefined,
+  model?: string,
 ): Promise<ProviderSession | null> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
@@ -249,8 +258,9 @@ async function connectToOpenAI(
 
   try {
     // OpenAI Realtime API WebSocket — GA model (no Beta header)
+    const realtimeModel = model ?? 'gpt-realtime';
     const openaiWs = new WebSocket(
-      'wss://api.openai.com/v1/realtime?model=gpt-realtime',
+      `wss://api.openai.com/v1/realtime?model=${realtimeModel}`,
       {
         headers: {
           'Authorization': `Bearer ${apiKey}`,
@@ -281,7 +291,7 @@ async function connectToOpenAI(
           type: 'session.update',
           session: {
             type: 'realtime',
-            model: 'gpt-realtime',
+            model: realtimeModel,
             instructions: systemPrompt || 'You are a helpful voice assistant. Keep responses concise.',
             output_modalities: ['text', 'audio'],
             audio: {
@@ -623,7 +633,7 @@ export function handleRealtimeVoiceStreamUpgrade(
   req: IncomingMessage,
   res: ServerResponse,
   logger: Logger,
-  _voiceCfg: RealtimeVoicePluginConfig | undefined,
+  voiceCfg: RealtimeVoicePluginConfig | undefined,
 ): void {
   // Validate WebSocket upgrade
   const upgradeHeader = (req.headers['upgrade'] ?? '').toLowerCase();
@@ -648,7 +658,7 @@ export function handleRealtimeVoiceStreamUpgrade(
 
   const provider = providerParam && availableProviders.includes(providerParam)
     ? providerParam
-    : getDefaultProvider(availableProviders)!;
+    : getDefaultProvider(availableProviders, voiceCfg)!;
 
   const socket = req.socket;
   const wss = getWSS();
@@ -742,7 +752,10 @@ export function handleRealtimeVoiceStreamUpgrade(
         switch (provider) {
           case 'openai':
             providerSession = await connectToOpenAI(
-              clientWs, logger, msg.voice || 'alloy', msg.systemPrompt
+              clientWs, logger,
+              msg.voice || voiceCfg?.openai?.voice || 'alloy',
+              msg.systemPrompt,
+              voiceCfg?.openai?.model,
             );
             break;
 
@@ -754,7 +767,9 @@ export function handleRealtimeVoiceStreamUpgrade(
 
           case 'cartesia':
             providerSession = await connectToCartesia(
-              clientWs, logger, msg.voice || 'sonic-english', msg.systemPrompt
+              clientWs, logger,
+              msg.voice || voiceCfg?.cartesia?.voice || 'sonic-english',
+              msg.systemPrompt,
             );
             break;
 

@@ -15,9 +15,9 @@ import type { TalkMeta, TalkMessage, TalkJob, TalkAgent, JobReport, Logger } fro
 
 const DEFAULT_DATA_DIR = path.join(
   process.env.HOME || '~',
-  '.moltbot',
+  '.openclaw',
   'plugins',
-  'remoteclaw',
+  'clawtalk',
 );
 
 /** Validate that a talk ID is safe for use as a directory name. */

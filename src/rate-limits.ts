@@ -13,7 +13,7 @@ import { sendJson } from './http.js';
 import { getProxyCachedLimits } from './proxy.js';
 
 // ---------------------------------------------------------------------------
-// Usage loader — uses moltbot internals for rate-limit data
+// Usage loader — uses openclaw internals for rate-limit data
 // ---------------------------------------------------------------------------
 
 // Prevent TypeScript from downcompiling import() to require(), which cannot
@@ -23,10 +23,10 @@ const dynamicImport = new Function('specifier', 'return import(specifier)') as
 
 let _loadUsage: ((opts?: any) => Promise<UsageSummary>) | null = null;
 
-function findMoltbotRoot(): string | null {
+function findOpenclawRoot(): string | null {
   const candidates = [
-    '/usr/lib/node_modules/moltbot',
-    '/usr/local/lib/node_modules/moltbot',
+    '/usr/lib/node_modules/openclaw',
+    '/usr/local/lib/node_modules/openclaw',
   ];
   for (const root of candidates) {
     if (existsSync(`${root}/dist/infra/provider-usage.load.js`)) {
@@ -39,9 +39,9 @@ function findMoltbotRoot(): string | null {
 async function ensureUsageLoader(log: Logger): Promise<typeof _loadUsage> {
   if (_loadUsage) return _loadUsage;
 
-  const root = findMoltbotRoot();
+  const root = findOpenclawRoot();
   if (!root) {
-    log.warn('RemoteClaw: moltbot dist not found');
+    log.warn('ClawTalk: openclaw dist not found');
     return null;
   }
 
@@ -51,12 +51,12 @@ async function ensureUsageLoader(log: Logger): Promise<typeof _loadUsage> {
     );
     if (typeof mod.loadProviderUsageSummary === 'function') {
       _loadUsage = mod.loadProviderUsageSummary;
-      log.info('RemoteClaw: usage loader initialized via import()');
+      log.info('ClawTalk: usage loader initialized via import()');
       return _loadUsage;
     }
-    log.warn(`RemoteClaw: module loaded, keys: ${Object.keys(mod).join(', ')}`);
+    log.warn(`ClawTalk: module loaded, keys: ${Object.keys(mod).join(', ')}`);
   } catch (err) {
-    log.info(`RemoteClaw: import() approach failed: ${err}`);
+    log.info(`ClawTalk: import() approach failed: ${err}`);
   }
 
   try {
@@ -65,26 +65,26 @@ async function ensureUsageLoader(log: Logger): Promise<typeof _loadUsage> {
     );
     if (typeof mod.loadProviderUsageSummary === 'function') {
       _loadUsage = mod.loadProviderUsageSummary;
-      log.info('RemoteClaw: usage loader initialized via barrel import');
+      log.info('ClawTalk: usage loader initialized via barrel import');
       return _loadUsage;
     }
   } catch (err) {
-    log.info(`RemoteClaw: barrel import failed: ${err}`);
+    log.info(`ClawTalk: barrel import failed: ${err}`);
   }
 
-  log.info('RemoteClaw: falling back to subprocess strategy');
+  log.info('ClawTalk: falling back to subprocess strategy');
   _loadUsage = createSubprocessUsageLoader(root, log);
   return _loadUsage;
 }
 
 function createSubprocessUsageLoader(
-  moltbotRoot: string,
+  openclawRoot: string,
   log: Logger,
 ): (opts?: any) => Promise<UsageSummary> {
   return async () => {
     try {
       const script = `
-        import { loadProviderUsageSummary } from "${moltbotRoot}/dist/infra/provider-usage.load.js";
+        import { loadProviderUsageSummary } from "${openclawRoot}/dist/infra/provider-usage.load.js";
         const result = await loadProviderUsageSummary();
         process.stdout.write(JSON.stringify(result));
       `;
@@ -98,7 +98,7 @@ function createSubprocessUsageLoader(
       );
       return JSON.parse(output.trim());
     } catch (err) {
-      log.warn(`RemoteClaw: subprocess fetch failed: ${err}`);
+      log.warn(`ClawTalk: subprocess fetch failed: ${err}`);
       return { updatedAt: Date.now(), providers: [] };
     }
   };
@@ -209,7 +209,7 @@ export async function handleRateLimits(ctx: HandlerContext): Promise<void> {
 
   const providerFilter = ctx.url.searchParams.get('provider') ?? undefined;
 
-  // Try the moltbot usage loader first
+  // Try the openclaw usage loader first
   let usedProxyFallback = false;
   const loader = await ensureUsageLoader(ctx.logger);
 
@@ -243,7 +243,7 @@ export async function handleRateLimits(ctx: HandlerContext): Promise<void> {
         usedProxyFallback = true;
       }
     } catch (err) {
-      ctx.logger.warn(`RemoteClaw: usage loader error: ${String(err)}`);
+      ctx.logger.warn(`ClawTalk: usage loader error: ${String(err)}`);
       usedProxyFallback = true;
     }
   } else {

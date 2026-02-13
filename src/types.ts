@@ -1,7 +1,7 @@
 /**
- * Type definitions for RemoteClaw Gateway Plugin
+ * Type definitions for ClawTalk Gateway Plugin
  *
- * Matches the real moltbot plugin API.
+ * Matches the real openclaw plugin API.
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -33,7 +33,7 @@ export interface HandlerContext {
   res: ServerResponse;
   url: URL;
   cfg: Record<string, any>;
-  pluginCfg: RemoteClawPluginConfig;
+  pluginCfg: ClawTalkPluginConfig;
   logger: Logger;
 }
 
@@ -179,7 +179,7 @@ export interface TalkMeta {
   updatedAt: number;
 }
 
-export interface RemoteClawPluginConfig {
+export interface ClawTalkPluginConfig {
   proxyPort?: number;
   providers?: Record<string, ProviderBillingConfig>;
   voice?: VoicePluginConfig;
@@ -189,6 +189,8 @@ export interface RemoteClawPluginConfig {
   name?: string;
   dataDir?: string;
   uploadDir?: string;
+  llmCallTimeoutMs?: number;
+  jobTimeoutMs?: number;
 }
 
 export type { IncomingMessage, ServerResponse };

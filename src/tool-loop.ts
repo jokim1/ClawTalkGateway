@@ -46,6 +46,7 @@ export interface ToolLoopStreamOptions {
   registry: ToolRegistry;
   executor: ToolExecutor;
   logger: Logger;
+  timeoutMs?: number;
 }
 
 export interface ToolLoopStreamResult {
@@ -80,7 +81,7 @@ export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoop
           stream: true,
           stream_options: { include_usage: true },
         }),
-        signal: AbortSignal.timeout(LLM_CALL_TIMEOUT_MS),
+        signal: AbortSignal.timeout(opts.timeoutMs ?? LLM_CALL_TIMEOUT_MS),
       });
     } catch (err) {
       logger.error(`ToolLoop: LLM fetch failed (iteration ${iteration}): ${err}`);

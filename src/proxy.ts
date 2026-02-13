@@ -87,7 +87,7 @@ export function startProxy(
 ): { server: http.Server; close: () => Promise<void> } {
   // If already running (plugin hot-reload), return existing server
   if (activeServer?.listening) {
-    logger.debug(`RemoteClaw: proxy already running on 127.0.0.1:${port}`);
+    logger.debug(`ClawTalk: proxy already running on 127.0.0.1:${port}`);
     return {
       server: activeServer,
       close: () => new Promise((resolve) => { activeServer?.close(() => resolve()); }),
@@ -125,7 +125,7 @@ export function startProxy(
         if (parsed) {
           store.set('anthropic', parsed);
           logger.debug(
-            `RemoteClaw proxy: captured — 5h: ${parsed.fiveHour ? `${Math.round(parsed.fiveHour.utilization * 100)}%` : 'n/a'}, 7d: ${parsed.sevenDay ? `${Math.round(parsed.sevenDay.utilization * 100)}%` : 'n/a'}`,
+            `ClawTalk proxy: captured — 5h: ${parsed.fiveHour ? `${Math.round(parsed.fiveHour.utilization * 100)}%` : 'n/a'}, 7d: ${parsed.sevenDay ? `${Math.round(parsed.sevenDay.utilization * 100)}%` : 'n/a'}`,
           );
         }
 
@@ -144,7 +144,7 @@ export function startProxy(
     );
 
     upstreamReq.on('error', (err) => {
-      logger.error(`RemoteClaw proxy: upstream error: ${err.message}`);
+      logger.error(`ClawTalk proxy: upstream error: ${err.message}`);
       if (!res.headersSent) {
         res.writeHead(502, { 'Content-Type': 'text/plain' });
       }
@@ -165,13 +165,13 @@ export function startProxy(
     server.listen(port, '127.0.0.1', () => {
       if (!started) {
         started = true;
-        logger.info(`RemoteClaw: proxy started on 127.0.0.1:${port}`);
+        logger.info(`ClawTalk: proxy started on 127.0.0.1:${port}`);
       }
     });
   }
 
   // unref() so the proxy doesn't prevent the process from exiting during
-  // short-lived CLI commands (e.g. `moltbot gateway stop/status`).  The
+  // short-lived CLI commands (e.g. `openclaw gateway stop/status`).  The
   // gateway's own HTTP server keeps the event loop alive during normal
   // operation, so the proxy will still run as long as the gateway is up.
   server.unref();
@@ -179,10 +179,10 @@ export function startProxy(
   server.on('error', (err: NodeJS.ErrnoException) => {
     if (err.code === 'EADDRINUSE' && retries < maxRetries) {
       retries++;
-      logger.info(`RemoteClaw: port ${port} busy, retrying (${retries}/${maxRetries})...`);
+      logger.info(`ClawTalk: port ${port} busy, retrying (${retries}/${maxRetries})...`);
       setTimeout(tryListen, retryDelay).unref();
     } else {
-      logger.error(`RemoteClaw: proxy server error: ${err.message}`);
+      logger.error(`ClawTalk: proxy server error: ${err.message}`);
     }
   });
 

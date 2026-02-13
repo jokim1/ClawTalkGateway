@@ -96,12 +96,12 @@ export async function handleFileUpload(
     await mkdir(dir, { recursive: true });
     await writeFile(destPath, fileBuffer);
   } catch (err) {
-    logger.error(`RemoteClaw: file upload write failed: ${err}`);
+    logger.error(`ClawTalk: file upload write failed: ${err}`);
     sendJson(res, 500, { error: 'Failed to save file on server' });
     return;
   }
 
-  logger.info(`RemoteClaw: file uploaded: ${finalName} (${fileBuffer.length} bytes) → ${destPath}`);
+  logger.info(`ClawTalk: file uploaded: ${finalName} (${fileBuffer.length} bytes) → ${destPath}`);
 
   sendJson(res, 200, {
     ok: true,

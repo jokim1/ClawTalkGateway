@@ -35,6 +35,7 @@ export interface JobSchedulerOptions {
   logger: Logger;
   registry: ToolRegistry;
   executor: ToolExecutor;
+  jobTimeoutMs?: number;
 }
 
 /**
@@ -112,6 +113,31 @@ export function parseIntervalMs(schedule: string): number | null {
   if (unit.startsWith('h')) return value * 3_600_000;
   if (unit.startsWith('d')) return value * 86_400_000;
   return null;
+}
+
+/**
+ * Validate that a schedule string matches a recognized format.
+ * Returns null if valid, or an error message describing the problem.
+ */
+export function validateSchedule(schedule: string): string | null {
+  if (!schedule || typeof schedule !== 'string' || !schedule.trim()) {
+    return 'Schedule must be a non-empty string';
+  }
+  const s = schedule.trim();
+
+  // One-off: "in Xh", "at 3pm", etc.
+  if (parseOneOff(s, Date.now()) !== null) return null;
+
+  // Interval: "every Xh", "every Xm", "every Xd"
+  if (parseIntervalMs(s) !== null) return null;
+
+  // Daily: "daily 9am", "daily 14:00"
+  if (/^daily\s+\d{1,2}(?::\d{2})?\s*(am|pm)?$/i.test(s)) return null;
+
+  // Cron: 5 space-separated fields
+  if (s.split(/\s+/).length === 5) return null;
+
+  return `Unrecognized schedule format: "${s}". Supported: "every Xh/Xm/Xd", "daily 9am/14:00", "in Xh/Xm", "at 3pm/14:00", or 5-field cron`;
 }
 
 /**
@@ -287,7 +313,7 @@ Provide a concise report of your findings or actions. Start with a one-line summ
     messages.push({ role: 'user', content: jobPrompt });
 
     // Run the tool loop (non-streaming for background jobs)
-    const model = meta.model ?? 'moltbot';
+    const model = meta.model ?? 'openclaw';
     const tools = registry.getToolSchemas();
 
     const result = await runToolLoopNonStreaming({
@@ -298,7 +324,7 @@ Provide a concise report of your findings or actions. Start with a one-line summ
       authToken,
       executor,
       logger,
-      timeoutMs: JOB_TIMEOUT_MS,
+      timeoutMs: opts.jobTimeoutMs ?? JOB_TIMEOUT_MS,
     });
 
     const fullOutput = result.fullContent.trim();

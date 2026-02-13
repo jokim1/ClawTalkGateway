@@ -344,7 +344,7 @@ export async function handleVoiceTranscribe(ctx: HandlerContext): Promise<void> 
   try {
     parsed = await parseMultipart(ctx.req, contentType);
   } catch (err) {
-    ctx.logger.error(`RemoteClaw: multipart parse failed: ${err}`);
+    ctx.logger.error(`ClawTalk: multipart parse failed: ${err}`);
     sendJson(ctx.res, 400, { error: 'Failed to parse audio upload' });
     return;
   }
@@ -373,7 +373,7 @@ export async function handleVoiceTranscribe(ctx: HandlerContext): Promise<void> 
       duration: result.duration,
     });
   } catch (err) {
-    ctx.logger.error(`RemoteClaw: STT failed: ${err}`);
+    ctx.logger.error(`ClawTalk: STT failed: ${err}`);
     sendJson(ctx.res, 500, {
       error: err instanceof Error ? err.message : 'Transcription failed',
     });
@@ -445,7 +445,7 @@ export async function handleVoiceSynthesize(ctx: HandlerContext): Promise<void> 
     ctx.res.setHeader('Access-Control-Allow-Origin', '*');
     ctx.res.end(audioBuffer);
   } catch (err) {
-    ctx.logger.error(`RemoteClaw: TTS failed: ${err}`);
+    ctx.logger.error(`ClawTalk: TTS failed: ${err}`);
     sendJson(ctx.res, 500, {
       error: err instanceof Error ? err.message : 'Synthesis failed',
     });
@@ -487,7 +487,7 @@ export async function handleSTTProviderSwitch(ctx: HandlerContext): Promise<void
     return;
   }
 
-  ctx.logger.info(`RemoteClaw: STT provider switched to ${body.provider}`);
+  ctx.logger.info(`ClawTalk: STT provider switched to ${body.provider}`);
   sendJson(ctx.res, 200, {
     ok: true,
     provider: body.provider,
@@ -525,7 +525,7 @@ export async function handleTTSProviderSwitch(ctx: HandlerContext): Promise<void
     return;
   }
 
-  ctx.logger.info(`RemoteClaw: TTS provider switched to ${body.provider}`);
+  ctx.logger.info(`ClawTalk: TTS provider switched to ${body.provider}`);
   sendJson(ctx.res, 200, {
     ok: true,
     provider: body.provider,

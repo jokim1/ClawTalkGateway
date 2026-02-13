@@ -1,7 +1,7 @@
 {
-  "name": "@jokim1/remoteclaw",
+  "name": "@jokim1/clawtalk",
   "version": "0.1.0",
-  "description": "Moltbot gateway plugin for RemoteClaw — providers, rate limits, and voice",
+  "description": "OpenClaw gateway plugin for ClawTalk — providers, rate limits, and voice",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
@@ -9,14 +9,14 @@
     "dev": "tsc --watch",
     "test": "jest"
   },
-  "moltbot": {
+  "openclaw": {
     "extensions": [
       "./dist/index.js"
     ]
   },
   "keywords": [
-    "moltbot",
-    "remoteclaw",
+    "openclaw",
+    "clawtalk",
     "gateway",
     "plugin",
     "voice",

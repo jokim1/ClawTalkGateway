@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { execSync } from 'node:child_process';
-import type { PluginApi, RemoteClawPluginConfig } from './types.js';
+import type { PluginApi, ClawTalkPluginConfig } from './types.js';
 import { sendJson, readJsonBody, handleCors } from './http.js';
 import { authorize, resolveGatewayToken, safeEqual } from './auth.js';
 import { handleProviders } from './providers.js';
@@ -53,6 +53,8 @@ function isRateLimited(ip: string, maxAttempts = 5, windowMs = 60_000): boolean 
   const now = Date.now();
   const entry = rateLimitMap.get(ip);
   if (!entry || now >= entry.resetAt) {
+    // Prevent unbounded map growth between cleanup cycles
+    if (!entry && rateLimitMap.size >= 10_000) return false;
     rateLimitMap.set(ip, { count: 1, resetAt: now + windowMs });
     return false;
   }
@@ -73,7 +75,7 @@ rateLimitCleanup.unref();
 // Pair Password
 // ============================================================================
 
-function resolvePairPassword(pluginCfg: RemoteClawPluginConfig): string | undefined {
+function resolvePairPassword(pluginCfg: ClawTalkPluginConfig): string | undefined {
   return pluginCfg.pairPassword ?? process.env.CLAWDBOT_PAIR_PASSWORD ?? undefined;
 }
 
@@ -99,14 +101,14 @@ function detectTailscaleFunnelUrl(log: PluginApi['logger']): string | null {
       const hostname = dnsName.replace(/\.$/, '');
       if (hostname.includes('.')) {
         const url = `https://${hostname}`;
-        log.info(`RemoteClaw: detected Tailscale hostname: ${url}`);
+        log.info(`ClawTalk: detected Tailscale hostname: ${url}`);
         _cachedFunnelUrl = url;
         return url;
       }
     }
-    log.info('RemoteClaw: no Tailscale DNS name found');
+    log.info('ClawTalk: no Tailscale DNS name found');
   } catch (err) {
-    log.info(`RemoteClaw: Tailscale detection failed: ${err}`);
+    log.info(`ClawTalk: Tailscale detection failed: ${err}`);
   }
 
   _cachedFunnelUrl = null;
@@ -118,15 +120,15 @@ function detectTailscaleFunnelUrl(log: PluginApi['logger']): string | null {
 // ============================================================================
 
 const plugin = {
-  id: 'remoteclaw',
-  name: 'RemoteClaw',
+  id: 'clawtalk',
+  name: 'ClawTalk',
   description:
-    'Exposes /api/providers, /api/rate-limits, and /api/voice/* HTTP endpoints for the RemoteClaw TUI client.',
+    'Exposes /api/providers, /api/rate-limits, and /api/voice/* HTTP endpoints for the ClawTalk TUI client.',
 
   register(api: PluginApi) {
-    const pluginCfg = (api.pluginConfig ?? {}) as RemoteClawPluginConfig;
+    const pluginCfg = (api.pluginConfig ?? {}) as ClawTalkPluginConfig;
 
-    api.logger.info('RemoteClaw plugin loaded');
+    api.logger.info('ClawTalk plugin loaded');
 
     // Start the rate-limit capture proxy
     startProxy(pluginCfg.proxyPort ?? 18793, api.logger);
@@ -155,12 +157,13 @@ const plugin = {
       logger: api.logger,
       registry: toolRegistry,
       executor: toolExecutor,
+      jobTimeoutMs: pluginCfg.jobTimeoutMs,
     });
 
     // Log voice availability
     const { sttAvailable, ttsAvailable } = resolveVoiceAvailability(pluginCfg.voice);
     if (sttAvailable || ttsAvailable) {
-      api.logger.info(`RemoteClaw: voice enabled (STT: ${sttAvailable}, TTS: ${ttsAvailable})`);
+      api.logger.info(`ClawTalk: voice enabled (STT: ${sttAvailable}, TTS: ${ttsAvailable})`);
     }
 
     api.registerHttpHandler(

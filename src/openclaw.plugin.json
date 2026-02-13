@@ -66,6 +66,14 @@
         "type": "string",
         "description": "Directory for persistent Talk data (default: ~/.openclaw/plugins/clawtalk)"
       },
+      "llmCallTimeoutMs": {
+        "type": "number",
+        "description": "Timeout in ms for streaming LLM calls (default: 300000)"
+      },
+      "jobTimeoutMs": {
+        "type": "number",
+        "description": "Timeout in ms for job scheduler LLM calls (default: 120000)"
+      },
       "realtimeVoice": {
         "type": "object",
         "additionalProperties": false,
