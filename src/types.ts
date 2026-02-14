@@ -196,6 +196,23 @@ export interface JobReport {
   tokenUsage?: { input: number; output: number };
 }
 
+export interface TalkDirective {
+  id: string;
+  text: string;
+  active: boolean;
+  createdAt: number;
+}
+
+export type PlatformPermission = 'read' | 'write' | 'read+write';
+
+export interface TalkPlatformBinding {
+  id: string;
+  platform: string;    // e.g. "slack", "posthog", "monday"
+  scope: string;       // e.g. "#team-product", "analytics", "all boards"
+  permission: PlatformPermission;
+  createdAt: number;
+}
+
 export interface TalkMeta {
   id: string;
   topicTitle?: string;
@@ -204,6 +221,8 @@ export interface TalkMeta {
   pinnedMessageIds: string[];
   jobs: TalkJob[];
   agents?: TalkAgent[];
+  directives?: TalkDirective[];
+  platformBindings?: TalkPlatformBinding[];
   createdAt: number;
   updatedAt: number;
 }

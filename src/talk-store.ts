@@ -11,7 +11,7 @@ import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import * as readline from 'node:readline';
-import type { TalkMeta, TalkMessage, TalkJob, TalkAgent, JobReport, Logger } from './types.js';
+import type { TalkMeta, TalkMessage, TalkJob, TalkAgent, TalkDirective, TalkPlatformBinding, JobReport, Logger } from './types.js';
 
 const DEFAULT_DATA_DIR = path.join(
   process.env.HOME || '~',
@@ -69,6 +69,8 @@ export class TalkStore {
           meta.pinnedMessageIds ??= [];
           meta.jobs ??= [];
           meta.agents ??= [];
+          meta.directives ??= [];
+          meta.platformBindings ??= [];
           this.talks.set(meta.id, meta);
         } catch (err) {
           // File may not exist or be corrupted — skip it
@@ -121,13 +123,15 @@ export class TalkStore {
     return sorted;
   }
 
-  updateTalk(id: string, updates: Partial<Pick<TalkMeta, 'topicTitle' | 'objective' | 'model'>>): TalkMeta | null {
+  updateTalk(id: string, updates: Partial<Pick<TalkMeta, 'topicTitle' | 'objective' | 'model' | 'directives' | 'platformBindings'>>): TalkMeta | null {
     const meta = this.talks.get(id);
     if (!meta) return null;
 
     if (updates.topicTitle !== undefined) meta.topicTitle = updates.topicTitle;
     if (updates.objective !== undefined) meta.objective = updates.objective;
     if (updates.model !== undefined) meta.model = updates.model;
+    if (updates.directives !== undefined) meta.directives = updates.directives;
+    if (updates.platformBindings !== undefined) meta.platformBindings = updates.platformBindings;
     meta.updatedAt = Date.now();
 
     this.invalidateListCache();
@@ -468,6 +472,32 @@ export class TalkStore {
     const meta = this.talks.get(talkId);
     if (!meta) throw new Error('Talk not found');
     meta.agents = agents;
+    meta.updatedAt = Date.now();
+    this.invalidateListCache();
+    this.persistMeta(meta);
+  }
+
+  // -------------------------------------------------------------------------
+  // Directive management
+  // -------------------------------------------------------------------------
+
+  async setDirectives(talkId: string, directives: TalkDirective[]): Promise<void> {
+    const meta = this.talks.get(talkId);
+    if (!meta) throw new Error('Talk not found');
+    meta.directives = directives;
+    meta.updatedAt = Date.now();
+    this.invalidateListCache();
+    this.persistMeta(meta);
+  }
+
+  // -------------------------------------------------------------------------
+  // Platform binding management
+  // -------------------------------------------------------------------------
+
+  async setPlatformBindings(talkId: string, bindings: TalkPlatformBinding[]): Promise<void> {
+    const meta = this.talks.get(talkId);
+    if (!meta) throw new Error('Talk not found');
+    meta.platformBindings = bindings;
     meta.updatedAt = Date.now();
     this.invalidateListCache();
     this.persistMeta(meta);

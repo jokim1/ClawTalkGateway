@@ -154,7 +154,7 @@ async function handleGetTalk(ctx: HandlerContext, store: TalkStore, talkId: stri
 }
 
 async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: string): Promise<void> {
-  let body: { topicTitle?: string; objective?: string; model?: string; agents?: any[] };
+  let body: { topicTitle?: string; objective?: string; model?: string; agents?: any[]; directives?: any[]; platformBindings?: any[] };
   try {
     body = (await readJsonBody(ctx.req)) as typeof body;
   } catch {
@@ -170,6 +170,12 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
 
   if (body.agents !== undefined) {
     await store.setAgents(talkId, body.agents);
+  }
+  if (body.directives !== undefined) {
+    await store.setDirectives(talkId, body.directives);
+  }
+  if (body.platformBindings !== undefined) {
+    await store.setPlatformBindings(talkId, body.platformBindings);
   }
 
   const updated = store.updateTalk(talkId, body);

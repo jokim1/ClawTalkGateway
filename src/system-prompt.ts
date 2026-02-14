@@ -142,6 +142,28 @@ export function composeSystemPrompt(input: SystemPromptInput): string | undefine
     );
   }
 
+  // Directives
+  const activeDirectives = (meta.directives ?? []).filter(d => d.active);
+  if (activeDirectives.length > 0) {
+    const directiveLines = activeDirectives.map((d, i) => `${i + 1}. ${d.text}`);
+    sections.push(
+      '## Directives\n' +
+      'Follow each directive as written. These are standing rules for this conversation.\n\n' +
+      directiveLines.join('\n'),
+    );
+  }
+
+  // Platform Access
+  const bindings = meta.platformBindings ?? [];
+  if (bindings.length > 0) {
+    const bindingLines = bindings.map(b => `- **${b.platform}** ${b.scope} (${b.permission})`);
+    sections.push(
+      '## Platform Access\n' +
+      'You have access to the following platforms. Use them as needed to fulfill directives and objectives.\n\n' +
+      bindingLines.join('\n'),
+    );
+  }
+
   // Conversation context
   if (contextMd.trim()) {
     sections.push(
