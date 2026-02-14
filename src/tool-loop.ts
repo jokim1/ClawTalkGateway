@@ -53,6 +53,39 @@ function createActivityAbort(inactivityMs: number, maxMs: number) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Error classification and helpers
+// ---------------------------------------------------------------------------
+
+const TRANSIENT_CODES = new Set([429, 500, 502, 503, 529]);
+const PERMANENT_CODES = new Set([400, 401, 403, 404]);
+
+/**
+ * Classify an error as transient (worth retrying) or permanent.
+ * Client disconnects are never transient.
+ */
+export function isTransientError(err: unknown, clientSignal?: AbortSignal): boolean {
+  if (clientSignal?.aborted) return false;
+
+  if (err instanceof Error) {
+    const msg = err.message.toLowerCase();
+    if (/abort|cancel/i.test(err.name)) return true;
+    if (/econnreset|econnrefused|etimedout|epipe|socket hang up|fetch failed/i.test(msg)) return true;
+    // Check for HTTP status codes in error messages like "LLM error (502): ..."
+    const statusMatch = msg.match(/\((\d{3})\)/);
+    if (statusMatch) {
+      const code = parseInt(statusMatch[1], 10);
+      if (PERMANENT_CODES.has(code)) return false;
+      if (TRANSIENT_CODES.has(code)) return true;
+    }
+  }
+  return false;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 /** Accumulated tool call fragment from streaming delta. */
 interface ToolCallAccumulator {
   id: string;
@@ -78,6 +111,8 @@ export interface ToolLoopStreamOptions {
   executor: ToolExecutor;
   logger: Logger;
   timeoutMs?: number;
+  /** Signal that fires when the HTTP client disconnects. Not retried. */
+  clientSignal?: AbortSignal;
 }
 
 export interface ToolLoopStreamResult {
@@ -91,7 +126,7 @@ export interface ToolLoopStreamResult {
  * executes tool calls, and loops until done or max iterations.
  */
 export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoopStreamResult> {
-  const { messages, model, tools, gatewayOrigin, authToken, res, executor, logger } = opts;
+  const { messages, model, tools, gatewayOrigin, authToken, res, executor, logger, clientSignal } = opts;
   let fullContent = '';
   let responseModel: string | undefined;
   const toolCallMessages: ToolLoopStreamResult['toolCallMessages'] = [];
@@ -101,6 +136,13 @@ export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoop
   const inactivityMs = opts.timeoutMs ?? LOOP_INACTIVITY_MS;
   const maxMs = Math.min(inactivityMs * 6, LOOP_MAX_MS);
   const abort = createActivityAbort(inactivityMs, maxMs);
+
+  // Compose the activity abort with the client disconnect signal so that
+  // either one cancels the in-flight LLM fetch.
+  const fetchSignal = clientSignal
+    ? AbortSignal.any([abort.signal, clientSignal])
+    : abort.signal;
+
   let continuations = 0;
 
   try {
@@ -108,198 +150,241 @@ export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoop
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
 
-    let llmResponse: Response;
-    try {
-      llmResponse = await fetch(`${gatewayOrigin}/v1/chat/completions`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          model,
-          messages,
-          tools: tools.length > 0 ? tools : undefined,
-          stream: true,
-          stream_options: { include_usage: true },
-        }),
-        signal: abort.signal,
-      });
-    } catch (err) {
-      logger.error(`ToolLoop: LLM fetch failed (iteration ${iteration}): ${err}`);
-      throw err;
-    }
+    // Snapshot messages length so we can roll back on retry
+    const messagesSnapshot = messages.length;
 
-    if (!llmResponse.ok) {
-      const errBody = await llmResponse.text().catch(() => '');
-      logger.warn(`ToolLoop: LLM error (${llmResponse.status}): ${errBody.slice(0, 200)}`);
-      throw new Error(`LLM error (${llmResponse.status}): ${errBody.slice(0, 500)}`);
-    }
+    // ---------- retry wrapper (max 1 retry per iteration) ----------
+    let retried = false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      // Check for client disconnect before each attempt
+      if (clientSignal?.aborted) {
+        logger.info('ToolLoop: client disconnected, aborting');
+        throw new Error('Client disconnected');
+      }
 
-    const reader = llmResponse.body?.getReader();
-    if (!reader) throw new Error('No response body from AI provider');
+      let llmResponse: Response;
+      let iterContent = '';
+      const toolCallAccumulators = new Map<number, ToolCallAccumulator>();
+      let finishReason: string | null = null;
+      let fetchOk = false;
 
-    // Parse the SSE stream
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let iterContent = '';
-    let finishReason: string | null = null;
-    const toolCallAccumulators = new Map<number, ToolCallAccumulator>();
+      try {
+        llmResponse = await fetch(`${gatewayOrigin}/v1/chat/completions`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            model,
+            messages,
+            tools: tools.length > 0 ? tools : undefined,
+            stream: true,
+            stream_options: { include_usage: true },
+          }),
+          signal: fetchSignal,
+        });
 
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+        if (!llmResponse.ok) {
+          const errBody = await llmResponse.text().catch(() => '');
+          logger.warn(`ToolLoop: LLM error (${llmResponse.status}): ${errBody.slice(0, 200)}`);
+          throw new Error(`LLM error (${llmResponse.status}): ${errBody.slice(0, 500)}`);
+        }
+        fetchOk = true;
 
-        abort.touch(); // Reset inactivity timer on each chunk
-        const chunk = decoder.decode(value, { stream: true });
+        const reader = llmResponse.body?.getReader();
+        if (!reader) throw new Error('No response body from AI provider');
 
-        // Forward raw SSE text chunks to client (for streaming text display)
-        // We only forward on the first iteration or when we're streaming new content
-        // For tool loop iterations > 0, we only forward content deltas
-        buffer += chunk;
-        const lines = buffer.split('\n');
-        buffer = lines.pop() ?? '';
+        // Parse the SSE stream
+        const decoder = new TextDecoder();
+        let buffer = '';
 
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const data = line.slice(6);
-            if (data === '[DONE]') continue;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
 
-            try {
-              const parsed = JSON.parse(data);
-              if (!responseModel && parsed.model) {
-                responseModel = parsed.model;
-              }
+          abort.touch(); // Reset inactivity timer on each chunk
+          const chunk = decoder.decode(value, { stream: true });
 
-              const choice = parsed.choices?.[0];
-              if (!choice) continue;
+          buffer += chunk;
+          const lines = buffer.split('\n');
+          buffer = lines.pop() ?? '';
 
-              // Accumulate text content
-              const contentDelta = choice.delta?.content;
-              if (contentDelta) {
-                iterContent += contentDelta;
-                // Forward content to client as standard SSE
-                res.write(`data: ${JSON.stringify({
-                  choices: [{ delta: { content: contentDelta } }],
-                  model: parsed.model,
-                })}\n\n`);
-              }
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const data = line.slice(6);
+              if (data === '[DONE]') continue;
 
-              // Accumulate tool call fragments
-              const toolCallDeltas = choice.delta?.tool_calls;
-              if (toolCallDeltas && Array.isArray(toolCallDeltas)) {
-                for (const tc of toolCallDeltas) {
-                  const idx = tc.index ?? 0;
-                  let acc = toolCallAccumulators.get(idx);
-                  if (!acc) {
-                    acc = {
-                      id: tc.id ?? '',
-                      type: 'function',
-                      function: { name: '', arguments: '' },
-                    };
-                    toolCallAccumulators.set(idx, acc);
-                  }
-                  if (tc.id) acc.id = tc.id;
-                  if (tc.function?.name) acc.function.name += tc.function.name;
-                  if (tc.function?.arguments) acc.function.arguments += tc.function.arguments;
+              try {
+                const parsed = JSON.parse(data);
+                if (!responseModel && parsed.model) {
+                  responseModel = parsed.model;
                 }
-                // Send SSE comment as keepalive while accumulating tool call
-                // arguments. Without this, the client sees no data during long
-                // tool-argument generation (e.g. writing a large document) and
-                // its inactivity timer fires.
-                res.write(': keepalive\n\n');
-              }
 
-              // Capture finish reason
-              if (choice.finish_reason) {
-                finishReason = choice.finish_reason;
+                const choice = parsed.choices?.[0];
+                if (!choice) continue;
+
+                // Accumulate text content
+                const contentDelta = choice.delta?.content;
+                if (contentDelta) {
+                  iterContent += contentDelta;
+                  // Forward content to client as standard SSE
+                  res.write(`data: ${JSON.stringify({
+                    choices: [{ delta: { content: contentDelta } }],
+                    model: parsed.model,
+                  })}\n\n`);
+                }
+
+                // Accumulate tool call fragments
+                const toolCallDeltas = choice.delta?.tool_calls;
+                if (toolCallDeltas && Array.isArray(toolCallDeltas)) {
+                  for (const tc of toolCallDeltas) {
+                    const idx = tc.index ?? 0;
+                    let acc = toolCallAccumulators.get(idx);
+                    if (!acc) {
+                      acc = {
+                        id: tc.id ?? '',
+                        type: 'function',
+                        function: { name: '', arguments: '' },
+                      };
+                      toolCallAccumulators.set(idx, acc);
+                    }
+                    if (tc.id) acc.id = tc.id;
+                    if (tc.function?.name) acc.function.name += tc.function.name;
+                    if (tc.function?.arguments) acc.function.arguments += tc.function.arguments;
+                  }
+                  res.write(': keepalive\n\n');
+                }
+
+                // Capture finish reason
+                if (choice.finish_reason) {
+                  finishReason = choice.finish_reason;
+                }
+              } catch {
+                // Partial chunk, ignore parse error
               }
-            } catch {
-              // Partial chunk, ignore parse error
             }
           }
         }
+      } catch (err) {
+        // --- Retry decision ---
+        if (attempt === 0 && !retried && isTransientError(err, clientSignal)) {
+          retried = true;
+
+          if (iterContent) {
+            // Mid-stream failure: partial content was already sent to client.
+            // Push partial as assistant message + continuation prompt so the LLM
+            // picks up where it left off.
+            fullContent += iterContent;
+            messages.push({ role: 'assistant', content: iterContent });
+            messages.push({ role: 'user', content: 'Your previous response was interrupted mid-stream. Continue from where you left off.' });
+            logger.info(`ToolLoop: mid-stream failure (iteration ${iteration}), retrying with ${iterContent.length} chars of partial content`);
+          } else if (!fetchOk) {
+            // Pre-fetch failure: no content sent, just retry the same request
+            // Roll back any messages added this iteration
+            messages.length = messagesSnapshot;
+            logger.info(`ToolLoop: fetch failure (iteration ${iteration}), retrying after 2s`);
+          }
+
+          await sleep(2000);
+          abort.touch();
+          continue; // retry the inner attempt loop
+        }
+
+        // Not retryable or already retried — propagate
+        logger.error(`ToolLoop: ${fetchOk ? 'stream read' : 'LLM fetch'} error (iteration ${iteration}): ${err}`);
+        throw err;
       }
-    } catch (err) {
-      logger.error(`ToolLoop: stream read error (iteration ${iteration}): ${err}`);
-      throw err;
-    }
 
-    fullContent += iterContent;
+      // --- Success path (no error thrown) ---
+      fullContent += iterContent;
 
-    // If the model wants to call tools
-    if (finishReason === 'tool_calls' && toolCallAccumulators.size > 0) {
-      const toolCalls: ToolCallInfo[] = [];
-      for (const [, acc] of toolCallAccumulators) {
-        toolCalls.push({
-          id: acc.id,
-          type: 'function',
-          function: { name: acc.function.name, arguments: acc.function.arguments },
-        });
-      }
+      // If the model wants to call tools
+      if (finishReason === 'tool_calls' && toolCallAccumulators.size > 0) {
+        const toolCalls: ToolCallInfo[] = [];
+        for (const [, acc] of toolCallAccumulators) {
+          toolCalls.push({
+            id: acc.id,
+            type: 'function',
+            function: { name: acc.function.name, arguments: acc.function.arguments },
+          });
+        }
 
-      // Add assistant message with tool_calls to messages array
-      const assistantToolMsg: any = {
-        role: 'assistant',
-        content: iterContent || null,
-        tool_calls: toolCalls,
-      };
-      messages.push(assistantToolMsg);
-      toolCallMessages.push(assistantToolMsg);
-
-      // Execute each tool call
-      for (const tc of toolCalls) {
-        // Send tool_start event to client
-        res.write(`event: tool_start\ndata: ${JSON.stringify({
-          id: tc.id,
-          name: tc.function.name,
-          arguments: tc.function.arguments,
-        })}\n\n`);
-        abort.touch();
-
-        const result = await executor.execute(tc.function.name, tc.function.arguments);
-
-        // Send tool_end event to client
-        res.write(`event: tool_end\ndata: ${JSON.stringify({
-          id: tc.id,
-          name: tc.function.name,
-          success: result.success,
-          content: result.content.slice(0, 2000), // Truncate for SSE event
-          durationMs: result.durationMs,
-        })}\n\n`);
-        abort.touch();
-
-        // Add tool result to messages array
-        const toolResultMsg: any = {
-          role: 'tool',
-          content: result.content,
-          tool_call_id: tc.id,
-          name: tc.function.name,
+        // Add assistant message with tool_calls to messages array
+        const assistantToolMsg: any = {
+          role: 'assistant',
+          content: iterContent || null,
+          tool_calls: toolCalls,
         };
-        messages.push(toolResultMsg);
-        toolCallMessages.push(toolResultMsg);
+        messages.push(assistantToolMsg);
+        toolCallMessages.push(assistantToolMsg);
+
+        // Execute each tool call
+        for (const tc of toolCalls) {
+          // Check client disconnect before each tool execution
+          if (clientSignal?.aborted) {
+            logger.info('ToolLoop: client disconnected during tool execution, aborting');
+            throw new Error('Client disconnected');
+          }
+
+          // Send tool_start event to client
+          res.write(`event: tool_start\ndata: ${JSON.stringify({
+            id: tc.id,
+            name: tc.function.name,
+            arguments: tc.function.arguments,
+          })}\n\n`);
+          abort.touch();
+
+          const result = await executor.execute(tc.function.name, tc.function.arguments);
+
+          // Send tool_end event to client
+          res.write(`event: tool_end\ndata: ${JSON.stringify({
+            id: tc.id,
+            name: tc.function.name,
+            success: result.success,
+            content: result.content.slice(0, 2000), // Truncate for SSE event
+            durationMs: result.durationMs,
+          })}\n\n`);
+          abort.touch();
+
+          // Add tool result to messages array
+          const toolResultMsg: any = {
+            role: 'tool',
+            content: result.content,
+            tool_call_id: tc.id,
+            name: tc.function.name,
+          };
+          messages.push(toolResultMsg);
+          toolCallMessages.push(toolResultMsg);
+        }
+
+        // Keepalive between iterations — resets both gateway and TUI client
+        // inactivity timers during the TTFT gap before the next LLM call.
+        res.write(': keepalive\n\n');
+        abort.touch();
+
+        // Continue the loop — LLM will see the tool results
+        logger.info(`ToolLoop: iteration ${iteration + 1}, executed ${toolCalls.length} tool(s)`);
+      } else if (finishReason === 'length' && continuations < MAX_CONTINUATIONS) {
+        // If the model hit max output tokens, auto-continue
+        continuations++;
+        logger.info(`ToolLoop: output truncated (finish_reason=length), auto-continuing (${continuations}/${MAX_CONTINUATIONS})`);
+
+        // Push the truncated assistant content so far
+        messages.push({ role: 'assistant', content: iterContent });
+        // Ask the model to continue
+        messages.push({ role: 'user', content: 'Continue from where you left off.' });
+
+        res.write(': keepalive\n\n');
+        abort.touch();
       }
 
-      // Keepalive between iterations — resets both gateway and TUI client
-      // inactivity timers during the TTFT gap before the next LLM call.
-      res.write(': keepalive\n\n');
-      abort.touch();
-
-      // Continue the loop — LLM will see the tool results
-      logger.info(`ToolLoop: iteration ${iteration + 1}, executed ${toolCalls.length} tool(s)`);
-      continue;
+      // Break out of the retry loop — success
+      break;
     }
+    // ---------- end retry wrapper ----------
 
-    // If the model hit max output tokens, auto-continue
-    if (finishReason === 'length' && continuations < MAX_CONTINUATIONS) {
-      continuations++;
-      logger.info(`ToolLoop: output truncated (finish_reason=length), auto-continuing (${continuations}/${MAX_CONTINUATIONS})`);
-
-      // Push the truncated assistant content so far
-      messages.push({ role: 'assistant', content: iterContent });
-      // Ask the model to continue
-      messages.push({ role: 'user', content: 'Continue from where you left off.' });
-
-      res.write(': keepalive\n\n');
-      abort.touch();
+    // Check if we should continue the outer iteration loop
+    // (tool calls and continuations set up messages above and need another iteration)
+    const lastMsg = messages[messages.length - 1];
+    if (lastMsg?.role === 'tool' || (lastMsg?.role === 'user' && lastMsg?.content === 'Continue from where you left off.')) {
       continue;
     }
 

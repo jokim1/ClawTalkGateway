@@ -70,6 +70,8 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
     otherAgents?: { name: string; role: string; model: string }[];
     imageBase64?: string;
     imageMimeType?: string;
+    /** When true, this is a recovery retry — skip persisting the user message to avoid duplicates. */
+    recovery?: boolean;
   };
   try {
     body = (await readJsonBody(req, 5 * 1024 * 1024)) as typeof body;
@@ -179,6 +181,7 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
   }
 
   // Persist user message (metadata only, no base64)
+  // Skip persistence on recovery retries to avoid duplicate user messages.
   const userMsg: TalkMessage = {
     id: randomUUID(),
     role: 'user',
@@ -188,7 +191,9 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
     ...(body.agentRole && { agentRole: body.agentRole as any }),
     ...(attachmentMeta && { attachment: attachmentMeta }),
   };
-  await store.appendMessage(talkId, userMsg);
+  if (!body.recovery) {
+    await store.appendMessage(talkId, userMsg);
+  }
 
   // Disable server-level timeouts for this long-lived SSE connection.
   // Node.js 18+ defaults requestTimeout to 5 minutes, which is too short
@@ -196,6 +201,15 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
   req.setTimeout(0);
   res.setTimeout(0);
   if (req.socket) req.socket.setTimeout(0);
+
+  // Client disconnect detection — abort the tool loop when nobody is listening.
+  const clientAbort = new AbortController();
+  req.on('close', () => {
+    if (!res.writableEnded) {
+      logger.info(`TalkChat: client disconnected for talk ${talkId}, aborting tool loop`);
+      clientAbort.abort();
+    }
+  });
 
   // Set up SSE response headers
   res.statusCode = 200;
@@ -225,20 +239,28 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
       registry,
       executor,
       logger,
+      clientSignal: clientAbort.signal,
     });
 
     fullContent = result.fullContent;
     responseModel = result.responseModel;
     toolCallMessages = result.toolCallMessages;
   } catch (err) {
-    logger.error(`TalkChat: tool loop error: ${err}`);
-    // Write error as SSE event before closing
-    res.write(`data: ${JSON.stringify({
-      choices: [{ delta: { content: `\n\n[Error: ${err instanceof Error ? err.message : 'Unknown error'}]` } }],
-    })}\n\n`);
+    const errMessage = err instanceof Error ? err.message : 'Unknown error';
+    logger.error(`TalkChat: tool loop error: ${errMessage}`);
+
+    // Don't write to a closed connection
+    if (!clientAbort.signal.aborted && !res.writableEnded) {
+      // Determine if this is a transient error the client could retry
+      const { isTransientError } = await import('./tool-loop.js');
+      const transient = isTransientError(err, clientAbort.signal);
+      res.write(`event: error\ndata: ${JSON.stringify({ message: errMessage, transient })}\n\n`);
+    }
   } finally {
-    res.write('data: [DONE]\n\n');
-    res.end();
+    if (!res.writableEnded) {
+      res.write('data: [DONE]\n\n');
+      res.end();
+    }
   }
 
   // Persist assistant message and any tool messages
