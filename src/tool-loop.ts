@@ -22,13 +22,16 @@ const MAX_ITERATIONS = 10;
 /** Maximum auto-continuations when the model hits max output tokens. */
 const MAX_CONTINUATIONS = 3;
 
-/** Inactivity timeout for the streaming tool loop — resets on each chunk/event (10 min).
- *  Matches OpenClaw's embedded agent timeout (600s) so we don't abort before
- *  the upstream provider does — important for slow-thinking models like Kimi K2.5. */
-const LOOP_INACTIVITY_MS = 600_000;
+/** Inactivity timeout for the streaming tool loop (5 min).
+ *  With the keepalive relay active, this only fires if the gateway process
+ *  itself is completely stuck (keepalives reset it every 30s). */
+const LOOP_INACTIVITY_MS = 300_000;
 
-/** Hard max timeout for the entire streaming tool loop (30 min). */
-const LOOP_MAX_MS = 1_800_000;
+/** Hard max timeout for the entire streaming tool loop (60 min). */
+const LOOP_MAX_MS = 3_600_000;
+
+/** Interval between keepalive SSE comments sent to the client (30s). */
+const KEEPALIVE_INTERVAL_MS = 30_000;
 
 /**
  * Create an AbortController with an activity-based timeout.
@@ -146,6 +149,17 @@ export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoop
     : abort.signal;
 
   let continuations = 0;
+
+  // Keepalive relay: send periodic SSE comments to the client while the
+  // upstream agent is working.  This prevents client-side timeouts and
+  // provides implicit "still alive" feedback.  Also touches the abort
+  // timer so the inactivity timeout only fires if the process is stuck.
+  const keepalive = setInterval(() => {
+    if (!res.writableEnded && !clientSignal?.aborted) {
+      res.write(': keepalive\n\n');
+      abort.touch();
+    }
+  }, KEEPALIVE_INTERVAL_MS);
 
   try {
   for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
@@ -393,6 +407,7 @@ export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoop
     break;
   }
   } finally {
+    clearInterval(keepalive);
     abort.clear();
   }
 
