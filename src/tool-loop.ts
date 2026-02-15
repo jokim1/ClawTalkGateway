@@ -22,8 +22,10 @@ const MAX_ITERATIONS = 10;
 /** Maximum auto-continuations when the model hits max output tokens. */
 const MAX_CONTINUATIONS = 3;
 
-/** Inactivity timeout for the streaming tool loop — resets on each chunk/event (5 min). */
-const LOOP_INACTIVITY_MS = 300_000;
+/** Inactivity timeout for the streaming tool loop — resets on each chunk/event (10 min).
+ *  Matches OpenClaw's embedded agent timeout (600s) so we don't abort before
+ *  the upstream provider does — important for slow-thinking models like Kimi K2.5. */
+const LOOP_INACTIVITY_MS = 600_000;
 
 /** Hard max timeout for the entire streaming tool loop (30 min). */
 const LOOP_MAX_MS = 1_800_000;
