@@ -28,7 +28,7 @@ const CHECK_INTERVAL_MS = 60_000; // 1 minute
 export const EVENT_JOB_DEBOUNCE_MS = 5_000;
 
 /** Maximum time for a single job execution. */
-const JOB_TIMEOUT_MS = 120_000; // 2 minutes
+const JOB_TIMEOUT_MS = 300_000; // 5 minutes
 
 /** Talks with a currently running job — prevents concurrent runs. */
 const runningTalks = new Set<string>();
@@ -471,7 +471,7 @@ export async function executeJob(
   job: TalkJob,
   /** Extra context injected before the job prompt (e.g. event trigger details). */
   triggerContext?: string,
-): Promise<void> {
+): Promise<JobReport | null> {
   const { store, gatewayOrigin, authToken, logger, registry, executor } = opts;
   const runAt = Date.now();
 
@@ -483,7 +483,7 @@ export async function executeJob(
     const meta = store.getTalk(talkId);
     if (!meta) {
       logger.warn(`JobScheduler: talk ${talkId} not found, skipping job`);
-      return;
+      return null;
     }
 
     const contextMd = await store.getContextMd(talkId);
@@ -559,6 +559,8 @@ Provide a concise report of your findings or actions. Start with a one-line summ
     } else {
       logger.info(`JobScheduler: job ${job.id} completed — "${summary}"`);
     }
+
+    return report;
   } catch (err) {
     const cause = err instanceof Error && (err as any).cause ? ` (cause: ${(err as any).cause})` : '';
     const errorMsg = err instanceof Error ? err.message : String(err);
@@ -578,6 +580,7 @@ Provide a concise report of your findings or actions. Start with a one-line summ
       logger.error(`JobScheduler: failed to persist error report for job ${job.id}: ${reportErr}`);
     });
     store.updateJob(talkId, job.id, { lastRunAt: runAt, lastStatus: 'error' });
+    return null;
   } finally {
     store.setProcessing(talkId, false);
   }

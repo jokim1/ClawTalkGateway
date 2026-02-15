@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { execSync } from 'node:child_process';
-import type { PluginApi, ClawTalkPluginConfig } from './types.js';
+import type { PluginApi, ClawTalkPluginConfig, Logger } from './types.js';
+import type { EventReplyTarget } from './event-dispatcher.js';
 import { sendJson, readJsonBody, handleCors } from './http.js';
 import { authorize, resolveGatewayToken, safeEqual } from './auth.js';
 import { handleProviders } from './providers.js';
@@ -28,6 +29,22 @@ import { handleFileUpload } from './file-upload.js';
 import { ToolRegistry } from './tool-registry.js';
 import { ToolExecutor } from './tool-executor.js';
 import { registerCommands } from './commands.js';
+
+// ---------------------------------------------------------------------------
+// Node.js 25 fetch fix — replace built-in undici connector to fix Tailscale IP
+// connectivity (100.64.0.0/10 CGNAT range). Without this, fetch() to the
+// gateway origin fails with ECONNREFUSED on Tailscale IPs.
+// ---------------------------------------------------------------------------
+try {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { Agent, setGlobalDispatcher, buildConnector } = require('undici');
+  const connector = buildConnector({});
+  setGlobalDispatcher(new Agent({
+    connect: (opts: Record<string, unknown>, cb: Function) => connector(opts, cb),
+  }));
+} catch {
+  // undici not installed — fetch uses Node's built-in connector
+}
 
 const ROUTES = new Set([
   '/api/pair',
@@ -117,6 +134,120 @@ function detectTailscaleFunnelUrl(log: PluginApi['logger']): string | null {
   return null;
 }
 
+/**
+ * Resolve the gateway's self-origin for internal calls (scheduler, dispatcher).
+ * Reads gateway.bind and gateway.port from config. If bind is "tailnet",
+ * resolves the Tailscale IPv4 via `tailscale status --json`.
+ */
+function resolveGatewayOrigin(cfg: Record<string, any>, log: PluginApi['logger']): string {
+  const port = cfg?.gateway?.port ?? 18789;
+  const bind = cfg?.gateway?.bind;
+
+  if (bind === 'tailnet' || bind === 'tailscale') {
+    try {
+      const output = execSync('tailscale ip -4', {
+        timeout: 5000,
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      const ip = output.trim();
+      if (ip) {
+        const origin = `http://${ip}:${port}`;
+        log.info(`ClawTalk: resolved gateway origin: ${origin}`);
+        return origin;
+      }
+    } catch {
+      // fall through to default
+    }
+  }
+
+  if (bind && bind !== 'tailnet' && bind !== 'tailscale' && bind !== '0.0.0.0') {
+    return `http://${bind}:${port}`;
+  }
+
+  return `http://127.0.0.1:${port}`;
+}
+
+// ============================================================================
+// Platform reply — delivers event job output back to the originating platform
+// ============================================================================
+
+/**
+ * Resolve the Slack bot token for a given account from the OpenClaw config.
+ * Config values use template syntax like "${SLACK_KIMFAMILY_BOT_TOKEN}".
+ */
+function resolveSlackBotToken(cfg: Record<string, any>, accountId: string): string | undefined {
+  const raw: string | undefined = cfg?.channels?.slack?.accounts?.[accountId]?.botToken;
+  if (!raw) return undefined;
+
+  // Resolve ${ENV_VAR} template
+  const envMatch = raw.match(/^\$\{(.+)\}$/);
+  if (envMatch) {
+    return process.env[envMatch[1]] ?? undefined;
+  }
+
+  return raw;
+}
+
+/**
+ * Create a replyToEvent callback that delivers messages to platforms.
+ * Currently supports Slack via chat.postMessage.
+ */
+function createEventReplyHandler(
+  getConfig: () => Record<string, any>,
+  logger: Logger,
+) {
+  return async (target: EventReplyTarget, message: string): Promise<boolean> => {
+    if (target.platform !== 'slack') {
+      logger.warn(`EventReply: unsupported platform "${target.platform}"`);
+      return false;
+    }
+
+    if (!target.platformChannelId || !target.accountId) {
+      logger.warn('EventReply: missing channelId or accountId');
+      return false;
+    }
+
+    const cfg = getConfig();
+    const botToken = resolveSlackBotToken(cfg, target.accountId);
+    if (!botToken) {
+      logger.warn(`EventReply: no bot token for Slack account "${target.accountId}"`);
+      return false;
+    }
+
+    try {
+      const body: Record<string, unknown> = {
+        channel: target.platformChannelId,
+        text: message,
+      };
+      if (target.threadId) {
+        body.thread_ts = target.threadId;
+      }
+
+      const res = await fetch('https://slack.com/api/chat.postMessage', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${botToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+
+      const result = await res.json() as { ok: boolean; error?: string };
+      if (!result.ok) {
+        logger.warn(`EventReply: Slack API error: ${result.error}`);
+        return false;
+      }
+
+      return true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn(`EventReply: Slack post failed: ${msg}`);
+      return false;
+    }
+  };
+}
+
 // ============================================================================
 // Plugin
 // ============================================================================
@@ -153,10 +284,7 @@ const plugin = {
       start: () => {
         const cfg0 = api.runtime.config.loadConfig();
         const gatewayToken0 = resolveGatewayToken(cfg0);
-        // For self-calls (job scheduler), always use 127.0.0.1 — never the
-        // externalUrl, which is a client-facing URL that may not be reachable
-        // from the server itself (e.g. Tailscale funnel HTTPS hairpin issues).
-        const schedulerOrigin = 'http://127.0.0.1:18789';
+        const schedulerOrigin = resolveGatewayOrigin(cfg0, api.logger);
         stopScheduler = startJobScheduler({
           store: talkStore,
           gatewayOrigin: schedulerOrigin,
@@ -182,7 +310,11 @@ const plugin = {
       start: () => {
         const cfg0 = api.runtime.config.loadConfig();
         const gatewayToken0 = resolveGatewayToken(cfg0);
-        const dispatcherOrigin = 'http://127.0.0.1:18789';
+        const dispatcherOrigin = resolveGatewayOrigin(cfg0, api.logger);
+        const replyHandler = createEventReplyHandler(
+          () => api.runtime.config.loadConfig(),
+          api.logger,
+        );
         eventDispatcher = new EventDispatcher({
           store: talkStore,
           gatewayOrigin: dispatcherOrigin,
@@ -191,6 +323,7 @@ const plugin = {
           registry: toolRegistry,
           executor: toolExecutor,
           jobTimeoutMs: pluginCfg.jobTimeoutMs,
+          replyToEvent: replyHandler,
         });
         api.logger.info('ClawTalk: event dispatcher started');
       },

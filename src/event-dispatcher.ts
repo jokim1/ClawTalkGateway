@@ -31,6 +31,25 @@ export interface MessageContext {
   conversationId?: string;
 }
 
+/** Info needed to deliver a reply back to the originating platform. */
+export interface EventReplyTarget {
+  platform: string;
+  accountId: string | undefined;
+  /** Platform-specific channel/conversation ID (e.g. Slack channel ID). */
+  platformChannelId: string | undefined;
+  /** Thread ID for threaded replies (e.g. Slack message ts). */
+  threadId: string | undefined;
+}
+
+/**
+ * Callback to deliver event job output back to the originating platform.
+ * Returns true if delivery succeeded.
+ */
+export type ReplyToEventFn = (
+  target: EventReplyTarget,
+  message: string,
+) => Promise<boolean>;
+
 export interface EventDispatcherOptions {
   store: TalkStore;
   gatewayOrigin: string;
@@ -39,6 +58,8 @@ export interface EventDispatcherOptions {
   registry: ToolRegistry;
   executor: ToolExecutor;
   jobTimeoutMs?: number;
+  /** Optional callback to deliver event job output back to the originating platform. */
+  replyToEvent?: ReplyToEventFn;
 }
 
 /** Track debounce state per event job. */
@@ -104,6 +125,9 @@ export class EventDispatcher {
         continue;
       }
 
+      // Only reply if binding has write permission
+      const canReply = matchingBinding.permission === 'write' || matchingBinding.permission === 'read+write';
+
       // Fire the job
       this.debounceMap.set(debounceKey, { lastFiredAt: now });
       this.runningTalks.add(talkId);
@@ -113,7 +137,7 @@ export class EventDispatcher {
         `(${matchingBinding.platform}/${scope}, from: ${event.from})`,
       );
 
-      this.executeEventJob(talkId, job, event, ctx, matchingBinding.platform)
+      this.executeEventJob(talkId, job, event, ctx, matchingBinding.platform, canReply)
         .finally(() => {
           this.runningTalks.delete(talkId);
         });
@@ -126,6 +150,7 @@ export class EventDispatcher {
     event: MessageReceivedEvent,
     ctx: MessageContext,
     platform: string,
+    canReply: boolean,
   ): Promise<void> {
     const { logger } = this.opts;
 
@@ -134,13 +159,17 @@ export class EventDispatcher {
       ? new Date(event.timestamp).toISOString().replace('T', ' ').slice(0, 19)
       : new Date().toISOString().replace('T', ' ').slice(0, 19);
 
+    const senderName = (event.metadata?.senderName ?? event.metadata?.senderUsername ?? event.from) as string;
+
     const triggerContext = [
       '## Event Trigger',
       `Platform: ${platform}`,
       `Source: ${parseEventTrigger(job.schedule)}`,
-      `From: ${event.from}`,
+      `From: ${senderName}`,
       `Time: ${timestamp}`,
       `Content: ${event.content}`,
+      '',
+      'Your response will be automatically delivered to the channel. Just respond naturally.',
     ].join('\n');
 
     try {
@@ -155,7 +184,32 @@ export class EventDispatcher {
         jobTimeoutMs: this.opts.jobTimeoutMs,
       };
 
-      await executeJob(schedulerOpts, talkId, job, triggerContext);
+      const report = await executeJob(schedulerOpts, talkId, job, triggerContext);
+
+      // Deliver reply back to the originating platform if enabled
+      if (report && report.status === 'success' && canReply && this.opts.replyToEvent) {
+        const platformChannelId = extractPlatformChannelId(event.from);
+        const threadId = event.metadata?.threadId as string | undefined;
+
+        const target: EventReplyTarget = {
+          platform,
+          accountId: ctx.accountId,
+          platformChannelId,
+          threadId,
+        };
+
+        try {
+          const sent = await this.opts.replyToEvent(target, report.fullOutput);
+          if (sent) {
+            logger.info(`EventDispatcher: reply delivered to ${platform}/${platformChannelId}`);
+          } else {
+            logger.warn(`EventDispatcher: reply delivery returned false for ${platform}/${platformChannelId}`);
+          }
+        } catch (replyErr) {
+          const msg = replyErr instanceof Error ? replyErr.message : String(replyErr);
+          logger.warn(`EventDispatcher: reply delivery failed: ${msg}`);
+        }
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       logger.warn(`EventDispatcher: job ${job.id} for talk ${talkId} failed: ${msg}`);
@@ -173,4 +227,19 @@ export class EventDispatcher {
       }
     }
   }
+}
+
+/**
+ * Extract the platform-specific channel ID from an event `from` string.
+ * Examples:
+ *   "slack:channel:C01CL1PU022" → "C01CL1PU022"
+ *   "slack:U12345"              → "U12345"
+ *   "telegram:group:-123456"    → "-123456"
+ */
+function extractPlatformChannelId(from: string): string | undefined {
+  // Format: "platform:type:id" or "platform:id"
+  const parts = from.split(':');
+  if (parts.length >= 3) return parts.slice(2).join(':');
+  if (parts.length === 2) return parts[1];
+  return undefined;
 }
