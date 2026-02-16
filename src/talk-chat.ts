@@ -28,6 +28,36 @@ const MIN_HISTORY_MESSAGES = 8;
 const RESERVED_OVERHEAD_BYTES = 8 * 1024;
 /** Never shrink history budget below this floor. */
 const MIN_HISTORY_BUDGET_BYTES = 4 * 1024;
+const CLAWTALK_DEFAULT_AGENT_ID = 'clawtalk';
+
+function sanitizeSessionPart(value: string): string {
+  return value.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '_').slice(0, 96);
+}
+
+function resolveTalkAgentRouting(meta: { agents?: Array<{ name: string; openClawAgentId?: string }> }, requestedAgentName?: string): {
+  headerAgentId: string;
+  sessionAgentPart: string;
+} {
+  const requested = requestedAgentName?.trim().toLowerCase();
+  if (!requested) {
+    return {
+      headerAgentId: CLAWTALK_DEFAULT_AGENT_ID,
+      sessionAgentPart: CLAWTALK_DEFAULT_AGENT_ID,
+    };
+  }
+  const matched = (meta.agents ?? []).find((agent) => agent.name.trim().toLowerCase() === requested);
+  const routed = matched?.openClawAgentId?.trim() || CLAWTALK_DEFAULT_AGENT_ID;
+  return {
+    headerAgentId: routed,
+    sessionAgentPart: routed,
+  };
+}
+
+function buildTalkSessionKey(talkId: string, agentPart: string): string {
+  const talk = sanitizeSessionPart(talkId) || 'talk';
+  const agent = sanitizeSessionPart(agentPart) || CLAWTALK_DEFAULT_AGENT_ID;
+  return `agent:${agent}:clawtalk:talk:${talk}:chat`;
+}
 
 function estimateHistoryMessageBytes(msg: TalkMessage): number {
   let size = Buffer.byteLength(msg.content || '', 'utf-8');
@@ -274,6 +304,11 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
   let fullContent = '';
   let responseModel: string | undefined;
   let toolCallMessages: Array<any> = [];
+  const routing = resolveTalkAgentRouting(meta, body.agentName);
+  const extraHeaders: Record<string, string> = {
+    'x-openclaw-agent-id': routing.headerAgentId,
+    'x-openclaw-session-key': buildTalkSessionKey(talkId, routing.sessionAgentPart),
+  };
 
   store.setProcessing(talkId, true);
   try {
@@ -283,6 +318,7 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
       tools,
       gatewayOrigin,
       authToken,
+      extraHeaders,
       res,
       registry,
       executor,

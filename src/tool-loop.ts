@@ -117,6 +117,7 @@ export interface ToolLoopStreamOptions {
   tools: ToolDefinition[];
   gatewayOrigin: string;
   authToken: string | undefined;
+  extraHeaders?: Record<string, string>;
   res: ServerResponse;
   registry: ToolRegistry;
   executor: ToolExecutor;
@@ -137,7 +138,7 @@ export interface ToolLoopStreamResult {
  * executes tool calls, and loops until done or max iterations.
  */
 export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoopStreamResult> {
-  const { messages, model, tools, gatewayOrigin, authToken, res, executor, logger, clientSignal } = opts;
+  const { messages, model, tools, gatewayOrigin, authToken, extraHeaders, res, executor, logger, clientSignal } = opts;
   let fullContent = '';
   let responseModel: string | undefined;
   const toolCallMessages: ToolLoopStreamResult['toolCallMessages'] = [];
@@ -171,6 +172,13 @@ export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoop
   for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+    if (extraHeaders) {
+      for (const [key, value] of Object.entries(extraHeaders)) {
+        if (typeof value === 'string' && value.trim().length > 0) {
+          headers[key] = value;
+        }
+      }
+    }
 
     // Snapshot messages length so we can roll back on retry
     const messagesSnapshot = messages.length;

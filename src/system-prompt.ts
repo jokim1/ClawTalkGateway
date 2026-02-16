@@ -135,7 +135,7 @@ export function composeSystemPrompt(input: SystemPromptInput): string | undefine
     '## Honesty\n' +
     'Do not speculate about or fabricate system internals, configuration entries, ' +
     'session identifiers, or infrastructure details you do not actually have access to. ' +
-    'If you do not know how something works internally, say so rather than guessing.',
+      'If you do not know how something works internally, say so rather than guessing.',
   );
 
   // Objectives

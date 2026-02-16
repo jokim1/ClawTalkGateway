@@ -458,6 +458,23 @@ function createSlackScopeResolver(cfg: Record<string, any>, logger: HandlerConte
 
     const channelName = normalizeSlackChannelNameScope(scope);
     if (!channelName) {
+      const trimmedScope = scope.trim();
+      const looksLikeDisplayLabel = /\s+#/.test(trimmedScope)
+        && !trimmedScope.startsWith('#')
+        && !/^[a-z0-9._-]+:#/i.test(trimmedScope)
+        && !/^account:[a-z0-9._-]+:/i.test(trimmedScope)
+        && !/^channel:/i.test(trimmedScope)
+        && !/^user:/i.test(trimmedScope)
+        && !/^slack:/i.test(trimmedScope);
+      if (looksLikeDisplayLabel) {
+        return {
+          ok: false,
+          error:
+            `Invalid Slack scope "${scope}". ` +
+            'This looks like a display label. Use account ID scope (e.g. lilagames:#team-product) ' +
+            'or channel:<ID> (e.g. channel:C01JZCR4ATU).',
+        };
+      }
       return {
         ok: false,
         error:
