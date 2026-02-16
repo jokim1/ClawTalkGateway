@@ -728,6 +728,7 @@ async function callLlmForEvent(params: {
   const baseSystemPrompt = composeSystemPrompt({
     meta,
     contextMd,
+    activeModel: model,
     pinnedMessages: pinnedMessages.filter(Boolean) as TalkMessage[],
     agentOverride: selectedAgent
       ? {

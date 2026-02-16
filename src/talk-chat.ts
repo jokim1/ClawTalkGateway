@@ -186,7 +186,14 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
     roleInstructions: body.agentRoleInstructions || '',
     otherAgents: body.otherAgents || [],
   } : undefined;
-  const systemPrompt = composeSystemPrompt({ meta, contextMd, pinnedMessages, agentOverride, registry });
+  const systemPrompt = composeSystemPrompt({
+    meta,
+    contextMd,
+    pinnedMessages,
+    activeModel: model,
+    agentOverride,
+    registry,
+  });
 
   // Load recent history and adapt the included window to fit context budget.
   const recentHistory = await store.getRecentMessages(talkId, MAX_CONTEXT_MESSAGES);

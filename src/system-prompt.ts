@@ -24,6 +24,7 @@ export interface SystemPromptInput {
   meta: TalkMeta;
   contextMd: string;
   pinnedMessages: TalkMessage[];
+  activeModel?: string;
   agentOverride?: {
     name: string;
     role: string;
@@ -39,7 +40,7 @@ function totalPromptBytes(sections: string[]): number {
 }
 
 export function composeSystemPrompt(input: SystemPromptInput): string | undefined {
-  const { meta, contextMd, pinnedMessages, agentOverride, registry } = input;
+  const { meta, contextMd, pinnedMessages, activeModel, agentOverride, registry } = input;
 
   // Priority-ordered sections: identity > objective > context > pinned > jobs > tools
   // Each section is built and then assembled, truncating lower-priority sections if needed.
@@ -137,6 +138,15 @@ export function composeSystemPrompt(input: SystemPromptInput): string | undefine
     'session identifiers, or infrastructure details you do not actually have access to. ' +
       'If you do not know how something works internally, say so rather than guessing.',
   );
+
+  if (activeModel?.trim()) {
+    sections.push(
+      `## Model Configuration\n` +
+      `Current request model: \`${activeModel.trim()}\`\n\n` +
+      `If asked what model you are, answer using this configured model string. ` +
+      `Do not infer identity from prior conversation text, prior summaries, or memory.`,
+    );
+  }
 
   // Objectives
   if (meta.objective) {
