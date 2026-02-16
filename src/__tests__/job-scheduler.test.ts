@@ -1,4 +1,4 @@
-import { parseIntervalMs, isJobDue } from '../job-scheduler';
+import { parseIntervalMs, isJobDue, validateSchedule } from '../job-scheduler';
 import type { TalkJob } from '../types';
 
 // ---------------------------------------------------------------------------
@@ -67,6 +67,14 @@ describe('parseIntervalMs', () => {
 
   it('returns null for cron expression "0 9 * * 1-5"', () => {
     expect(parseIntervalMs('0 9 * * 1-5')).toBeNull();
+  });
+});
+
+describe('validateSchedule (weekly)', () => {
+  it('accepts weekly schedules with optional timezone token', () => {
+    expect(validateSchedule('every Monday at 5pm')).toBeNull();
+    expect(validateSchedule('every Monday PST at 5PM')).toBeNull();
+    expect(validateSchedule('every Monday at 5PM PST')).toBeNull();
   });
 });
 
@@ -179,6 +187,34 @@ describe('isJobDue (daily schedules)', () => {
     const job = makeJob({
       schedule,
       lastRunAt: undefined,
+    });
+    expect(isJobDue(job)).toBe(false);
+  });
+});
+
+describe('isJobDue (weekly schedules)', () => {
+  const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'] as const;
+
+  it('returns true when weekly target time has passed and has not run today', () => {
+    const now = new Date();
+    const minute = now.getMinutes() > 0 ? now.getMinutes() - 1 : 0;
+    const schedule = `every ${dayNames[now.getDay()]} at ${now.getHours()}:${String(minute).padStart(2, '0')}`;
+
+    const job = makeJob({
+      schedule,
+      lastRunAt: Date.now() - 86_400_000 * 2, // 2 days ago
+    });
+    expect(isJobDue(job)).toBe(true);
+  });
+
+  it('returns false when weekly job already ran after today\'s target', () => {
+    const now = new Date();
+    const minute = now.getMinutes() > 0 ? now.getMinutes() - 1 : 0;
+    const schedule = `every ${dayNames[now.getDay()]} at ${now.getHours()}:${String(minute).padStart(2, '0')}`;
+
+    const job = makeJob({
+      schedule,
+      lastRunAt: Date.now() - 5_000, // just ran
     });
     expect(isJobDue(job)).toBe(false);
   });

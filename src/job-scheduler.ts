@@ -7,6 +7,7 @@
  *
  * Schedules supported:
  *   - Simple intervals: "every 1h", "every 30m", "every 6h"
+ *   - Weekly: "every Monday at 5pm", "every Monday PST at 5pm", "every Monday at 5pm PST"
  *   - Daily: "daily 9am", "daily 14:00"
  *   - Daily with day constraint: "daily 10am weekdays", "10am weekdays", "9am weekends"
  *   - Daily with timezone: "10am IST weekdays", "daily 9am PST", "10am Asia/Kolkata"
@@ -216,6 +217,13 @@ interface DailySchedule {
   timezone?: string; // IANA timezone name
 }
 
+interface WeeklySchedule {
+  dayOfWeek: number; // 0=Sun
+  hour: number;
+  minute: number;
+  timezone?: string; // IANA timezone name
+}
+
 /**
  * Parse a daily schedule string into structured form.
  * Accepts: "daily 9am", "10am weekdays", "10am IST weekdays", "10am Asia/Kolkata weekdays"
@@ -262,6 +270,90 @@ export function parseDailySchedule(schedule: string): DailySchedule | null {
   return { hour, minute, days, timezone };
 }
 
+const WEEKDAY_TO_DOW: Record<string, number> = {
+  sunday: 0,
+  sun: 0,
+  monday: 1,
+  mon: 1,
+  tuesday: 2,
+  tue: 2,
+  wednesday: 3,
+  wed: 3,
+  thursday: 4,
+  thu: 4,
+  friday: 5,
+  fri: 5,
+  saturday: 6,
+  sat: 6,
+};
+
+/**
+ * Parse a weekly schedule string.
+ * Accepts:
+ *   - "every Monday at 5pm"
+ *   - "every Monday PST at 5pm"
+ *   - "every Monday at 5pm PST"
+ */
+export function parseWeeklySchedule(schedule: string): WeeklySchedule | null {
+  const match = schedule.match(/^every\s+([a-z]+)\s+(.+)$/i);
+  if (!match) return null;
+
+  const dayToken = match[1].toLowerCase();
+  const dayOfWeek = WEEKDAY_TO_DOW[dayToken];
+  if (dayOfWeek === undefined) return null;
+
+  let remainder = match[2].trim();
+  if (!remainder) return null;
+
+  let timezoneToken: string | undefined;
+  let timeToken: string | undefined;
+
+  // Pattern A: "<timezone> at <time>"
+  const atSeparator = remainder.toLowerCase().indexOf(' at ');
+  if (atSeparator > 0) {
+    timezoneToken = remainder.slice(0, atSeparator).trim();
+    timeToken = remainder.slice(atSeparator + 4).trim();
+  } else if (remainder.toLowerCase().startsWith('at ')) {
+    // Pattern B: "at <time> [timezone]"
+    remainder = remainder.slice(3).trim();
+    const pieces = remainder.split(/\s+/);
+    if (pieces.length >= 2) {
+      const maybeTimezone = pieces[pieces.length - 1];
+      if (resolveTimezone(maybeTimezone)) {
+        timezoneToken = maybeTimezone;
+        timeToken = pieces.slice(0, -1).join(' ');
+      } else {
+        timeToken = remainder;
+      }
+    } else {
+      timeToken = remainder;
+    }
+  } else {
+    return null;
+  }
+
+  if (!timeToken) return null;
+
+  const timeMatch = timeToken.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i);
+  if (!timeMatch) return null;
+  let hour = parseInt(timeMatch[1], 10);
+  const minute = parseInt(timeMatch[2] ?? '0', 10);
+  const ampm = timeMatch[3]?.toLowerCase();
+
+  if (ampm === 'pm' && hour < 12) hour += 12;
+  if (ampm === 'am' && hour === 12) hour = 0;
+  if (hour > 23 || minute > 59) return null;
+
+  let timezone: string | undefined;
+  if (timezoneToken) {
+    const resolved = resolveTimezone(timezoneToken);
+    if (!resolved) return null;
+    timezone = resolved;
+  }
+
+  return { dayOfWeek, hour, minute, timezone };
+}
+
 // ---------------------------------------------------------------------------
 // Event trigger parsing
 // ---------------------------------------------------------------------------
@@ -296,6 +388,9 @@ export function validateSchedule(schedule: string): string | null {
   // Interval: "every Xh", "every Xm", "every Xd"
   if (parseIntervalMs(s) !== null) return null;
 
+  // Weekly: "every Monday at 5pm", optionally with timezone token.
+  if (parseWeeklySchedule(s) !== null) return null;
+
   // Daily (with optional day constraint): "daily 9am", "daily 14:00", "daily 10am weekdays",
   // "10am weekdays", "9am weekends"
   if (parseDailySchedule(s) !== null) return null;
@@ -303,7 +398,7 @@ export function validateSchedule(schedule: string): string | null {
   // Cron: 5 space-separated fields
   if (s.split(/\s+/).length === 5) return null;
 
-  return `Unrecognized schedule format: "${s}". Supported: "on <scope>" (event), "every Xh/Xm/Xd", "daily 9am", "10am IST weekdays", "in Xh/Xm", "at 3pm/14:00", or 5-field cron`;
+  return `Unrecognized schedule format: "${s}". Supported: "on <scope>" (event), "every Xh/Xm/Xd", "every Monday [TZ] at 5pm", "daily 9am", "10am IST weekdays", "in Xh/Xm", "at 3pm/14:00", or 5-field cron`;
 }
 
 /**
@@ -329,6 +424,39 @@ export function isJobDue(job: TalkJob): boolean {
   if (intervalMs !== null) {
     const lastRun = job.lastRunAt ?? job.createdAt;
     return now - lastRun >= intervalMs;
+  }
+
+  // Weekly schedules: "every Monday at 5pm", with optional timezone
+  const weekly = parseWeeklySchedule(job.schedule);
+  if (weekly) {
+    if (weekly.timezone) {
+      const tz = getTimeInTimezone(weekly.timezone);
+      if (tz.dayOfWeek !== weekly.dayOfWeek) return false;
+      const targetReached = tz.hour > weekly.hour || (tz.hour === weekly.hour && tz.minute >= weekly.minute);
+      if (!targetReached) return false;
+
+      const tzDayKey = `${tz.year}-${tz.month}-${tz.day}`;
+      const lastRun = job.lastRunAt ?? 0;
+      if (lastRun > 0) {
+        const lastRunDate = new Date(lastRun);
+        const lastRunParts = new Intl.DateTimeFormat('en-US', {
+          timeZone: weekly.timezone,
+          year: 'numeric', month: 'numeric', day: 'numeric',
+        }).formatToParts(lastRunDate);
+        const getLR = (type: string) => lastRunParts.find(p => p.type === type)?.value ?? '';
+        const lastRunDayKey = `${getLR('year')}-${getLR('month')}-${getLR('day')}`;
+        if (lastRunDayKey === tzDayKey) return false;
+      }
+
+      return true;
+    }
+
+    const today = new Date();
+    if (today.getDay() !== weekly.dayOfWeek) return false;
+    const targetToday = new Date(today.getFullYear(), today.getMonth(), today.getDate(), weekly.hour, weekly.minute, 0, 0);
+    const targetMs = targetToday.getTime();
+    const lastRun = job.lastRunAt ?? 0;
+    return now >= targetMs && lastRun < targetMs;
   }
 
   // Daily schedule: "daily 9am", "daily 14:00", "daily 10am weekdays", "10am IST weekdays"
