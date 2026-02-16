@@ -500,22 +500,13 @@ function shouldHandleViaBehavior(meta: TalkMeta, bindingId: string): {
   reason?: string;
   behavior?: { autoRespond?: boolean; agentName?: string; onMessagePrompt?: string };
 } {
-  const behaviors = meta.platformBehaviors ?? [];
-  // Backwards compatibility: if no behavior rows exist, keep legacy auto-reply behavior.
-  if (behaviors.length === 0) {
+  const behavior = resolveBehaviorForBinding(meta, bindingId);
+  if (!behavior) {
+    // Missing behavior row means "use default talk behavior" for this binding.
     return { handle: true };
   }
 
-  const behavior = resolveBehaviorForBinding(meta, bindingId);
-  if (!behavior) {
-    return { handle: false, reason: 'no-platform-behavior' };
-  }
-
   if (behavior.autoRespond === false) {
-    return { handle: false, reason: 'on-message-disabled' };
-  }
-
-  if (!behavior.onMessagePrompt) {
     return { handle: false, reason: 'on-message-disabled' };
   }
 

@@ -223,7 +223,7 @@ describe('slack ingress ownership hooks', () => {
     expect(result).toBeUndefined();
   });
 
-  it('passes through when behavior exists but on-message is not configured', async () => {
+  it('handles when behavior sets agent-only override (no on-message prompt)', async () => {
     const { talkId, bindingId } = addSlackBindingWithId('channel:c901');
     store.updateTalk(talkId, {
       platformBehaviors: [{
@@ -251,7 +251,7 @@ describe('slack ingress ownership hooks', () => {
       },
       buildDeps(),
     );
-    expect(hookResult).toBeUndefined();
+    expect(hookResult).toEqual({ cancel: true });
 
     const result = handleSlackMessageSendingHook(
       {
@@ -265,7 +265,7 @@ describe('slack ingress ownership hooks', () => {
       },
       mockLogger,
     );
-    expect(result).toBeUndefined();
+    expect(result).toEqual({ cancel: true });
   });
 
   it('suppresses outbound when on-message behavior is configured for the binding', async () => {
