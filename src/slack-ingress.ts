@@ -107,6 +107,15 @@ type SlackOwnershipDecision = {
   duplicate?: boolean;
 };
 
+export type SlackOwnershipInspection = {
+  decision: 'handled' | 'pass';
+  talkId?: string;
+  reason?: string;
+  bindingId?: string;
+  behaviorAgentName?: string;
+  behaviorOnMessagePrompt?: string;
+};
+
 export type MessageReceivedHookEvent = {
   from: string;
   content: string;
@@ -842,9 +851,9 @@ function routeSlackIngressEvent(
     };
   }
 
-  const owner = resolveOwnerTalk(deps.store.listTalks(), event, deps.logger);
-  if (!owner.talkId || !owner.binding) {
-    const reason = owner.reason ?? 'no-binding';
+  const ownership = inspectSlackOwnership(event, deps.store, deps.logger);
+  if (ownership.decision === 'pass' || !ownership.talkId || !ownership.bindingId) {
+    const reason = ownership.reason ?? 'no-binding';
     seenEvents.set(event.eventId, {
       ts: Date.now(),
       decision: 'pass',
@@ -855,46 +864,6 @@ function routeSlackIngressEvent(
       payload: {
         decision: 'pass',
         reason,
-        eventId: event.eventId,
-      },
-    };
-  }
-
-  const ownerTalk = deps.store.getTalk(owner.talkId);
-  if (!ownerTalk) {
-    seenEvents.set(event.eventId, {
-      ts: Date.now(),
-      decision: 'pass',
-      reason: 'talk-not-found',
-    });
-    return {
-      statusCode: 200,
-      payload: {
-        decision: 'pass',
-        reason: 'talk-not-found',
-        eventId: event.eventId,
-      },
-    };
-  }
-
-  const behaviorDecision = shouldHandleViaBehavior(ownerTalk, owner.binding.id);
-  if (!behaviorDecision.handle) {
-    const reason = behaviorDecision.reason ?? 'no-platform-behavior';
-    seenEvents.set(event.eventId, {
-      ts: Date.now(),
-      decision: 'pass',
-      reason,
-      talkId: owner.talkId,
-    });
-    deps.logger.debug(
-      `SlackIngress: pass ${event.eventId} for talk ${owner.talkId} (${reason})`,
-    );
-    return {
-      statusCode: 200,
-      payload: {
-        decision: 'pass',
-        reason,
-        talkId: owner.talkId,
         eventId: event.eventId,
       },
     };
@@ -921,15 +890,15 @@ function routeSlackIngressEvent(
   seenEvents.set(event.eventId, {
     ts: Date.now(),
     decision: 'handled',
-    talkId: owner.talkId,
+    talkId: ownership.talkId,
   });
-  upsertOutboundSuppression(event, owner.talkId);
+  upsertOutboundSuppression(event, ownership.talkId);
   queue.push({
-    talkId: owner.talkId,
+    talkId: ownership.talkId,
     event,
-    platformBindingId: owner.binding.id,
-    behaviorAgentName: behaviorDecision.behavior?.agentName,
-    behaviorOnMessagePrompt: behaviorDecision.behavior?.onMessagePrompt,
+    platformBindingId: ownership.bindingId,
+    behaviorAgentName: ownership.behaviorAgentName,
+    behaviorOnMessagePrompt: ownership.behaviorOnMessagePrompt,
     attempt: 0,
     enqueuedAt: Date.now(),
     inboundContent: buildInboundMessage(event),
@@ -942,10 +911,55 @@ function routeSlackIngressEvent(
     statusCode: 202,
     payload: {
       decision: 'handled',
-      talkId: owner.talkId,
+      talkId: ownership.talkId,
       eventId: event.eventId,
       queued: true,
     },
+  };
+}
+
+export function inspectSlackOwnership(
+  event: Pick<SlackIngressEvent, 'accountId' | 'channelId' | 'channelName' | 'outboundTarget' | 'eventId'>,
+  store: TalkStore,
+  logger: Logger,
+): SlackOwnershipInspection {
+  const owner = resolveOwnerTalk(store.listTalks(), {
+    ...event,
+    text: '',
+  }, logger);
+  if (!owner.talkId || !owner.binding) {
+    return {
+      decision: 'pass',
+      reason: owner.reason ?? 'no-binding',
+    };
+  }
+
+  const ownerTalk = store.getTalk(owner.talkId);
+  if (!ownerTalk) {
+    return {
+      decision: 'pass',
+      reason: 'talk-not-found',
+      talkId: owner.talkId,
+      bindingId: owner.binding.id,
+    };
+  }
+
+  const behaviorDecision = shouldHandleViaBehavior(ownerTalk, owner.binding.id);
+  if (!behaviorDecision.handle) {
+    return {
+      decision: 'pass',
+      reason: behaviorDecision.reason ?? 'no-platform-behavior',
+      talkId: owner.talkId,
+      bindingId: owner.binding.id,
+    };
+  }
+
+  return {
+    decision: 'handled',
+    talkId: owner.talkId,
+    bindingId: owner.binding.id,
+    behaviorAgentName: behaviorDecision.behavior?.agentName,
+    behaviorOnMessagePrompt: behaviorDecision.behavior?.onMessagePrompt,
   };
 }
 

@@ -31,9 +31,12 @@ import { ToolExecutor } from './tool-executor.js';
 import { registerCommands } from './commands.js';
 import {
   handleSlackIngress,
+  inspectSlackOwnership,
   handleSlackMessageReceivedHook,
   handleSlackMessageSendingHook,
 } from './slack-ingress.js';
+import { normalizeSlackBindingScope } from './talks.js';
+import { findOpenClawSlackOwnershipConflicts } from './slack-ownership-doctor.js';
 
 // ---------------------------------------------------------------------------
 // Node.js 25 fetch fix — replace built-in undici connector to fix Tailscale IP
@@ -66,6 +69,8 @@ const ROUTES = new Set([
   '/api/realtime-voice/stream',
   '/api/files/upload',
   '/api/events/slack',
+  '/api/events/slack/resolve',
+  '/api/events/slack/doctor',
 ]);
 
 // ============================================================================
@@ -174,6 +179,31 @@ function resolveGatewayOrigin(cfg: Record<string, any>, log: PluginApi['logger']
   return `http://127.0.0.1:${port}`;
 }
 
+function resolveClawTalkAgentIds(cfg: Record<string, any>): string[] {
+  const ids = new Set<string>(['mobileclaw', 'clawtalk']);
+  const agents = Array.isArray(cfg?.agents?.list) ? cfg.agents.list : [];
+  for (const entry of agents) {
+    if (!entry || typeof entry !== 'object') continue;
+    const agent = entry as Record<string, unknown>;
+    const id = typeof agent.id === 'string' ? agent.id.trim() : '';
+    const name = typeof agent.name === 'string' ? agent.name.trim().toLowerCase() : '';
+    if (!id) continue;
+    if (name.includes('clawtalk') || id.toLowerCase().includes('clawtalk')) {
+      ids.add(id);
+    }
+  }
+  return Array.from(ids);
+}
+
+function normalizeSlackResolveScope(channelIdRaw: string): string | null {
+  const channelId = channelIdRaw.trim();
+  if (!channelId) return null;
+  if (channelId.includes(':')) {
+    return normalizeSlackBindingScope(channelId);
+  }
+  return normalizeSlackBindingScope(`channel:${channelId}`);
+}
+
 // ============================================================================
 // Platform reply — delivers event job output back to the originating platform
 // ============================================================================
@@ -279,6 +309,27 @@ const plugin = {
     const talkStore = new TalkStore(pluginCfg.dataDir, api.logger);
     talkStore.init().catch(err => api.logger.error(`TalkStore init failed: ${err}`));
 
+    const logSlackOwnershipConflicts = () => {
+      const cfg0 = api.runtime.config.loadConfig();
+      const conflicts = findOpenClawSlackOwnershipConflicts({
+        talks: talkStore.listTalks(),
+        openClawConfig: cfg0,
+        clawTalkAgentIds: resolveClawTalkAgentIds(cfg0),
+      });
+      if (conflicts.length === 0) {
+        api.logger.info('ClawTalk: Slack ownership doctor found no conflicts');
+        return;
+      }
+      for (const conflict of conflicts) {
+        api.logger.warn(
+          'ClawTalk: Slack ownership conflict detected — ' +
+          `talk=${conflict.talkId} owns ${conflict.talkAccountId}/${conflict.talkScope}, ` +
+          `but OpenClaw binding routes ${conflict.openClawAccountId}/${conflict.openClawScope} ` +
+          `to agent "${conflict.openClawAgentId}"`,
+        );
+      }
+    };
+
     // Shared Slack reply path (direct Slack API).
     const replyHandler = createEventReplyHandler(
       () => api.runtime.config.loadConfig(),
@@ -313,6 +364,10 @@ const plugin = {
         ),
     });
     refreshSlackIngressRoute();
+    const ownershipDoctorTimer = setTimeout(() => {
+      logSlackOwnershipConflicts();
+    }, 2000);
+    ownershipDoctorTimer.unref?.();
 
     // Initialize tool registry and executor
     const toolRegistry = new ToolRegistry(pluginCfg.dataDir, api.logger);
@@ -390,6 +445,7 @@ const plugin = {
     // Register lifecycle hooks
     api.on('gateway_start', () => {
       refreshSlackIngressRoute();
+      logSlackOwnershipConflicts();
       api.logger.info('ClawTalk: gateway_start event received');
     });
 
@@ -566,6 +622,77 @@ const plugin = {
         }
 
         switch (url.pathname) {
+          case '/api/events/slack/resolve': {
+            if (req.method !== 'GET') {
+              sendJson(res, 405, { error: 'Method not allowed' });
+              break;
+            }
+            const channelIdInput = url.searchParams.get('channelId')?.trim() ?? '';
+            if (!channelIdInput) {
+              sendJson(res, 400, { error: 'Missing query param: channelId' });
+              break;
+            }
+            const canonicalScope = normalizeSlackResolveScope(channelIdInput);
+            if (!canonicalScope) {
+              sendJson(res, 400, {
+                error: 'Invalid channelId. Use C123..., channel:C123..., or user:U123...',
+              });
+              break;
+            }
+
+            const accountId = (url.searchParams.get('accountId')?.trim().toLowerCase() || undefined);
+            const scopeTarget = canonicalScope.includes(':')
+              ? canonicalScope.slice(canonicalScope.indexOf(':') + 1)
+              : channelIdInput;
+            const ownership = inspectSlackOwnership(
+              {
+                eventId: `resolve:${Date.now()}`,
+                accountId,
+                channelId: scopeTarget,
+                channelName: url.searchParams.get('channelName')?.trim() || undefined,
+                outboundTarget: url.searchParams.get('outboundTarget')?.trim() || undefined,
+              },
+              talkStore,
+              api.logger,
+            );
+            const conflicts = findOpenClawSlackOwnershipConflicts({
+              talks: talkStore.listTalks(),
+              openClawConfig: cfg,
+              clawTalkAgentIds: resolveClawTalkAgentIds(cfg),
+            }).filter((conflict) => {
+              if (accountId && conflict.talkAccountId !== accountId) return false;
+              if (conflict.talkScope !== canonicalScope.toLowerCase() && conflict.talkScope !== 'slack:*') {
+                return false;
+              }
+              return true;
+            });
+
+            sendJson(res, 200, {
+              accountId: accountId ?? 'default',
+              channelId: scopeTarget,
+              canonicalScope,
+              ownership,
+              openClawConflicts: conflicts,
+            });
+            break;
+          }
+          case '/api/events/slack/doctor': {
+            if (req.method !== 'GET') {
+              sendJson(res, 405, { error: 'Method not allowed' });
+              break;
+            }
+            const conflicts = findOpenClawSlackOwnershipConflicts({
+              talks: talkStore.listTalks(),
+              openClawConfig: cfg,
+              clawTalkAgentIds: resolveClawTalkAgentIds(cfg),
+            });
+            sendJson(res, 200, {
+              ok: conflicts.length === 0,
+              conflictCount: conflicts.length,
+              conflicts,
+            });
+            break;
+          }
           case '/api/events/slack': {
             const host = req.headers.host ?? 'localhost:18789';
             const gatewayOrigin = `http://${host}`;

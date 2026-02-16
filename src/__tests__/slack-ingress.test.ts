@@ -5,6 +5,7 @@ import {
   __resetSlackIngressStateForTests,
   handleSlackMessageReceivedHook,
   handleSlackMessageSendingHook,
+  inspectSlackOwnership,
 } from '../slack-ingress';
 import { TalkStore } from '../talk-store';
 import type { Logger } from '../types';
@@ -299,5 +300,31 @@ describe('slack ingress ownership hooks', () => {
       mockLogger,
     );
     expect(result).toBeUndefined();
+  });
+
+  it('exposes ownership inspection details for diagnostics', () => {
+    const { talkId, bindingId } = addSlackBindingWithId('channel:c777');
+    store.updateTalk(talkId, {
+      platformBehaviors: [{
+        id: 'behavior-diag',
+        platformBindingId: bindingId,
+        onMessagePrompt: 'Reply in one line.',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      }],
+    });
+
+    const inspected = inspectSlackOwnership(
+      {
+        eventId: 'evt-1',
+        accountId: 'default',
+        channelId: 'C777',
+      },
+      store,
+      mockLogger,
+    );
+    expect(inspected.decision).toBe('handled');
+    expect(inspected.talkId).toBe(talkId);
+    expect(inspected.bindingId).toBe(bindingId);
   });
 });
