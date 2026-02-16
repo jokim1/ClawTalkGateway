@@ -245,6 +245,12 @@ Returns usage data for all providers. Optionally filter with `?provider=anthropi
 - `CLAWTALK_INGRESS_SUPPRESS_TTL_MS` (default `120000`) — suppression lease TTL for blocking OpenClaw outbound after a claim.
 - `CLAWTALK_INGRESS_SUPPRESS_MAX_CANCELS` (default `3`) — max OpenClaw outbound sends canceled per claimed event.
 
+#### Slack platform binding rules
+
+- For `platform: slack`, scope must be one of: `channel:<ID>`, `user:<ID>`, or `slack:*`.
+- Legacy name-based scopes (e.g. `#team-channel`) are rejected for new writes.
+- Writable Slack ownership scopes (`write` / `read+write`) must be unique across talks; conflicting updates return `409`.
+
 ### Voice endpoints
 
 | Method | Endpoint | Description |
