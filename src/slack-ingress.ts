@@ -13,6 +13,7 @@ import type {
 import { readJsonBody, sendJson } from './http.js';
 import { composeSystemPrompt } from './system-prompt.js';
 import { scheduleContextUpdate } from './context-updater.js';
+import { collectRoutingDiagnostics } from './model-routing-diagnostics.js';
 
 const MAX_CONTEXT_MESSAGES = 50;
 const MAX_CONTEXT_BUDGET_BYTES = 60 * 1024;
@@ -769,18 +770,38 @@ async function callLlmForEvent(params: {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
   };
+  const traceId = randomUUID();
   if (deps.authToken) {
     headers.Authorization = `Bearer ${deps.authToken}`;
   }
+  const routeDiag = await collectRoutingDiagnostics({
+    requestedModel: model,
+    headerAgentId: selectedAgent?.openClawAgentId?.trim(),
+  });
+  const resolvedHeaderAgentId = selectedAgent?.openClawAgentId?.trim()
+    || (
+      routeDiag.configuredAgentModel?.trim().toLowerCase() !== model.trim().toLowerCase()
+        ? routeDiag.matchedRequestedModelAgentId
+        : undefined
+    );
   const sessionKey = buildSlackSessionKey({
     talkId,
     event,
-    agentId: selectedAgent?.openClawAgentId ?? 'main',
+    agentId: resolvedHeaderAgentId ?? 'main',
   });
+  headers['x-openclaw-trace-id'] = traceId;
   headers['x-openclaw-session-key'] = sessionKey;
-  if (selectedAgent?.openClawAgentId?.trim()) {
-    headers['x-openclaw-agent-id'] = selectedAgent.openClawAgentId.trim();
+  if (resolvedHeaderAgentId?.trim()) {
+    headers['x-openclaw-agent-id'] = resolvedHeaderAgentId.trim();
   }
+  deps.logger.info(
+    `ModelRoute trace=${traceId} flow=slack-ingress talkId=${talkId} eventId=${event.eventId} requestedModel=${routeDiag.requestedModel} `
+    + `headerAgentId=${selectedAgent?.openClawAgentId?.trim() ?? '-'} effectiveHeaderAgentId=${resolvedHeaderAgentId ?? '-'} `
+    + `configuredAgentId=${routeDiag.configuredAgentId ?? '-'} `
+    + `configuredAgentModel=${routeDiag.configuredAgentModel ?? '-'} defaultAgentId=${routeDiag.defaultAgentId ?? '-'} `
+    + `defaultAgentModel=${routeDiag.defaultAgentModel ?? '-'} matchedRequestedModelAgentId=${routeDiag.matchedRequestedModelAgentId ?? '-'} `
+    + `matchedRequestedModelAgentModel=${routeDiag.matchedRequestedModelAgentModel ?? '-'} notes=${routeDiag.notes.join(',') || '-'}`,
+  );
 
   const llmResponse = await fetch(`${deps.gatewayOrigin}/v1/chat/completions`, {
     method: 'POST',
@@ -795,6 +816,10 @@ async function callLlmForEvent(params: {
 
   if (!llmResponse.ok) {
     const errBody = await llmResponse.text().catch(() => '');
+    deps.logger.warn(
+      `ModelRoute trace=${traceId} flow=slack-ingress-error talkId=${talkId} eventId=${event.eventId} `
+      + `status=${llmResponse.status} body=${errBody.slice(0, 120)}`,
+    );
     throw new Error(`llm call failed (${llmResponse.status}): ${errBody.slice(0, 200)}`);
   }
 
@@ -804,8 +829,16 @@ async function callLlmForEvent(params: {
   };
   const reply = json.choices?.[0]?.message?.content?.trim() ?? '';
   if (!reply) {
+    deps.logger.warn(
+      `ModelRoute trace=${traceId} flow=slack-ingress-error talkId=${talkId} eventId=${event.eventId} `
+      + 'status=ok reason=empty-reply',
+    );
     throw new Error('llm returned empty response');
   }
+  deps.logger.info(
+    `ModelRoute trace=${traceId} flow=slack-ingress-complete talkId=${talkId} eventId=${event.eventId} `
+    + `responseModel=${json.model?.trim() || '-'} chars=${reply.length}`,
+  );
 
   return {
     reply,

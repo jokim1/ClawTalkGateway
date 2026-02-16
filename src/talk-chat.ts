@@ -17,6 +17,7 @@ import { sendJson, readJsonBody } from './http.js';
 import { composeSystemPrompt } from './system-prompt.js';
 import { scheduleContextUpdate } from './context-updater.js';
 import { runToolLoop } from './tool-loop.js';
+import { collectRoutingDiagnostics } from './model-routing-diagnostics.js';
 
 /** Maximum number of history messages to include in LLM context. */
 const MAX_CONTEXT_MESSAGES = 50;
@@ -29,6 +30,29 @@ const RESERVED_OVERHEAD_BYTES = 8 * 1024;
 /** Never shrink history budget below this floor. */
 const MIN_HISTORY_BUDGET_BYTES = 4 * 1024;
 const CLAWTALK_DEFAULT_AGENT_ID = 'clawtalk';
+const DEFAULT_TALK_TOOL_LOOP_TIMEOUT_MS = 180_000;
+
+function resolveTalkToolLoopTimeoutMs(): number {
+  const raw = process.env.CLAWTALK_TALK_TOOLLOOP_TIMEOUT_MS;
+  if (!raw) return DEFAULT_TALK_TOOL_LOOP_TIMEOUT_MS;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) return DEFAULT_TALK_TOOL_LOOP_TIMEOUT_MS;
+  return Math.min(900_000, Math.max(30_000, parsed));
+}
+
+function isModelIdentityQuestion(message: string): boolean {
+  const text = message.trim().toLowerCase();
+  if (!text) return false;
+  return (
+    /^what model\b/.test(text)
+    || /^which model\b/.test(text)
+    || /^what llm\b/.test(text)
+    || /^who are you\b/.test(text)
+    || /\bwhat model are you\b/.test(text)
+    || /\bwhich model are you\b/.test(text)
+    || /\bwhat are you running\b/.test(text)
+  );
+}
 
 function sanitizeSessionPart(value: string): string {
   return value.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '_').slice(0, 96);
@@ -306,19 +330,44 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
   // Inject the user message ID as a custom SSE event so the client can reference it
   res.write(`event: meta\ndata: ${JSON.stringify({ userMessageId: userMsg.id })}\n\n`);
 
-  // Get tool schemas for this request
-  const tools = registry.getToolSchemas();
+  // Tool policy: simple model-identity/meta questions should not trigger tool chains.
+  const disableTools = isModelIdentityQuestion(body.message);
+  const tools = disableTools ? [] : registry.getToolSchemas();
+  const maxIterations = disableTools ? 2 : undefined;
+  if (disableTools) {
+    logger.info(`TalkChat: tool bypass for model/meta question talkId=${talkId}`);
+  }
 
   let fullContent = '';
   let responseModel: string | undefined;
   let toolCallMessages: Array<any> = [];
   const routing = resolveTalkAgentRouting(meta, body.agentName);
+  const traceId = randomUUID();
   const extraHeaders: Record<string, string> = {
     'x-openclaw-session-key': buildTalkSessionKey(talkId, routing.sessionAgentPart),
+    'x-openclaw-trace-id': traceId,
   };
-  if (routing.headerAgentId) {
-    extraHeaders['x-openclaw-agent-id'] = routing.headerAgentId;
+  const routeDiag = await collectRoutingDiagnostics({
+    requestedModel: model,
+    headerAgentId: routing.headerAgentId,
+  });
+  const resolvedHeaderAgentId = routing.headerAgentId
+    ?? (
+      routeDiag.configuredAgentModel?.trim().toLowerCase() !== model.trim().toLowerCase()
+        ? routeDiag.matchedRequestedModelAgentId
+        : undefined
+    );
+  if (resolvedHeaderAgentId?.trim()) {
+    extraHeaders['x-openclaw-agent-id'] = resolvedHeaderAgentId.trim();
   }
+  logger.info(
+    `ModelRoute trace=${traceId} flow=talk-chat talkId=${talkId} requestedModel=${routeDiag.requestedModel} `
+    + `headerAgentId=${routing.headerAgentId ?? '-'} effectiveHeaderAgentId=${resolvedHeaderAgentId ?? '-'} `
+    + `configuredAgentId=${routeDiag.configuredAgentId ?? '-'} `
+    + `configuredAgentModel=${routeDiag.configuredAgentModel ?? '-'} defaultAgentId=${routeDiag.defaultAgentId ?? '-'} `
+    + `defaultAgentModel=${routeDiag.defaultAgentModel ?? '-'} matchedRequestedModelAgentId=${routeDiag.matchedRequestedModelAgentId ?? '-'} `
+    + `matchedRequestedModelAgentModel=${routeDiag.matchedRequestedModelAgentModel ?? '-'} notes=${routeDiag.notes.join(',') || '-'}`,
+  );
 
   store.setProcessing(talkId, true);
   try {
@@ -334,14 +383,22 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
       executor,
       logger,
       clientSignal: clientAbort.signal,
+      traceId,
+      timeoutMs: resolveTalkToolLoopTimeoutMs(),
+      maxTotalMs: resolveTalkToolLoopTimeoutMs(),
+      maxIterations,
     });
 
     fullContent = result.fullContent;
     responseModel = result.responseModel;
     toolCallMessages = result.toolCallMessages;
+    logger.info(
+      `ModelRoute trace=${traceId} flow=talk-chat-complete talkId=${talkId} responseModel=${responseModel ?? '-'} chars=${fullContent.length}`,
+    );
   } catch (err) {
     const errMessage = err instanceof Error ? err.message : 'Unknown error';
     logger.error(`TalkChat: tool loop error: ${errMessage}`);
+    logger.warn(`ModelRoute trace=${traceId} flow=talk-chat-error talkId=${talkId} error=${errMessage}`);
 
     // Don't write to a closed connection
     if (!clientAbort.signal.aborted && !res.writableEnded) {

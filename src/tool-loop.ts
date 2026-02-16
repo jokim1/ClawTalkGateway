@@ -123,8 +123,12 @@ export interface ToolLoopStreamOptions {
   executor: ToolExecutor;
   logger: Logger;
   timeoutMs?: number;
+  maxTotalMs?: number;
+  maxIterations?: number;
   /** Signal that fires when the HTTP client disconnects. Not retried. */
   clientSignal?: AbortSignal;
+  /** Correlation id for model routing diagnostics. */
+  traceId?: string;
 }
 
 export interface ToolLoopStreamResult {
@@ -138,7 +142,7 @@ export interface ToolLoopStreamResult {
  * executes tool calls, and loops until done or max iterations.
  */
 export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoopStreamResult> {
-  const { messages, model, tools, gatewayOrigin, authToken, extraHeaders, res, executor, logger, clientSignal } = opts;
+  const { messages, model, tools, gatewayOrigin, authToken, extraHeaders, res, executor, logger, clientSignal, traceId } = opts;
   let fullContent = '';
   let responseModel: string | undefined;
   const toolCallMessages: ToolLoopStreamResult['toolCallMessages'] = [];
@@ -146,7 +150,7 @@ export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoop
   // Activity-based abort spanning the entire tool loop.
   // Resets on every chunk, tool event, and keepalive.
   const inactivityMs = opts.timeoutMs ?? LOOP_INACTIVITY_MS;
-  const maxMs = Math.min(inactivityMs * 6, LOOP_MAX_MS);
+  const maxMs = Math.min(opts.maxTotalMs ?? inactivityMs * 6, LOOP_MAX_MS);
   const abort = createActivityAbort(inactivityMs, maxMs);
 
   // Compose the activity abort with the client disconnect signal so that
@@ -169,7 +173,8 @@ export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoop
   }, KEEPALIVE_INTERVAL_MS);
 
   try {
-  for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
+  const iterationLimit = Math.max(1, Math.min(opts.maxIterations ?? MAX_ITERATIONS, MAX_ITERATIONS));
+  for (let iteration = 0; iteration < iterationLimit; iteration++) {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
     if (extraHeaders) {
@@ -246,6 +251,11 @@ export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoop
                 const parsed = JSON.parse(data);
                 if (!responseModel && parsed.model) {
                   responseModel = parsed.model;
+                  if (traceId) {
+                    logger.info(
+                      `ModelRoute trace=${traceId} flow=tool-loop responseModel=${responseModel} iteration=${iteration + 1} attempt=${attempt + 1}`,
+                    );
+                  }
                 }
 
                 const choice = parsed.choices?.[0];

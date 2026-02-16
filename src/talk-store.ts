@@ -164,6 +164,7 @@ export class TalkStore {
   async init(): Promise<void> {
     await this.ensureDir();
     await this.loadAllAsync();
+    await this.clearStaleProcessingFlags();
   }
 
   private async ensureDir(): Promise<void> {
@@ -299,6 +300,22 @@ export class TalkStore {
     meta.processing = processing;
     this.invalidateListCache();
     this.persistMeta(meta);
+  }
+
+  /** Clear stale processing flags after startup/restart recovery. */
+  async clearStaleProcessingFlags(): Promise<number> {
+    let cleared = 0;
+    for (const meta of this.talks.values()) {
+      if (!meta.processing) continue;
+      meta.processing = false;
+      this.persistMeta(meta);
+      cleared += 1;
+    }
+    if (cleared > 0) {
+      this.invalidateListCache();
+      this.logger.warn(`TalkStore: cleared stale processing flag for ${cleared} talk(s) on startup`);
+    }
+    return cleared;
   }
 
   // -------------------------------------------------------------------------
