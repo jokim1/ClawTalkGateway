@@ -71,6 +71,7 @@ const ROUTES = new Set([
   '/api/realtime-voice/stream',
   '/api/files/upload',
   '/api/events/slack',
+  '/api/events/slack/options',
   '/api/events/slack/resolve',
   '/api/events/slack/doctor',
   '/api/events/slack/status',
@@ -205,6 +206,150 @@ function normalizeSlackResolveScope(channelIdRaw: string): string | null {
     return normalizeSlackBindingScope(channelId);
   }
   return normalizeSlackBindingScope(`channel:${channelId}`);
+}
+
+function resolveTemplateSecret(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  const envMatch = trimmed.match(/^\$\{(.+)\}$/);
+  if (envMatch?.[1]) {
+    const value = process.env[envMatch[1]]?.trim();
+    return value || undefined;
+  }
+  return trimmed;
+}
+
+function resolveSlackBotTokenForDiscovery(cfg: Record<string, any>, accountId: string): string | undefined {
+  const accountToken = resolveTemplateSecret(cfg?.channels?.slack?.accounts?.[accountId]?.botToken);
+  if (accountToken) return accountToken;
+  if (accountId === 'default') {
+    return (
+      resolveTemplateSecret(cfg?.channels?.slack?.botToken) ??
+      resolveTemplateSecret(process.env.SLACK_BOT_TOKEN)
+    );
+  }
+  return undefined;
+}
+
+function listSlackAccountOptions(cfg: Record<string, any>): Array<{
+  id: string;
+  isDefault: boolean;
+  hasBotToken: boolean;
+}> {
+  const accountsRoot = cfg?.channels?.slack?.accounts;
+  const ids = new Set<string>();
+  if (accountsRoot && typeof accountsRoot === 'object') {
+    for (const key of Object.keys(accountsRoot)) {
+      const id = key.trim().toLowerCase();
+      if (id) ids.add(id);
+    }
+  }
+
+  if (resolveSlackBotTokenForDiscovery(cfg, 'default')) {
+    ids.add('default');
+  }
+  if (ids.size === 0) {
+    ids.add('default');
+  }
+
+  return Array.from(ids)
+    .sort((a, b) => (a === 'default' ? -1 : b === 'default' ? 1 : a.localeCompare(b)))
+    .map((id) => ({
+      id,
+      isDefault: id === 'default',
+      hasBotToken: Boolean(resolveSlackBotTokenForDiscovery(cfg, id)),
+    }));
+}
+
+async function fetchSlackChannelsForAccount(params: {
+  token: string;
+  limit: number;
+}): Promise<Array<{ id: string; name: string; scope: string; displayScope: string }>> {
+  const channels: Array<{ id: string; name: string; scope: string; displayScope: string }> = [];
+  let cursor = '';
+  const timeoutMs = 5_000;
+
+  while (channels.length < params.limit) {
+    const url = new URL('https://slack.com/api/conversations.list');
+    url.searchParams.set('exclude_archived', 'true');
+    url.searchParams.set('limit', '1000');
+    url.searchParams.set('types', 'public_channel,private_channel');
+    if (cursor) url.searchParams.set('cursor', cursor);
+
+    let payload: any;
+    try {
+      const res = await fetch(url, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${params.token}` },
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!res.ok) break;
+      payload = await res.json();
+    } catch {
+      break;
+    }
+
+    if (!payload?.ok) break;
+    const batch = Array.isArray(payload.channels) ? payload.channels : [];
+    for (const channel of batch) {
+      const id = typeof channel?.id === 'string' ? channel.id.trim().toUpperCase() : '';
+      const name = typeof channel?.name_normalized === 'string'
+        ? channel.name_normalized.trim()
+        : (typeof channel?.name === 'string' ? channel.name.trim() : '');
+      if (!id || !name) continue;
+      channels.push({
+        id,
+        name,
+        scope: `channel:${id}`,
+        displayScope: `#${name}`,
+      });
+      if (channels.length >= params.limit) break;
+    }
+
+    const nextCursor = typeof payload?.response_metadata?.next_cursor === 'string'
+      ? payload.response_metadata.next_cursor.trim()
+      : '';
+    if (!nextCursor) break;
+    cursor = nextCursor;
+  }
+
+  return channels;
+}
+
+function collectTalkSlackChannelHints(params: {
+  talkStore: TalkStore;
+  accountId: string;
+  limit: number;
+}): Array<{ id: string; name?: string; scope: string; displayScope: string }> {
+  const results = new Map<string, { id: string; name?: string; scope: string; displayScope: string }>();
+  const desiredAccount = params.accountId.trim().toLowerCase() || 'default';
+
+  for (const talk of params.talkStore.listTalks()) {
+    for (const binding of talk.platformBindings ?? []) {
+      if (binding.platform.trim().toLowerCase() !== 'slack') continue;
+      const bindingAccount = (binding.accountId?.trim().toLowerCase() || 'default');
+      if (bindingAccount !== desiredAccount) continue;
+
+      const scope = binding.scope.trim();
+      const channelMatch = scope.match(/^channel:([a-z0-9]+)$/i);
+      if (!channelMatch?.[1]) continue;
+
+      const id = channelMatch[1].toUpperCase();
+      const displayScope = binding.displayScope?.trim() || `#${id}`;
+      const name = displayScope.startsWith('#') ? displayScope.slice(1) : undefined;
+      results.set(id, {
+        id,
+        scope: `channel:${id}`,
+        displayScope,
+        ...(name ? { name } : {}),
+      });
+      if (results.size >= params.limit) break;
+    }
+    if (results.size >= params.limit) break;
+  }
+
+  return Array.from(results.values());
 }
 
 // ============================================================================
@@ -629,6 +774,50 @@ const plugin = {
         }
 
         switch (url.pathname) {
+          case '/api/events/slack/options': {
+            if (req.method !== 'GET') {
+              sendJson(res, 405, { error: 'Method not allowed' });
+              break;
+            }
+
+            const requestedAccount = (url.searchParams.get('accountId')?.trim().toLowerCase() || undefined);
+            const requestedLimit = parseInt(url.searchParams.get('limit') ?? '50', 10);
+            const limit = Number.isFinite(requestedLimit) ? Math.min(200, Math.max(1, requestedLimit)) : 50;
+
+            const accounts = listSlackAccountOptions(cfg);
+            const selectedAccountId = requestedAccount
+              ?? accounts.find((account) => account.hasBotToken)?.id
+              ?? accounts[0]?.id
+              ?? 'default';
+
+            const baseHints = collectTalkSlackChannelHints({
+              talkStore,
+              accountId: selectedAccountId,
+              limit,
+            });
+            const merged = new Map(baseHints.map((entry) => [entry.id, entry]));
+            let channelsSource: 'slack-api' | 'talk-bindings' | 'none' =
+              baseHints.length > 0 ? 'talk-bindings' : 'none';
+
+            const token = resolveSlackBotTokenForDiscovery(cfg, selectedAccountId);
+            if (token) {
+              const apiChannels = await fetchSlackChannelsForAccount({ token, limit });
+              if (apiChannels.length > 0) {
+                channelsSource = 'slack-api';
+                for (const channel of apiChannels) {
+                  merged.set(channel.id, channel);
+                }
+              }
+            }
+
+            sendJson(res, 200, {
+              accounts,
+              selectedAccountId,
+              channels: Array.from(merged.values()).slice(0, limit),
+              channelsSource,
+            });
+            break;
+          }
           case '/api/events/slack/resolve': {
             if (req.method !== 'GET') {
               sendJson(res, 405, { error: 'Method not allowed' });
