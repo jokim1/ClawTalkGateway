@@ -12,9 +12,15 @@
  */
 
 import type { ServerResponse } from 'node:http';
+import { Agent } from 'undici';
 import type { Logger, ToolCallInfo } from './types.js';
 import type { ToolRegistry, ToolDefinition } from './tool-registry.js';
 import type { ToolExecutor, ToolExecResult } from './tool-executor.js';
+
+/** Dispatcher with disabled headers/body timeout for long-running non-streaming requests.
+ *  Node.js undici defaults to 5 min headersTimeout which kills requests before our
+ *  AbortSignal.timeout has a chance to fire. */
+const longTimeoutDispatcher = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
 
 /** Maximum tool loop iterations per message. */
 const MAX_ITERATIONS = 10;
@@ -460,6 +466,8 @@ export async function runToolLoopNonStreaming(opts: ToolLoopNonStreamOptions): P
         stream: false,
       }),
       signal: AbortSignal.timeout(timeoutMs),
+      // @ts-expect-error -- Node.js undici supports dispatcher option on fetch
+      dispatcher: longTimeoutDispatcher,
     });
 
     if (!response.ok) {

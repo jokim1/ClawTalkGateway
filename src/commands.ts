@@ -63,27 +63,27 @@ export function registerCommands(api: PluginApi, talkStore: TalkStore): void {
         `Created: ${new Date(talk.createdAt).toLocaleString()}`,
         `Updated: ${new Date(talk.updatedAt).toLocaleString()}`,
         `Pins: ${talk.pinnedMessageIds.length}`,
-        `Jobs: ${talk.jobs.length} (${talk.jobs.filter(j => j.active).length} active)`,
+        `Automations: ${talk.jobs.length} (${talk.jobs.filter(j => j.active).length} active)`,
         `Agents: ${(talk.agents ?? []).length}`,
       ];
 
       if (talk.objective) {
-        lines.push(`Objective: ${talk.objective.slice(0, 200)}`);
+        lines.push(`Objectives: ${talk.objective.slice(0, 200)}`);
       }
 
       ctx.reply(lines.join('\n'));
     },
   });
 
-  // /jobs — list all active jobs across talks
+  // /jobs — list all active automations across talks
   api.registerCommand({
     name: 'jobs',
-    description: 'List all active jobs across all talks',
+    description: 'List all active automations across all talks',
     usage: '/jobs',
     handler: (ctx) => {
       const activeJobs = talkStore.getAllActiveJobs();
       if (activeJobs.length === 0) {
-        ctx.reply('No active jobs.');
+        ctx.reply('No active automations.');
         return;
       }
 
@@ -99,7 +99,7 @@ export function registerCommands(api: PluginApi, talkStore: TalkStore): void {
         return `  [${talkName}] "${job.schedule}" — ${promptPreview} (${lastRun})`;
       });
 
-      ctx.reply(`Active jobs (${activeJobs.length}):\n${lines.join('\n')}`);
+      ctx.reply(`Active automations (${activeJobs.length}):\n${lines.join('\n')}`);
     },
   });
 

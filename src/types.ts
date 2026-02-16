@@ -172,6 +172,11 @@ export interface TalkPlatformBehavior {
   id: string;
   /** Foreign key to TalkPlatformBinding.id. */
   platformBindingId: string;
+  /**
+   * Explicit on/off switch for inbound auto-response.
+   * When false, inbound handling is disabled for this binding.
+   */
+  autoRespond?: boolean;
   /** Optional talk agent name override for this binding. */
   agentName?: string;
   /**

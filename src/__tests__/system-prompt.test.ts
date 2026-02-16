@@ -52,7 +52,7 @@ describe('composeSystemPrompt', () => {
       pinnedMessages: [],
     });
     expect(result).toBeDefined();
-    expect(result).toContain('## Objective');
+    expect(result).toContain('## Objectives');
     expect(result).toContain('Help user plan their sprint tasks');
     expect(result).toContain('steer it back');
   });
@@ -136,9 +136,9 @@ describe('composeSystemPrompt', () => {
       pinnedMessages: [],
     });
     expect(result).toBeDefined();
-    expect(result).toContain('## Active Jobs');
+    expect(result).toContain('## Active Automations');
     expect(result).toContain('[every 6h] Check sprint burndown');
-    // Inactive job should NOT appear in Active Jobs section
+    // Inactive job should NOT appear in Active Automations section
     expect(result).not.toContain('Summarize PRs');
   });
 
@@ -152,9 +152,9 @@ describe('composeSystemPrompt', () => {
       contextMd: '',
       pinnedMessages: [],
     });
-    // Should still return a prompt (base instruction), but no Active Jobs section
+    // Should still return a prompt (base instruction), but no Active Automations section
     expect(result).toBeDefined();
-    expect(result).not.toContain('## Active Jobs');
+    expect(result).not.toContain('## Active Automations');
   });
 
   it('truncates long job prompts to 200 chars', () => {
@@ -187,13 +187,13 @@ describe('composeSystemPrompt', () => {
     })!;
 
     expect(result).toContain('focused assistant');
-    expect(result).toContain('## Objective');
+    expect(result).toContain('## Objectives');
     expect(result).toContain('Debug the login flow');
     expect(result).toContain('## Conversation Context');
     expect(result).toContain('null pointer in auth middleware');
     expect(result).toContain('## Pinned References');
     expect(result).toContain('Important finding');
-    expect(result).toContain('## Active Jobs');
+    expect(result).toContain('## Active Automations');
     expect(result).toContain('Check error logs');
   });
 
@@ -213,7 +213,7 @@ describe('composeSystemPrompt', () => {
       pinnedMessages: [],
     })!;
     // Sections should be separated by \n\n
-    expect(result).toContain('## Objective');
+    expect(result).toContain('## Objectives');
     expect(result).toContain('## Conversation Context');
     // Both should appear with clear separation
     expect(result).toContain('Test objective');

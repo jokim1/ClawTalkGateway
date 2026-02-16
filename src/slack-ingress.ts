@@ -57,6 +57,7 @@ type QueueItem = {
   talkId: string;
   event: SlackIngressEvent;
   platformBindingId: string;
+  replyAccountId?: string;
   behaviorAgentName?: string;
   behaviorOnMessagePrompt?: string;
   attempt: number;
@@ -384,8 +385,10 @@ function scoreSlackBinding(binding: PlatformBinding, event: SlackIngressEvent): 
   const bindingAccountId = binding.accountId?.trim()
     ? normalizeAccountId(binding.accountId)
     : undefined;
-  const eventAccountId = normalizeAccountId(event.accountId);
-  if (bindingAccountId && bindingAccountId !== eventAccountId) {
+  const explicitEventAccountId = event.accountId?.trim()
+    ? normalizeAccountId(event.accountId)
+    : undefined;
+  if (bindingAccountId && explicitEventAccountId && bindingAccountId !== explicitEventAccountId) {
     return -1;
   }
 
@@ -703,12 +706,14 @@ async function persistAssistantResult(item: QueueItem, deps: SlackIngressDeps): 
 async function sendSlackReply(params: {
   deps: SlackIngressDeps;
   event: SlackIngressEvent;
+  accountId?: string;
   message: string;
   sessionKey: string;
 }): Promise<void> {
+  const resolvedAccountId = params.accountId ?? params.event.accountId;
   if (params.deps.sendSlackMessage) {
     const sent = await params.deps.sendSlackMessage({
-      accountId: params.event.accountId,
+      accountId: resolvedAccountId,
       channelId: params.event.channelId,
       threadTs: params.event.threadTs,
       message: params.message,
@@ -723,8 +728,8 @@ async function sendSlackReply(params: {
     'Content-Type': 'application/json',
     'x-openclaw-message-channel': 'slack',
   };
-  if (params.event.accountId) {
-    headers['x-openclaw-account-id'] = params.event.accountId;
+  if (resolvedAccountId) {
+    headers['x-openclaw-account-id'] = resolvedAccountId;
   }
   if (params.deps.authToken) {
     headers.Authorization = `Bearer ${params.deps.authToken}`;
@@ -742,7 +747,7 @@ async function sendSlackReply(params: {
         target: `channel:${params.event.channelId}`,
         message: params.message,
         ...(params.event.threadTs ? { replyTo: params.event.threadTs } : {}),
-        ...(params.event.accountId ? { accountId: params.event.accountId } : {}),
+        ...(resolvedAccountId ? { accountId: resolvedAccountId } : {}),
         bestEffort: true,
       },
     }),
@@ -797,6 +802,7 @@ async function sendFailureNotice(params: {
   await sendSlackReply({
     deps: params.deps,
     event: params.item.event,
+    accountId: params.item.replyAccountId,
     message,
     sessionKey: fallbackSessionKey,
   });
@@ -829,6 +835,7 @@ async function processQueueItem(item: QueueItem, deps: SlackIngressDeps): Promis
     await sendSlackReply({
       deps,
       event: item.event,
+      accountId: item.replyAccountId,
       message: reply,
       sessionKey,
     });
@@ -872,7 +879,7 @@ async function processQueue(deps: SlackIngressDeps): Promise<void> {
       if (!item) continue;
       try {
         await processQueueItem(item, deps);
-        deps.logger.info(`SlackIngress: delivered reply for event ${item.event.eventId} (talk ${item.talkId})`);
+        deps.logger.debug(`SlackIngress: delivered reply for event ${item.event.eventId} (talk ${item.talkId})`);
       } catch (err) {
         deps.logger.warn(
           `SlackIngress: processing failed for ${item.event.eventId} (attempt ${item.attempt + 1}): ${String(err)}`,
@@ -912,6 +919,12 @@ function routeSlackIngressEvent(
   const ownership = inspectSlackOwnership(event, deps.store, deps.logger);
   if (ownership.decision === 'pass' || !ownership.talkId || !ownership.bindingId) {
     const reason = ownership.reason ?? 'no-binding';
+    if (reason !== 'no-binding') {
+      deps.logger.debug(
+        `SlackIngress: pass event=${event.eventId} account=${event.accountId ?? 'unknown'} ` +
+        `channel=${event.channelId} reason=${reason}`,
+      );
+    }
     seenEvents.set(event.eventId, {
       ts: Date.now(),
       decision: 'pass',
@@ -930,6 +943,10 @@ function routeSlackIngressEvent(
   const maxQueue = parseIntegerEnv('CLAWTALK_INGRESS_MAX_QUEUE', DEFAULT_MAX_QUEUE, 10, 100_000);
   if (queue.length >= maxQueue) {
     const reason = 'queue-overflow';
+    deps.logger.warn(
+      `SlackIngress: dropping event due to queue overflow event=${event.eventId} ` +
+      `account=${event.accountId ?? 'unknown'} channel=${event.channelId} maxQueue=${maxQueue}`,
+    );
     seenEvents.set(event.eventId, {
       ts: Date.now(),
       decision: 'pass',
@@ -950,11 +967,18 @@ function routeSlackIngressEvent(
     decision: 'handled',
     talkId: ownership.talkId,
   });
+  deps.logger.debug(
+    `SlackIngress: handled event=${event.eventId} account=${event.accountId ?? 'unknown'} ` +
+    `channel=${event.channelId} talk=${ownership.talkId} binding=${ownership.bindingId}`,
+  );
   upsertOutboundSuppression(event, ownership.talkId);
+  const ownerTalk = deps.store.getTalk(ownership.talkId);
+  const ownerBinding = ownerTalk?.platformBindings?.find((binding) => binding.id === ownership.bindingId);
   queue.push({
     talkId: ownership.talkId,
     event,
     platformBindingId: ownership.bindingId,
+    replyAccountId: event.accountId ?? ownerBinding?.accountId,
     behaviorAgentName: ownership.behaviorAgentName,
     behaviorOnMessagePrompt: ownership.behaviorOnMessagePrompt,
     attempt: 0,

@@ -75,6 +75,42 @@ function canWrite(permission: PlatformPermission): boolean {
   return permission === 'write' || permission === 'read+write';
 }
 
+function normalizeObjectiveAlias(raw: unknown): string | undefined {
+  if (typeof raw === 'string') return raw.trim();
+  if (Array.isArray(raw)) {
+    for (const entry of raw) {
+      if (typeof entry === 'string' && entry.trim()) return entry.trim();
+    }
+  }
+  return undefined;
+}
+
+function mapChannelResponseSettingsInput(input: unknown): unknown {
+  if (!Array.isArray(input)) return input;
+  return input.map((entry) => {
+    if (!entry || typeof entry !== 'object') return entry;
+    const row = entry as Record<string, unknown>;
+    const connectionId =
+      typeof row.connectionId === 'string' ? row.connectionId.trim() : '';
+    const platformBindingId =
+      typeof row.platformBindingId === 'string' ? row.platformBindingId.trim() : connectionId;
+    const responderAgent =
+      typeof row.responderAgent === 'string' ? row.responderAgent.trim() : '';
+    const responseInstruction =
+      typeof row.responseInstruction === 'string' ? row.responseInstruction.trim() : '';
+    const autoRespond =
+      typeof row.autoRespond === 'boolean' ? row.autoRespond : undefined;
+
+    return {
+      ...row,
+      ...(platformBindingId ? { platformBindingId } : {}),
+      ...(responderAgent ? { agentName: responderAgent } : {}),
+      ...(responseInstruction ? { onMessagePrompt: responseInstruction } : {}),
+      ...(autoRespond !== undefined ? { autoRespond } : {}),
+    };
+  });
+}
+
 export function normalizeSlackBindingScope(scope: string): string | null {
   const trimmed = scope.trim();
   if (!trimmed) return null;
@@ -630,11 +666,12 @@ export function normalizeAndValidatePlatformBehaviorsInput(
     }
 
     const onMessagePrompt = typeof row.onMessagePrompt === 'string' ? row.onMessagePrompt.trim() : '';
-    if (!agentName && !onMessagePrompt) {
+    const autoRespond = typeof row.autoRespond === 'boolean' ? row.autoRespond : undefined;
+    if (!agentName && !onMessagePrompt && autoRespond !== false) {
       return {
         ok: false,
         error:
-          `platformBehaviors[${i + 1}] must define agentName and/or onMessagePrompt.`,
+          `platformBehaviors[${i + 1}] must define agentName and/or onMessagePrompt, or set autoRespond=false.`,
       };
     }
 
@@ -645,6 +682,7 @@ export function normalizeAndValidatePlatformBehaviorsInput(
     normalized.push({
       id,
       platformBindingId,
+      ...(autoRespond !== undefined ? { autoRespond } : {}),
       ...(agentName ? { agentName } : {}),
       ...(onMessagePrompt ? { onMessagePrompt } : {}),
       createdAt,
@@ -799,14 +837,31 @@ async function handleCreateTalk(ctx: HandlerContext, store: TalkStore): Promise<
     model?: string;
     topicTitle?: string;
     objective?: string;
+    objectives?: string | string[];
     directives?: any[];
+    rules?: any[];
     platformBindings?: any[];
+    channelConnections?: any[];
     platformBehaviors?: any[];
+    channelResponseSettings?: any[];
   } = {};
   try {
     body = (await readJsonBody(ctx.req)) as typeof body;
   } catch {
     // empty body is fine
+  }
+
+  if (body.objective === undefined && body.objectives !== undefined) {
+    body.objective = normalizeObjectiveAlias(body.objectives);
+  }
+  if (body.directives === undefined && body.rules !== undefined) {
+    body.directives = body.rules;
+  }
+  if (body.platformBindings === undefined && body.channelConnections !== undefined) {
+    body.platformBindings = body.channelConnections;
+  }
+  if (body.platformBehaviors === undefined && body.channelResponseSettings !== undefined) {
+    body.platformBehaviors = mapChannelResponseSettingsInput(body.channelResponseSettings) as any[];
   }
 
   if (body.platformBindings !== undefined) {
@@ -876,11 +931,15 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
   let body: {
     topicTitle?: string;
     objective?: string;
+    objectives?: string | string[];
     model?: string;
     agents?: any[];
     directives?: any[];
+    rules?: any[];
     platformBindings?: any[];
+    channelConnections?: any[];
     platformBehaviors?: any[];
+    channelResponseSettings?: any[];
   };
   try {
     body = (await readJsonBody(ctx.req)) as typeof body;
@@ -893,6 +952,19 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
   if (!talk) {
     sendJson(ctx.res, 404, { error: 'Talk not found' });
     return;
+  }
+
+  if (body.objective === undefined && body.objectives !== undefined) {
+    body.objective = normalizeObjectiveAlias(body.objectives);
+  }
+  if (body.directives === undefined && body.rules !== undefined) {
+    body.directives = body.rules;
+  }
+  if (body.platformBindings === undefined && body.channelConnections !== undefined) {
+    body.platformBindings = body.channelConnections;
+  }
+  if (body.platformBehaviors === undefined && body.channelResponseSettings !== undefined) {
+    body.platformBehaviors = mapChannelResponseSettingsInput(body.channelResponseSettings) as any[];
   }
 
   if (body.platformBindings !== undefined) {

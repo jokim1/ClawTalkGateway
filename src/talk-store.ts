@@ -124,7 +124,8 @@ function normalizePlatformBehaviors(
 
       const agentName = typeof row.agentName === 'string' ? row.agentName.trim() : '';
       const onMessagePrompt = typeof row.onMessagePrompt === 'string' ? row.onMessagePrompt.trim() : '';
-      if (!agentName && !onMessagePrompt) return null;
+      const autoRespond = typeof row.autoRespond === 'boolean' ? row.autoRespond : undefined;
+      if (!agentName && !onMessagePrompt && autoRespond !== false) return null;
 
       const id =
         typeof row.id === 'string' && row.id.trim()
@@ -134,6 +135,7 @@ function normalizePlatformBehaviors(
       return {
         id,
         platformBindingId,
+        ...(autoRespond !== undefined ? { autoRespond } : {}),
         ...(agentName ? { agentName } : {}),
         ...(onMessagePrompt ? { onMessagePrompt } : {}),
         createdAt: typeof row.createdAt === 'number' ? row.createdAt : now,
