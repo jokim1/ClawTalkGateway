@@ -7,9 +7,588 @@
 
 import type { HandlerContext } from './types.js';
 import type { TalkStore } from './talk-store.js';
+import type { PlatformBinding, PlatformPermission, TalkMeta } from './types.js';
 import type { ToolRegistry } from './tool-registry.js';
 import { sendJson, readJsonBody } from './http.js';
 import { validateSchedule, parseEventTrigger } from './job-scheduler.js';
+
+type PlatformBindingsValidationResult =
+  | { ok: true; bindings: PlatformBinding[]; ownershipKeys: string[] }
+  | { ok: false; error: string };
+
+type SlackScopeResolutionResult =
+  | { ok: true; canonicalScope: string; accountId?: string; displayScope?: string }
+  | { ok: false; error: string };
+
+type PlatformBindingsValidationOptions = {
+  resolveSlackScope?: (scope: string, accountId?: string) => Promise<SlackScopeResolutionResult>;
+};
+
+type SlackConversation = {
+  id?: string;
+  name?: string;
+  name_normalized?: string;
+};
+
+type SlackConversationsListResponse = {
+  ok?: boolean;
+  error?: string;
+  channels?: SlackConversation[];
+  response_metadata?: {
+    next_cursor?: string;
+  };
+};
+
+type SlackConversationInfoResponse = {
+  ok?: boolean;
+  error?: string;
+  channel?: SlackConversation;
+};
+
+const SLACK_LOOKUP_TIMEOUT_MS = 10_000;
+const SLACK_CHANNEL_CACHE_TTL_MS = 5 * 60_000;
+const DEFAULT_SLACK_ACCOUNT_ID = 'default';
+
+const slackChannelNameByIdCache = new Map<string, { name: string; expiresAt: number }>();
+const slackChannelIdByNameCache = new Map<string, { id: string; name: string; expiresAt: number }>();
+
+function normalizePermission(raw: unknown): PlatformPermission {
+  const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (value === 'read' || value === 'write' || value === 'read+write') {
+    return value;
+  }
+  return 'read+write';
+}
+
+function canWrite(permission: PlatformPermission): boolean {
+  return permission === 'write' || permission === 'read+write';
+}
+
+export function normalizeSlackBindingScope(scope: string): string | null {
+  const trimmed = scope.trim();
+  if (!trimmed) return null;
+
+  if (/^(?:\*|all|slack:\*)$/i.test(trimmed)) {
+    return 'slack:*';
+  }
+
+  const channel =
+    trimmed.match(/^channel:([a-z0-9]+)$/i) ??
+    trimmed.match(/^slack:channel:([a-z0-9]+)$/i);
+  if (channel?.[1]) {
+    return `channel:${channel[1].toUpperCase()}`;
+  }
+
+  const user =
+    trimmed.match(/^user:([a-z0-9]+)$/i) ??
+    trimmed.match(/^slack:user:([a-z0-9]+)$/i);
+  if (user?.[1]) {
+    return `user:${user[1].toUpperCase()}`;
+  }
+
+  return null;
+}
+
+function resolveTemplateSecret(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  const envMatch = trimmed.match(/^\$\{(.+)\}$/);
+  if (envMatch?.[1]) {
+    const fromEnv = process.env[envMatch[1]];
+    return fromEnv?.trim() ? fromEnv.trim() : undefined;
+  }
+  return trimmed;
+}
+
+function listSlackAccountIds(cfg: Record<string, any>): string[] {
+  const accounts = cfg?.channels?.slack?.accounts;
+  if (!accounts || typeof accounts !== 'object') {
+    return [DEFAULT_SLACK_ACCOUNT_ID];
+  }
+  const ids = Object.keys(accounts).filter(Boolean);
+  if (ids.length === 0) return [DEFAULT_SLACK_ACCOUNT_ID];
+  if (ids.includes(DEFAULT_SLACK_ACCOUNT_ID)) {
+    return [DEFAULT_SLACK_ACCOUNT_ID, ...ids.filter((id) => id !== DEFAULT_SLACK_ACCOUNT_ID).sort()];
+  }
+  return ids.sort();
+}
+
+function resolveSlackBotTokenForAccount(cfg: Record<string, any>, accountId: string): string | undefined {
+  const accountRaw: string | undefined = cfg?.channels?.slack?.accounts?.[accountId]?.botToken;
+  const accountToken = resolveTemplateSecret(accountRaw);
+  if (accountToken) return accountToken;
+
+  if (accountId === DEFAULT_SLACK_ACCOUNT_ID) {
+    const topLevelToken = resolveTemplateSecret(cfg?.channels?.slack?.botToken);
+    if (topLevelToken) return topLevelToken;
+    const envToken = resolveTemplateSecret(process.env.SLACK_BOT_TOKEN);
+    if (envToken) return envToken;
+  }
+  return undefined;
+}
+
+function normalizeAccountId(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const trimmed = value.trim().toLowerCase();
+  return trimmed || undefined;
+}
+
+function parseScopedSlackInput(rawScope: string): { accountId?: string; scope: string } {
+  const rawTrimmed = rawScope.trim();
+  if (!rawTrimmed) return { scope: '' };
+
+  const quoted =
+    (rawTrimmed.startsWith('"') && rawTrimmed.endsWith('"')) ||
+    (rawTrimmed.startsWith("'") && rawTrimmed.endsWith("'"));
+  const trimmed = quoted ? rawTrimmed.slice(1, -1).trim() : rawTrimmed;
+  if (!trimmed) return { scope: '' };
+
+  const accountPrefix = trimmed.match(/^account:([a-z0-9._-]+):(.+)$/i);
+  if (accountPrefix?.[1] && accountPrefix?.[2]) {
+    return {
+      accountId: accountPrefix[1].toLowerCase(),
+      scope: accountPrefix[2].trim(),
+    };
+  }
+
+  const spaced = trimmed.match(/^([a-z0-9._-]+)\s+(#?[a-z0-9._-]+)$/i);
+  if (spaced?.[1] && spaced?.[2] && spaced[2].startsWith('#')) {
+    return {
+      accountId: spaced[1].toLowerCase(),
+      scope: spaced[2].trim(),
+    };
+  }
+
+  const shorthand = trimmed.match(/^([a-z0-9._-]+):(.+)$/i);
+  if (shorthand?.[1] && shorthand?.[2]) {
+    const accountPrefix = shorthand[1].toLowerCase();
+    const scoped = shorthand[2].trim();
+    if (
+      !['slack', 'channel', 'user'].includes(accountPrefix) &&
+      (
+        scoped.startsWith('#') ||
+        /^channel:/i.test(scoped) ||
+        /^user:/i.test(scoped) ||
+        /^slack:\*/i.test(scoped) ||
+        scoped === '*'
+      )
+    ) {
+      return {
+        accountId: shorthand[1].toLowerCase(),
+        scope: scoped,
+      };
+    }
+  }
+
+  return { scope: trimmed };
+}
+
+function normalizeSlackChannelNameScope(scope: string): string | null {
+  const trimmed = scope.trim();
+  if (!trimmed) return null;
+
+  const withPrefix =
+    trimmed.match(/^#([a-z0-9._-]+)$/i) ??
+    trimmed.match(/^channel:#([a-z0-9._-]+)$/i) ??
+    trimmed.match(/^slack:channel:#([a-z0-9._-]+)$/i);
+  if (withPrefix?.[1]) {
+    return withPrefix[1].toLowerCase();
+  }
+
+  const maybeNamedChannel =
+    trimmed.match(/^channel:([a-z0-9._-]+)$/i) ??
+    trimmed.match(/^slack:channel:([a-z0-9._-]+)$/i);
+  if (maybeNamedChannel?.[1]) {
+    // If channel:<ID> already matched the canonical parser, don't treat it as a name.
+    const candidate = maybeNamedChannel[1];
+    if (/^[cu][a-z0-9]+$/i.test(candidate)) {
+      return null;
+    }
+    return candidate.toLowerCase();
+  }
+
+  if (/^[a-z0-9._-]+$/i.test(trimmed)) {
+    return trimmed.toLowerCase();
+  }
+  return null;
+}
+
+function getCachedSlackChannelName(accountId: string, channelId: string): string | undefined {
+  const key = `${accountId}:${channelId.toUpperCase()}`;
+  const cached = slackChannelNameByIdCache.get(key);
+  if (!cached) return undefined;
+  if (cached.expiresAt <= Date.now()) {
+    slackChannelNameByIdCache.delete(key);
+    return undefined;
+  }
+  return cached.name;
+}
+
+function setCachedSlackChannelName(accountId: string, channelId: string, channelName: string): void {
+  const now = Date.now();
+  const keyById = `${accountId}:${channelId.toUpperCase()}`;
+  const keyByName = `${accountId}:${channelName.toLowerCase()}`;
+  slackChannelNameByIdCache.set(keyById, {
+    name: channelName,
+    expiresAt: now + SLACK_CHANNEL_CACHE_TTL_MS,
+  });
+  slackChannelIdByNameCache.set(keyByName, {
+    id: channelId.toUpperCase(),
+    name: channelName,
+    expiresAt: now + SLACK_CHANNEL_CACHE_TTL_MS,
+  });
+}
+
+function getCachedSlackChannelId(accountId: string, channelName: string): { id: string; name: string } | undefined {
+  const key = `${accountId}:${channelName.toLowerCase()}`;
+  const cached = slackChannelIdByNameCache.get(key);
+  if (!cached) return undefined;
+  if (cached.expiresAt <= Date.now()) {
+    slackChannelIdByNameCache.delete(key);
+    return undefined;
+  }
+  return { id: cached.id, name: cached.name };
+}
+
+async function fetchSlackConversationInfo(params: {
+  token: string;
+  channelId: string;
+}): Promise<SlackConversationInfoResponse | null> {
+  const url = new URL('https://slack.com/api/conversations.info');
+  url.searchParams.set('channel', params.channelId);
+  url.searchParams.set('include_num_members', 'false');
+  try {
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${params.token}`,
+      },
+      signal: AbortSignal.timeout(SLACK_LOOKUP_TIMEOUT_MS),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SlackConversationInfoResponse;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchSlackChannelByName(params: {
+  token: string;
+  channelName: string;
+}): Promise<{ id: string; name: string } | null> {
+  let cursor = '';
+  const wantedName = params.channelName.toLowerCase();
+
+  while (true) {
+    const url = new URL('https://slack.com/api/conversations.list');
+    url.searchParams.set('exclude_archived', 'true');
+    url.searchParams.set('limit', '1000');
+    url.searchParams.set('types', 'public_channel,private_channel');
+    if (cursor) {
+      url.searchParams.set('cursor', cursor);
+    }
+
+    let payload: SlackConversationsListResponse | null = null;
+    try {
+      const res = await fetch(url, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${params.token}`,
+        },
+        signal: AbortSignal.timeout(SLACK_LOOKUP_TIMEOUT_MS),
+      });
+      if (!res.ok) return null;
+      payload = (await res.json()) as SlackConversationsListResponse;
+    } catch {
+      return null;
+    }
+
+    if (!payload?.ok) return null;
+    for (const channel of payload.channels ?? []) {
+      const channelId = channel.id?.trim();
+      const name = (channel.name_normalized ?? channel.name ?? '').trim();
+      if (!channelId || !name) continue;
+      if (name.toLowerCase() !== wantedName) continue;
+      return { id: channelId.toUpperCase(), name };
+    }
+
+    const nextCursor = payload.response_metadata?.next_cursor?.trim();
+    if (!nextCursor) break;
+    cursor = nextCursor;
+  }
+
+  return null;
+}
+
+function createSlackScopeResolver(cfg: Record<string, any>, logger: HandlerContext['logger']) {
+  const accounts = listSlackAccountIds(cfg)
+    .map((accountId) => ({
+      accountId: accountId.toLowerCase(),
+      token: resolveSlackBotTokenForAccount(cfg, accountId),
+    }))
+    .filter((entry): entry is { accountId: string; token: string } => Boolean(entry.token));
+
+  const defaultAccountId = accounts[0]?.accountId ?? DEFAULT_SLACK_ACCOUNT_ID;
+
+  const selectAccounts = (accountHint?: string): Array<{ accountId: string; token: string }> => {
+    const normalizedHint = normalizeAccountId(accountHint);
+    if (!normalizedHint) return accounts;
+    return accounts.filter((account) => account.accountId === normalizedHint);
+  };
+
+  return async (scope: string, accountIdHint?: string): Promise<SlackScopeResolutionResult> => {
+    const normalizedHint = normalizeAccountId(accountIdHint);
+    const candidateAccounts = selectAccounts(normalizedHint);
+    if (normalizedHint && candidateAccounts.length === 0) {
+      return {
+        ok: false,
+        error: `references unknown Slack account "${normalizedHint}".`,
+      };
+    }
+
+    const canonical = normalizeSlackBindingScope(scope);
+    if (canonical) {
+      if (!canonical.startsWith('channel:')) {
+        return {
+          ok: true,
+          canonicalScope: canonical,
+          accountId: normalizedHint ?? defaultAccountId,
+        };
+      }
+
+      const channelId = canonical.slice('channel:'.length);
+      if (!channelId) {
+        return {
+          ok: true,
+          canonicalScope: canonical,
+          accountId: normalizedHint ?? defaultAccountId,
+        };
+      }
+
+      const accountsForLookup = candidateAccounts.length > 0 ? candidateAccounts : accounts;
+      const cachedName = accountsForLookup[0]
+        ? getCachedSlackChannelName(accountsForLookup[0].accountId, channelId)
+        : undefined;
+      if (cachedName) {
+        return {
+          ok: true,
+          canonicalScope: canonical,
+          accountId: accountsForLookup[0].accountId,
+          displayScope: `#${cachedName}`,
+        };
+      }
+
+      if (accountsForLookup.length === 0) {
+        return {
+          ok: true,
+          canonicalScope: canonical,
+          accountId: normalizedHint ?? defaultAccountId,
+        };
+      }
+
+      for (const account of accountsForLookup) {
+        const info = await fetchSlackConversationInfo({ token: account.token, channelId });
+        if (!info?.ok || !info.channel?.id) continue;
+        const channelName = (info.channel.name_normalized ?? info.channel.name ?? '').trim();
+        if (!channelName) continue;
+        setCachedSlackChannelName(account.accountId, info.channel.id, channelName);
+        return {
+          ok: true,
+          canonicalScope: canonical,
+          accountId: account.accountId,
+          displayScope: `#${channelName}`,
+        };
+      }
+
+      return {
+        ok: true,
+        canonicalScope: canonical,
+        accountId: normalizedHint ?? defaultAccountId,
+      };
+    }
+
+    const channelName = normalizeSlackChannelNameScope(scope);
+    if (!channelName) {
+      return {
+        ok: false,
+        error:
+          `Invalid Slack scope "${scope}". ` +
+          'Use channel:<ID>, user:<ID>, #channel, account:#channel, channel:<name>, or slack:*.',
+      };
+    }
+
+    if (candidateAccounts.length === 0) {
+      return {
+        ok: false,
+        error:
+          `Cannot resolve Slack channel "${channelName}" because no Slack bot token is configured. ` +
+          'Set channels.slack.accounts.<id>.botToken (or channels.slack.botToken/SLACK_BOT_TOKEN for default).',
+      };
+    }
+
+    if (!normalizedHint && candidateAccounts.length > 1) {
+      return {
+        ok: false,
+        error:
+          `is ambiguous across Slack accounts for channel "${channelName}". ` +
+          'Prefix scope with an account, e.g. kimfamily:#general or account:kimfamily:#general.',
+      };
+    }
+
+    for (const account of candidateAccounts) {
+      const cached = getCachedSlackChannelId(account.accountId, channelName);
+      if (cached) {
+        return {
+          ok: true,
+          canonicalScope: `channel:${cached.id.toUpperCase()}`,
+          accountId: account.accountId,
+          displayScope: `#${cached.name}`,
+        };
+      }
+
+      const resolved = await fetchSlackChannelByName({
+        token: account.token,
+        channelName,
+      });
+      if (!resolved) continue;
+      setCachedSlackChannelName(account.accountId, resolved.id, resolved.name);
+      return {
+        ok: true,
+        canonicalScope: `channel:${resolved.id.toUpperCase()}`,
+        accountId: account.accountId,
+        displayScope: `#${resolved.name}`,
+      };
+    }
+
+    logger.warn(
+      `ClawTalk: Slack channel lookup failed for scope "${scope}"` +
+      `${normalizedHint ? ` account=${normalizedHint}` : ''}`,
+    );
+    return {
+      ok: false,
+      error:
+        `Slack channel "${channelName}" not found or not visible to the configured Slack bot token. ` +
+        'Invite the bot to the channel or use channel:<ID>.',
+    };
+  };
+}
+
+export async function normalizeAndValidatePlatformBindingsInput(
+  input: unknown,
+  options?: PlatformBindingsValidationOptions,
+): Promise<PlatformBindingsValidationResult> {
+  if (!Array.isArray(input)) {
+    return { ok: false, error: 'platformBindings must be an array' };
+  }
+
+  const normalized: PlatformBinding[] = [];
+  const ownershipKeys = new Set<string>();
+
+  for (let i = 0; i < input.length; i += 1) {
+    const entry = input[i];
+    if (!entry || typeof entry !== 'object') {
+      return { ok: false, error: `platformBindings[${i + 1}] must be an object` };
+    }
+    const row = entry as Record<string, unknown>;
+    const platform = typeof row.platform === 'string' ? row.platform.trim().toLowerCase() : '';
+    const rawScope = typeof row.scope === 'string' ? row.scope.trim() : '';
+    const parsedScopedInput = platform === 'slack'
+      ? parseScopedSlackInput(rawScope)
+      : { scope: rawScope };
+    const scope = parsedScopedInput.scope.trim();
+    if (!platform || !scope) {
+      return { ok: false, error: `platformBindings[${i + 1}] requires platform and scope` };
+    }
+
+    const permission = normalizePermission(row.permission);
+    let normalizedScope = scope;
+    let accountId = normalizeAccountId(
+      typeof row.accountId === 'string' ? row.accountId : undefined,
+    ) ?? normalizeAccountId(parsedScopedInput.accountId);
+    let displayScope = typeof row.displayScope === 'string' ? row.displayScope.trim() : '';
+    if (platform === 'slack') {
+      if (options?.resolveSlackScope) {
+        const resolved = await options.resolveSlackScope(scope, accountId);
+        if (!resolved.ok) {
+          return { ok: false, error: `platformBindings[${i + 1}] ${resolved.error}` };
+        }
+        normalizedScope = resolved.canonicalScope;
+        accountId = normalizeAccountId(resolved.accountId) ?? accountId;
+        if (resolved.displayScope) {
+          displayScope = resolved.displayScope.trim();
+        }
+      } else {
+        const canonicalScope = normalizeSlackBindingScope(scope);
+        if (!canonicalScope) {
+          return {
+            ok: false,
+            error:
+              `platformBindings[${i + 1}] has invalid Slack scope "${scope}". ` +
+              'Use channel:<ID>, user:<ID>, #channel, account:#channel, or slack:*.',
+          };
+        }
+        normalizedScope = canonicalScope;
+        accountId = accountId ?? DEFAULT_SLACK_ACCOUNT_ID;
+      }
+
+      if (!normalizedScope) {
+        return {
+          ok: false,
+          error:
+            `platformBindings[${i + 1}] has invalid Slack scope "${scope}". ` +
+            'Use channel:<ID>, user:<ID>, #channel, account:#channel, channel:<name>, or slack:*.',
+        };
+      }
+      if (canWrite(permission)) {
+        const ownershipAccountId = accountId ?? DEFAULT_SLACK_ACCOUNT_ID;
+        ownershipKeys.add(`slack:${ownershipAccountId}:${normalizedScope.toLowerCase()}`);
+      }
+    }
+
+    normalized.push({
+      ...row,
+      platform,
+      scope: normalizedScope,
+      ...(accountId ? { accountId } : {}),
+      ...(displayScope ? { displayScope } : {}),
+      permission,
+    } as PlatformBinding);
+  }
+
+  return {
+    ok: true,
+    bindings: normalized,
+    ownershipKeys: Array.from(ownershipKeys),
+  };
+}
+
+export function findSlackBindingConflicts(params: {
+  candidateOwnershipKeys: string[];
+  talks: TalkMeta[];
+  skipTalkId?: string;
+}): Array<{ scope: string; talkId: string }> {
+  const keySet = new Set(params.candidateOwnershipKeys.map((value) => value.toLowerCase()));
+  if (keySet.size === 0) return [];
+
+  const conflicts = new Map<string, { scope: string; talkId: string }>();
+  for (const talk of params.talks) {
+    if (params.skipTalkId && talk.id === params.skipTalkId) continue;
+    for (const binding of talk.platformBindings ?? []) {
+      if (binding.platform.trim().toLowerCase() !== 'slack') continue;
+      const permission = normalizePermission(binding.permission);
+      if (!canWrite(permission)) continue;
+      const canonicalScope = normalizeSlackBindingScope(binding.scope);
+      if (!canonicalScope) continue;
+      const accountId = normalizeAccountId(binding.accountId) ?? DEFAULT_SLACK_ACCOUNT_ID;
+      const key = `slack:${accountId}:${canonicalScope.toLowerCase()}`;
+      if (!keySet.has(key)) continue;
+      const mapKey = `${talk.id}:${key}`;
+      conflicts.set(mapKey, { scope: canonicalScope, talkId: talk.id });
+    }
+  }
+  return Array.from(conflicts.values());
+}
 
 /**
  * Route a /api/talks request to the appropriate handler.
@@ -137,6 +716,30 @@ async function handleCreateTalk(ctx: HandlerContext, store: TalkStore): Promise<
     // empty body is fine
   }
 
+  if (body.platformBindings !== undefined) {
+    const parsed = await normalizeAndValidatePlatformBindingsInput(body.platformBindings, {
+      resolveSlackScope: createSlackScopeResolver(ctx.cfg, ctx.logger),
+    });
+    if (!parsed.ok) {
+      sendJson(ctx.res, 400, { error: parsed.error });
+      return;
+    }
+    const conflicts = findSlackBindingConflicts({
+      candidateOwnershipKeys: parsed.ownershipKeys,
+      talks: store.listTalks(),
+    });
+    if (conflicts.length > 0) {
+      const conflict = conflicts[0];
+      sendJson(ctx.res, 409, {
+        error:
+          `Slack ownership conflict for scope "${conflict.scope}". ` +
+          `Already claimed by talk ${conflict.talkId}.`,
+      });
+      return;
+    }
+    body.platformBindings = parsed.bindings;
+  }
+
   const talk = store.createTalk(body.model);
   store.updateTalk(talk.id, {
     ...(body.topicTitle ? { topicTitle: body.topicTitle } : {}),
@@ -183,6 +786,31 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
   if (!talk) {
     sendJson(ctx.res, 404, { error: 'Talk not found' });
     return;
+  }
+
+  if (body.platformBindings !== undefined) {
+    const parsed = await normalizeAndValidatePlatformBindingsInput(body.platformBindings, {
+      resolveSlackScope: createSlackScopeResolver(ctx.cfg, ctx.logger),
+    });
+    if (!parsed.ok) {
+      sendJson(ctx.res, 400, { error: parsed.error });
+      return;
+    }
+    const conflicts = findSlackBindingConflicts({
+      candidateOwnershipKeys: parsed.ownershipKeys,
+      talks: store.listTalks(),
+      skipTalkId: talkId,
+    });
+    if (conflicts.length > 0) {
+      const conflict = conflicts[0];
+      sendJson(ctx.res, 409, {
+        error:
+          `Slack ownership conflict for scope "${conflict.scope}". ` +
+          `Already claimed by talk ${conflict.talkId}.`,
+      });
+      return;
+    }
+    body.platformBindings = parsed.bindings;
   }
 
   if (body.agents !== undefined) {

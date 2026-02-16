@@ -292,6 +292,10 @@ function normalizeScope(scope: string): string {
   return scope.trim().toLowerCase();
 }
 
+function normalizeAccountId(value: string | undefined): string {
+  return (value ?? SLACK_DEFAULT_ACCOUNT).trim().toLowerCase();
+}
+
 function normalizeChannelName(value: string | undefined): string | undefined {
   if (!value) return undefined;
   const normalized = value.trim().replace(/^#/, '').toLowerCase();
@@ -308,6 +312,13 @@ function scoreSlackBinding(binding: PlatformBinding, event: SlackIngressEvent): 
     return -1;
   }
   if (!canWrite(binding.permission)) {
+    return -1;
+  }
+  const bindingAccountId = binding.accountId?.trim()
+    ? normalizeAccountId(binding.accountId)
+    : undefined;
+  const eventAccountId = normalizeAccountId(event.accountId);
+  if (bindingAccountId && bindingAccountId !== eventAccountId) {
     return -1;
   }
 

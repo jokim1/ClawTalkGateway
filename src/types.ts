@@ -158,6 +158,10 @@ export interface TalkPlatformBinding {
   id: string;
   platform: string;    // e.g. "slack", "posthog", "monday"
   scope: string;       // e.g. "#team-product", "analytics", "all boards"
+  /** Optional Slack account/workspace identifier from OpenClaw config. */
+  accountId?: string;
+  /** Optional human-friendly scope label (for example "#general"). */
+  displayScope?: string;
   permission: PlatformPermission;
   createdAt: number;
 }

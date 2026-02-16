@@ -84,6 +84,8 @@ function normalizePlatformBindings(input: unknown): PlatformBinding[] {
       const platform = typeof row.platform === 'string' ? row.platform.trim() : '';
       const scope = typeof row.scope === 'string' ? row.scope.trim() : '';
       if (!platform || !scope) return null;
+      const accountId = typeof row.accountId === 'string' ? row.accountId.trim() : '';
+      const displayScope = typeof row.displayScope === 'string' ? row.displayScope.trim() : '';
       const id =
         typeof row.id === 'string' && row.id.trim()
           ? row.id.trim()
@@ -92,6 +94,8 @@ function normalizePlatformBindings(input: unknown): PlatformBinding[] {
         id,
         platform,
         scope,
+        ...(accountId ? { accountId } : {}),
+        ...(displayScope ? { displayScope } : {}),
         permission: normalizePermission(row.permission),
         createdAt: typeof row.createdAt === 'number' ? row.createdAt : now,
       } satisfies PlatformBinding;
