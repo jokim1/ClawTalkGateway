@@ -52,6 +52,9 @@ type SeenDecision = {
 type QueueItem = {
   talkId: string;
   event: SlackIngressEvent;
+  platformBindingId: string;
+  behaviorAgentName?: string;
+  behaviorOnMessagePrompt?: string;
   attempt: number;
   enqueuedAt: number;
   inboundContent?: string;
@@ -358,28 +361,30 @@ function resolveOwnerTalk(
   talks: TalkMeta[],
   event: SlackIngressEvent,
   logger: Logger,
-): { talkId?: string; reason?: string } {
+): { talkId?: string; reason?: string; binding?: PlatformBinding } {
   let bestScore = -1;
-  const candidates: TalkMeta[] = [];
+  const candidates: Array<{ talk: TalkMeta; binding: PlatformBinding }> = [];
 
   for (const talk of talks) {
     const bindings = talk.platformBindings ?? [];
     let talkScore = -1;
+    let talkBestBinding: PlatformBinding | undefined;
     for (const binding of bindings) {
       const score = scoreSlackBinding(binding, event);
       if (score > talkScore) {
         talkScore = score;
+        talkBestBinding = binding;
       }
     }
-    if (talkScore < 0) continue;
+    if (talkScore < 0 || !talkBestBinding) continue;
     if (talkScore > bestScore) {
       bestScore = talkScore;
       candidates.length = 0;
-      candidates.push(talk);
+      candidates.push({ talk, binding: talkBestBinding });
       continue;
     }
     if (talkScore === bestScore) {
-      candidates.push(talk);
+      candidates.push({ talk, binding: talkBestBinding });
     }
   }
 
@@ -392,12 +397,59 @@ function resolveOwnerTalk(
     );
     return { reason: 'ambiguous-binding' };
   }
-  return { talkId: candidates[0].id };
+  return {
+    talkId: candidates[0].talk.id,
+    binding: candidates[0].binding,
+  };
 }
 
 function resolvePrimaryAgent(meta: TalkMeta): TalkAgent | undefined {
   const agents = meta.agents ?? [];
   return agents.find((agent) => agent.isPrimary) ?? agents[0];
+}
+
+function resolveAgentForEvent(meta: TalkMeta, preferredAgentName?: string): TalkAgent | undefined {
+  const preferred = preferredAgentName?.trim().toLowerCase();
+  if (preferred) {
+    const matched = (meta.agents ?? []).find((agent) => agent.name.trim().toLowerCase() === preferred);
+    if (matched) return matched;
+  }
+  return resolvePrimaryAgent(meta);
+}
+
+function resolveBehaviorForBinding(meta: TalkMeta, bindingId: string): {
+  agentName?: string;
+  onMessagePrompt?: string;
+} | undefined {
+  const behavior = (meta.platformBehaviors ?? []).find((entry) => entry.platformBindingId === bindingId);
+  if (!behavior) return undefined;
+  return {
+    agentName: behavior.agentName?.trim() || undefined,
+    onMessagePrompt: behavior.onMessagePrompt?.trim() || undefined,
+  };
+}
+
+function shouldHandleViaBehavior(meta: TalkMeta, bindingId: string): {
+  handle: boolean;
+  reason?: string;
+  behavior?: { agentName?: string; onMessagePrompt?: string };
+} {
+  const behaviors = meta.platformBehaviors ?? [];
+  // Backwards compatibility: if no behavior rows exist, keep legacy auto-reply behavior.
+  if (behaviors.length === 0) {
+    return { handle: true };
+  }
+
+  const behavior = resolveBehaviorForBinding(meta, bindingId);
+  if (!behavior) {
+    return { handle: false, reason: 'no-platform-behavior' };
+  }
+
+  if (!behavior.onMessagePrompt) {
+    return { handle: false, reason: 'on-message-disabled' };
+  }
+
+  return { handle: true, behavior };
 }
 
 function buildRoleInstructions(agent: TalkAgent): string {
@@ -433,6 +485,8 @@ async function callLlmForEvent(params: {
   deps: SlackIngressDeps;
   talkId: string;
   event: SlackIngressEvent;
+  behaviorAgentName?: string;
+  behaviorOnMessagePrompt?: string;
 }): Promise<{
   reply: string;
   model: string;
@@ -446,13 +500,13 @@ async function callLlmForEvent(params: {
     throw new Error(`talk ${talkId} not found`);
   }
 
-  const selectedAgent = resolvePrimaryAgent(meta);
+  const selectedAgent = resolveAgentForEvent(meta, params.behaviorAgentName);
   const model = selectedAgent?.model || meta.model || 'moltbot';
   const contextMd = await deps.store.getContextMd(talkId);
   const pinnedMessages = await Promise.all(meta.pinnedMessageIds.map(id => deps.store.getMessage(talkId, id)));
   const history = await deps.store.getRecentMessages(talkId, MAX_CONTEXT_MESSAGES);
 
-  const systemPrompt = composeSystemPrompt({
+  const baseSystemPrompt = composeSystemPrompt({
     meta,
     contextMd,
     pinnedMessages: pinnedMessages.filter(Boolean) as TalkMessage[],
@@ -467,6 +521,12 @@ async function callLlmForEvent(params: {
         }
       : undefined,
   });
+
+  const behaviorPrompt = params.behaviorOnMessagePrompt?.trim();
+  const systemPrompt = behaviorPrompt
+    ? `${baseSystemPrompt}\n\n` +
+      `Platform inbound behavior (Slack binding specific):\n${behaviorPrompt}`
+    : baseSystemPrompt;
 
   const messages: Array<{ role: string; content: string }> = [];
   if (systemPrompt) {
@@ -683,6 +743,8 @@ async function processQueueItem(item: QueueItem, deps: SlackIngressDeps): Promis
       deps,
       talkId: item.talkId,
       event: item.event,
+      behaviorAgentName: item.behaviorAgentName,
+      behaviorOnMessagePrompt: item.behaviorOnMessagePrompt,
     });
     item.reply = generated.reply;
     item.model = generated.model;
@@ -781,7 +843,7 @@ function routeSlackIngressEvent(
   }
 
   const owner = resolveOwnerTalk(deps.store.listTalks(), event, deps.logger);
-  if (!owner.talkId) {
+  if (!owner.talkId || !owner.binding) {
     const reason = owner.reason ?? 'no-binding';
     seenEvents.set(event.eventId, {
       ts: Date.now(),
@@ -793,6 +855,46 @@ function routeSlackIngressEvent(
       payload: {
         decision: 'pass',
         reason,
+        eventId: event.eventId,
+      },
+    };
+  }
+
+  const ownerTalk = deps.store.getTalk(owner.talkId);
+  if (!ownerTalk) {
+    seenEvents.set(event.eventId, {
+      ts: Date.now(),
+      decision: 'pass',
+      reason: 'talk-not-found',
+    });
+    return {
+      statusCode: 200,
+      payload: {
+        decision: 'pass',
+        reason: 'talk-not-found',
+        eventId: event.eventId,
+      },
+    };
+  }
+
+  const behaviorDecision = shouldHandleViaBehavior(ownerTalk, owner.binding.id);
+  if (!behaviorDecision.handle) {
+    const reason = behaviorDecision.reason ?? 'no-platform-behavior';
+    seenEvents.set(event.eventId, {
+      ts: Date.now(),
+      decision: 'pass',
+      reason,
+      talkId: owner.talkId,
+    });
+    deps.logger.debug(
+      `SlackIngress: pass ${event.eventId} for talk ${owner.talkId} (${reason})`,
+    );
+    return {
+      statusCode: 200,
+      payload: {
+        decision: 'pass',
+        reason,
+        talkId: owner.talkId,
         eventId: event.eventId,
       },
     };
@@ -825,6 +927,9 @@ function routeSlackIngressEvent(
   queue.push({
     talkId: owner.talkId,
     event,
+    platformBindingId: owner.binding.id,
+    behaviorAgentName: behaviorDecision.behavior?.agentName,
+    behaviorOnMessagePrompt: behaviorDecision.behavior?.onMessagePrompt,
     attempt: 0,
     enqueuedAt: Date.now(),
     inboundContent: buildInboundMessage(event),

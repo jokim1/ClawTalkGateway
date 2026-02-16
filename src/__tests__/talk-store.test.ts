@@ -82,17 +82,26 @@ describe('Talk CRUD', () => {
     expect(updated!.updatedAt).toBeGreaterThanOrEqual(talk.updatedAt);
   });
 
-  it('persists directives and platform bindings via updateTalk', () => {
+  it('persists directives, platform bindings, and platform behaviors via updateTalk', () => {
     const talk = store.createTalk();
     const now = Date.now();
+    const bindingId = 'binding-1';
     const updated = store.updateTalk(talk.id, {
       directives: [{ id: 'directive-1', text: 'Be concise', active: true, createdAt: now }],
       platformBindings: [{
-        id: 'binding-1',
+        id: bindingId,
         platform: 'slack',
         scope: '#team-product',
         permission: 'read+write',
         createdAt: now,
+      }],
+      platformBehaviors: [{
+        id: 'behavior-1',
+        platformBindingId: bindingId,
+        agentName: 'DeepSeek',
+        onMessagePrompt: 'Reply concisely.',
+        createdAt: now,
+        updatedAt: now,
       }],
     });
 
@@ -104,6 +113,12 @@ describe('Talk CRUD', () => {
     expect(updated!.platformBindings?.[0].platform).toBe('slack');
     expect(updated!.platformBindings?.[0].scope).toBe('#team-product');
     expect(updated!.platformBindings?.[0].permission).toBe('read+write');
+    expect(updated!.platformBehaviors).toHaveLength(1);
+    expect(updated!.platformBehaviors?.[0]).toMatchObject({
+      platformBindingId: bindingId,
+      agentName: 'DeepSeek',
+      onMessagePrompt: 'Reply concisely.',
+    });
   });
 
   it('returns null when updating nonexistent talk', () => {

@@ -168,6 +168,23 @@ export interface TalkPlatformBinding {
 
 export type PlatformBinding = TalkPlatformBinding;
 
+export interface TalkPlatformBehavior {
+  id: string;
+  /** Foreign key to TalkPlatformBinding.id. */
+  platformBindingId: string;
+  /** Optional talk agent name override for this binding. */
+  agentName?: string;
+  /**
+   * Optional instruction for inbound messages on this binding.
+   * If omitted, auto-response is disabled for this binding.
+   */
+  onMessagePrompt?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export type PlatformBehavior = TalkPlatformBehavior;
+
 export interface ImageAttachmentMeta {
   filename: string;
   mimeType: string;
@@ -233,6 +250,7 @@ export interface TalkMeta {
   agents?: TalkAgent[];
   directives?: TalkDirective[];
   platformBindings?: TalkPlatformBinding[];
+  platformBehaviors?: TalkPlatformBehavior[];
   processing?: boolean;
   createdAt: number;
   updatedAt: number;

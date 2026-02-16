@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { TalkMeta } from '../types';
 import {
   findSlackBindingConflicts,
+  normalizeAndValidatePlatformBehaviorsInput,
   normalizeAndValidatePlatformBindingsInput,
   normalizeSlackBindingScope,
 } from '../talks';
@@ -97,6 +98,71 @@ describe('normalizeAndValidatePlatformBindingsInput', () => {
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.error).toContain('invalid Slack scope');
+  });
+});
+
+describe('normalizeAndValidatePlatformBehaviorsInput', () => {
+  it('validates behavior rows against bindings and agents', () => {
+    const bindingId = randomUUID();
+    const result = normalizeAndValidatePlatformBehaviorsInput(
+      [{
+        platformBindingId: bindingId,
+        agentName: 'DeepSeek',
+        onMessagePrompt: 'Reply with concise action items.',
+      }],
+      {
+        bindings: [{
+          id: bindingId,
+          platform: 'slack',
+          scope: 'channel:C123',
+          permission: 'read+write',
+          createdAt: Date.now(),
+        }],
+        agents: [{
+          name: 'DeepSeek',
+          model: 'deepseek',
+          role: 'analyst',
+          isPrimary: true,
+        }],
+      },
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.behaviors).toHaveLength(1);
+    expect(result.behaviors[0]).toMatchObject({
+      platformBindingId: bindingId,
+      agentName: 'DeepSeek',
+      onMessagePrompt: 'Reply with concise action items.',
+    });
+  });
+
+  it('rejects behavior rows with unknown binding or unknown agent', () => {
+    const unknownBinding = normalizeAndValidatePlatformBehaviorsInput(
+      [{ platformBindingId: 'missing-binding', onMessagePrompt: 'Hi' }],
+      { bindings: [], agents: [] },
+    );
+    expect(unknownBinding.ok).toBe(false);
+    if (unknownBinding.ok) return;
+    expect(unknownBinding.error).toContain('unknown binding');
+
+    const knownBindingId = randomUUID();
+    const unknownAgent = normalizeAndValidatePlatformBehaviorsInput(
+      [{ platformBindingId: knownBindingId, agentName: 'NotHere' }],
+      {
+        bindings: [{
+          id: knownBindingId,
+          platform: 'slack',
+          scope: 'channel:C123',
+          permission: 'read+write',
+          createdAt: Date.now(),
+        }],
+        agents: [],
+      },
+    );
+    expect(unknownAgent.ok).toBe(false);
+    if (unknownAgent.ok) return;
+    expect(unknownAgent.error).toContain('unknown agent');
   });
 });
 

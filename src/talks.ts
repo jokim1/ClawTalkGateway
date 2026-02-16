@@ -7,13 +7,24 @@
 
 import type { HandlerContext } from './types.js';
 import type { TalkStore } from './talk-store.js';
-import type { PlatformBinding, PlatformPermission, TalkMeta } from './types.js';
+import type {
+  PlatformBehavior,
+  PlatformBinding,
+  PlatformPermission,
+  TalkAgent,
+  TalkMeta,
+} from './types.js';
 import type { ToolRegistry } from './tool-registry.js';
 import { sendJson, readJsonBody } from './http.js';
 import { validateSchedule, parseEventTrigger } from './job-scheduler.js';
+import { randomUUID } from 'node:crypto';
 
 type PlatformBindingsValidationResult =
   | { ok: true; bindings: PlatformBinding[]; ownershipKeys: string[] }
+  | { ok: false; error: string };
+
+type PlatformBehaviorsValidationResult =
+  | { ok: true; behaviors: PlatformBehavior[] }
   | { ok: false; error: string };
 
 type SlackScopeResolutionResult =
@@ -563,6 +574,87 @@ export async function normalizeAndValidatePlatformBindingsInput(
   };
 }
 
+export function normalizeAndValidatePlatformBehaviorsInput(
+  input: unknown,
+  params: {
+    bindings: PlatformBinding[];
+    agents: TalkAgent[];
+  },
+): PlatformBehaviorsValidationResult {
+  if (!Array.isArray(input)) {
+    return { ok: false, error: 'platformBehaviors must be an array' };
+  }
+
+  const now = Date.now();
+  const bindingIds = new Set(params.bindings.map((binding) => binding.id));
+  const agentNames = new Set((params.agents ?? []).map((agent) => agent.name.toLowerCase()));
+  const seenBindingIds = new Set<string>();
+  const normalized: PlatformBehavior[] = [];
+
+  for (let i = 0; i < input.length; i += 1) {
+    const entry = input[i];
+    if (!entry || typeof entry !== 'object') {
+      return { ok: false, error: `platformBehaviors[${i + 1}] must be an object` };
+    }
+    const row = entry as Record<string, unknown>;
+    const platformBindingId = typeof row.platformBindingId === 'string' ? row.platformBindingId.trim() : '';
+    if (!platformBindingId) {
+      return { ok: false, error: `platformBehaviors[${i + 1}] requires platformBindingId` };
+    }
+    if (!bindingIds.has(platformBindingId)) {
+      return {
+        ok: false,
+        error:
+          `platformBehaviors[${i + 1}] references unknown binding "${platformBindingId}". ` +
+          'Use /platform list to get a valid platformN first.',
+      };
+    }
+    if (seenBindingIds.has(platformBindingId)) {
+      return {
+        ok: false,
+        error:
+          `platformBehaviors has multiple entries for binding "${platformBindingId}". ` +
+          'Use one behavior per binding.',
+      };
+    }
+    seenBindingIds.add(platformBindingId);
+
+    const agentName = typeof row.agentName === 'string' ? row.agentName.trim() : '';
+    if (agentName && !agentNames.has(agentName.toLowerCase())) {
+      return {
+        ok: false,
+        error:
+          `platformBehaviors[${i + 1}] references unknown agent "${agentName}". ` +
+          'Add the agent first or omit agentName to use the primary talk agent.',
+      };
+    }
+
+    const onMessagePrompt = typeof row.onMessagePrompt === 'string' ? row.onMessagePrompt.trim() : '';
+    if (!agentName && !onMessagePrompt) {
+      return {
+        ok: false,
+        error:
+          `platformBehaviors[${i + 1}] must define agentName and/or onMessagePrompt.`,
+      };
+    }
+
+    const id = typeof row.id === 'string' && row.id.trim() ? row.id.trim() : randomUUID();
+    const createdAt = typeof row.createdAt === 'number' ? row.createdAt : now;
+    const updatedAt = typeof row.updatedAt === 'number' ? row.updatedAt : now;
+
+    normalized.push({
+      id,
+      platformBindingId,
+      ...(agentName ? { agentName } : {}),
+      ...(onMessagePrompt ? { onMessagePrompt } : {}),
+      createdAt,
+      updatedAt,
+    });
+  }
+
+  return { ok: true, behaviors: normalized };
+}
+
 export function findSlackBindingConflicts(params: {
   candidateOwnershipKeys: string[];
   talks: TalkMeta[];
@@ -709,6 +801,7 @@ async function handleCreateTalk(ctx: HandlerContext, store: TalkStore): Promise<
     objective?: string;
     directives?: any[];
     platformBindings?: any[];
+    platformBehaviors?: any[];
   } = {};
   try {
     body = (await readJsonBody(ctx.req)) as typeof body;
@@ -740,12 +833,25 @@ async function handleCreateTalk(ctx: HandlerContext, store: TalkStore): Promise<
     body.platformBindings = parsed.bindings;
   }
 
+  if (body.platformBehaviors !== undefined) {
+    const behaviorParse = normalizeAndValidatePlatformBehaviorsInput(body.platformBehaviors, {
+      bindings: body.platformBindings ?? [],
+      agents: [],
+    });
+    if (!behaviorParse.ok) {
+      sendJson(ctx.res, 400, { error: behaviorParse.error });
+      return;
+    }
+    body.platformBehaviors = behaviorParse.behaviors;
+  }
+
   const talk = store.createTalk(body.model);
   store.updateTalk(talk.id, {
     ...(body.topicTitle ? { topicTitle: body.topicTitle } : {}),
     ...(body.objective ? { objective: body.objective } : {}),
     ...(body.directives !== undefined ? { directives: body.directives } : {}),
     ...(body.platformBindings !== undefined ? { platformBindings: body.platformBindings } : {}),
+    ...(body.platformBehaviors !== undefined ? { platformBehaviors: body.platformBehaviors } : {}),
   });
 
   sendJson(ctx.res, 201, store.getTalk(talk.id) ?? talk);
@@ -774,6 +880,7 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
     agents?: any[];
     directives?: any[];
     platformBindings?: any[];
+    platformBehaviors?: any[];
   };
   try {
     body = (await readJsonBody(ctx.req)) as typeof body;
@@ -813,6 +920,20 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
     body.platformBindings = parsed.bindings;
   }
 
+  if (body.platformBehaviors !== undefined) {
+    const effectiveBindings = body.platformBindings ?? (talk.platformBindings ?? []);
+    const effectiveAgents = body.agents ?? (talk.agents ?? []);
+    const behaviorParse = normalizeAndValidatePlatformBehaviorsInput(body.platformBehaviors, {
+      bindings: effectiveBindings,
+      agents: effectiveAgents,
+    });
+    if (!behaviorParse.ok) {
+      sendJson(ctx.res, 400, { error: behaviorParse.error });
+      return;
+    }
+    body.platformBehaviors = behaviorParse.behaviors;
+  }
+
   if (body.agents !== undefined) {
     await store.setAgents(talkId, body.agents);
   }
@@ -822,6 +943,9 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
   if (body.platformBindings !== undefined) {
     await store.setPlatformBindings(talkId, body.platformBindings);
   }
+  if (body.platformBehaviors !== undefined) {
+    await store.setPlatformBehaviors(talkId, body.platformBehaviors);
+  }
 
   const updated = store.updateTalk(talkId, {
     topicTitle: body.topicTitle,
@@ -829,6 +953,7 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
     model: body.model,
     directives: body.directives,
     platformBindings: body.platformBindings,
+    platformBehaviors: body.platformBehaviors,
   });
   if (!updated) {
     sendJson(ctx.res, 404, { error: 'Talk not found' });

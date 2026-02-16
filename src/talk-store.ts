@@ -18,9 +18,11 @@ import type {
   TalkAgent,
   TalkDirective,
   TalkPlatformBinding,
+  TalkPlatformBehavior,
   JobReport,
   Directive,
   PlatformBinding,
+  PlatformBehavior,
   PlatformPermission,
   Logger,
 } from './types.js';
@@ -103,6 +105,44 @@ function normalizePlatformBindings(input: unknown): PlatformBinding[] {
     .filter((entry): entry is PlatformBinding => Boolean(entry));
 }
 
+function normalizePlatformBehaviors(
+  input: unknown,
+  bindings?: TalkPlatformBinding[],
+): PlatformBehavior[] {
+  if (!Array.isArray(input)) return [];
+  const now = Date.now();
+  const enforceBindingIds = Array.isArray(bindings);
+  const bindingIds = new Set((bindings ?? []).map((binding) => binding.id));
+  return input
+    .filter((entry) => Boolean(entry && typeof entry === 'object'))
+    .map((entry) => {
+      const row = entry as Record<string, unknown>;
+      const platformBindingId =
+        typeof row.platformBindingId === 'string' ? row.platformBindingId.trim() : '';
+      if (!platformBindingId) return null;
+      if (enforceBindingIds && !bindingIds.has(platformBindingId)) return null;
+
+      const agentName = typeof row.agentName === 'string' ? row.agentName.trim() : '';
+      const onMessagePrompt = typeof row.onMessagePrompt === 'string' ? row.onMessagePrompt.trim() : '';
+      if (!agentName && !onMessagePrompt) return null;
+
+      const id =
+        typeof row.id === 'string' && row.id.trim()
+          ? row.id.trim()
+          : randomUUID();
+
+      return {
+        id,
+        platformBindingId,
+        ...(agentName ? { agentName } : {}),
+        ...(onMessagePrompt ? { onMessagePrompt } : {}),
+        createdAt: typeof row.createdAt === 'number' ? row.createdAt : now,
+        updatedAt: typeof row.updatedAt === 'number' ? row.updatedAt : now,
+      } satisfies PlatformBehavior;
+    })
+    .filter((entry): entry is PlatformBehavior => Boolean(entry));
+}
+
 export class TalkStore {
   private readonly talksDir: string;
   private readonly talks: Map<string, TalkMeta> = new Map();
@@ -143,6 +183,7 @@ export class TalkStore {
           meta.agents ??= [];
           meta.directives = normalizeDirectives(meta.directives);
           meta.platformBindings = normalizePlatformBindings(meta.platformBindings);
+          meta.platformBehaviors = normalizePlatformBehaviors(meta.platformBehaviors, meta.platformBindings);
           if (meta.processing === undefined) {
             meta.processing = false;
           }
@@ -180,6 +221,7 @@ export class TalkStore {
       processing: false,
       directives: [],
       platformBindings: [],
+      platformBehaviors: [],
       createdAt: now,
       updatedAt: now,
     };
@@ -204,7 +246,10 @@ export class TalkStore {
   updateTalk(
     id: string,
     updates: Partial<
-      Pick<TalkMeta, 'topicTitle' | 'objective' | 'model' | 'directives' | 'platformBindings'>
+      Pick<
+        TalkMeta,
+        'topicTitle' | 'objective' | 'model' | 'directives' | 'platformBindings' | 'platformBehaviors'
+      >
     >,
   ): TalkMeta | null {
     const meta = this.talks.get(id);
@@ -216,6 +261,13 @@ export class TalkStore {
     if (updates.directives !== undefined) meta.directives = normalizeDirectives(updates.directives);
     if (updates.platformBindings !== undefined) {
       meta.platformBindings = normalizePlatformBindings(updates.platformBindings);
+      meta.platformBehaviors = normalizePlatformBehaviors(meta.platformBehaviors, meta.platformBindings);
+    }
+    if (updates.platformBehaviors !== undefined) {
+      meta.platformBehaviors = normalizePlatformBehaviors(
+        updates.platformBehaviors,
+        meta.platformBindings,
+      );
     }
     meta.updatedAt = Date.now();
 
@@ -596,7 +648,17 @@ export class TalkStore {
   async setPlatformBindings(talkId: string, bindings: TalkPlatformBinding[]): Promise<void> {
     const meta = this.talks.get(talkId);
     if (!meta) throw new Error('Talk not found');
-    meta.platformBindings = bindings;
+    meta.platformBindings = normalizePlatformBindings(bindings);
+    meta.platformBehaviors = normalizePlatformBehaviors(meta.platformBehaviors, meta.platformBindings);
+    meta.updatedAt = Date.now();
+    this.invalidateListCache();
+    this.persistMeta(meta);
+  }
+
+  async setPlatformBehaviors(talkId: string, behaviors: TalkPlatformBehavior[]): Promise<void> {
+    const meta = this.talks.get(talkId);
+    if (!meta) throw new Error('Talk not found');
+    meta.platformBehaviors = normalizePlatformBehaviors(behaviors, meta.platformBindings);
     meta.updatedAt = Date.now();
     this.invalidateListCache();
     this.persistMeta(meta);
