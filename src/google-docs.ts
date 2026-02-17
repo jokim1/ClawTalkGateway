@@ -385,6 +385,9 @@ export async function googleDocsAuthStatus(): Promise<{
   hasClientSecret: boolean;
   hasRefreshToken: boolean;
   accessTokenReady: boolean;
+  accountEmail?: string;
+  accountDisplayName?: string;
+  identityError?: string;
   error?: string;
 }> {
   return googleDocsAuthStatusForProfile(undefined);
@@ -398,6 +401,9 @@ export async function googleDocsAuthStatusForProfile(profile: string | undefined
   hasClientSecret: boolean;
   hasRefreshToken: boolean;
   accessTokenReady: boolean;
+  accountEmail?: string;
+  accountDisplayName?: string;
+  identityError?: string;
   error?: string;
 }> {
   const tokenPath = resolveTokenPath();
@@ -435,6 +441,20 @@ export async function googleDocsAuthStatusForProfile(profile: string | undefined
 
   try {
     await getAccessToken(selectedProfile);
+    let accountEmail: string | undefined;
+    let accountDisplayName: string | undefined;
+    let identityError: string | undefined;
+    try {
+      const about = await googleFetchJson(
+        'https://www.googleapis.com/drive/v3/about?fields=user(emailAddress,displayName)',
+        { method: 'GET' },
+        selectedProfile,
+      );
+      accountEmail = typeof about?.user?.emailAddress === 'string' ? about.user.emailAddress : undefined;
+      accountDisplayName = typeof about?.user?.displayName === 'string' ? about.user.displayName : undefined;
+    } catch (err) {
+      identityError = err instanceof Error ? err.message : String(err);
+    }
     return {
       profile: selectedProfile,
       activeProfile: normalizeProfileName(store.activeProfile),
@@ -443,6 +463,9 @@ export async function googleDocsAuthStatusForProfile(profile: string | undefined
       hasClientSecret: Boolean(clientSecret),
       hasRefreshToken: Boolean(refreshToken),
       accessTokenReady: true,
+      ...(accountEmail ? { accountEmail } : {}),
+      ...(accountDisplayName ? { accountDisplayName } : {}),
+      ...(identityError ? { identityError } : {}),
     };
   } catch (err) {
     return {

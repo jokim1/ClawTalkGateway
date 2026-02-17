@@ -407,6 +407,9 @@ export class ToolExecutor {
           `hasClientSecret: ${status.hasClientSecret}\n` +
           `hasRefreshToken: ${status.hasRefreshToken}\n` +
           `accessTokenReady: ${status.accessTokenReady}\n` +
+          `accountEmail: ${status.accountEmail ?? '(unknown)'}\n` +
+          `accountDisplayName: ${status.accountDisplayName ?? '(unknown)'}\n` +
+          `identityError: ${status.identityError ?? '(none)'}\n` +
           (status.error ? `error: ${status.error}` : 'error: (none)'),
         durationMs: 0,
       };
