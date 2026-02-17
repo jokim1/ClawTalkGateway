@@ -124,6 +124,8 @@ export interface ToolLoopStreamOptions {
   logger: Logger;
   timeoutMs?: number;
   maxTotalMs?: number;
+  /** Max time to receive first token/tool delta from provider in an iteration. */
+  firstTokenTimeoutMs?: number;
   maxIterations?: number;
   toolChoice?: 'auto' | 'none';
   /** Signal that fires when the HTTP client disconnects. Not retried. */
@@ -203,6 +205,24 @@ export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoop
       const toolCallAccumulators = new Map<number, ToolCallAccumulator>();
       let finishReason: string | null = null;
       let fetchOk = false;
+      let ttftTimer: ReturnType<typeof setTimeout> | undefined;
+      const ttftController = new AbortController();
+      let ttftAborted = false;
+      let sawFirstDelta = false;
+      const ttftMs = Math.max(5_000, opts.firstTokenTimeoutMs ?? 90_000);
+      const markFirstDelta = () => {
+        if (sawFirstDelta) return;
+        sawFirstDelta = true;
+        if (ttftTimer) {
+          clearTimeout(ttftTimer);
+          ttftTimer = undefined;
+        }
+      };
+      ttftTimer = setTimeout(() => {
+        if (sawFirstDelta) return;
+        ttftAborted = true;
+        ttftController.abort();
+      }, ttftMs);
 
       try {
         llmResponse = await fetch(`${gatewayOrigin}/v1/chat/completions`, {
@@ -216,7 +236,7 @@ export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoop
             stream: true,
             stream_options: { include_usage: true },
           }),
-          signal: fetchSignal,
+          signal: AbortSignal.any([fetchSignal, ttftController.signal]),
         });
 
         if (!llmResponse.ok) {
@@ -266,6 +286,7 @@ export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoop
                 // Accumulate text content
                 const contentDelta = choice.delta?.content;
                 if (contentDelta) {
+                  markFirstDelta();
                   iterContent += contentDelta;
                   // Forward content to client as standard SSE
                   res.write(`data: ${JSON.stringify({
@@ -277,6 +298,7 @@ export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoop
                 // Accumulate tool call fragments
                 const toolCallDeltas = choice.delta?.tool_calls;
                 if (toolCallDeltas && Array.isArray(toolCallDeltas)) {
+                  markFirstDelta();
                   for (const tc of toolCallDeltas) {
                     const idx = tc.index ?? 0;
                     let acc = toolCallAccumulators.get(idx);
@@ -297,6 +319,7 @@ export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoop
 
                 // Capture finish reason
                 if (choice.finish_reason) {
+                  markFirstDelta();
                   finishReason = choice.finish_reason;
                 }
               } catch {
@@ -306,8 +329,16 @@ export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoop
           }
         }
       } catch (err) {
+        let effectiveErr: unknown = err;
+        if (ttftAborted && !abort.signal.aborted && !clientSignal?.aborted) {
+          effectiveErr = new Error(`First token timeout after ${ttftMs}ms`);
+        }
+        if (ttftTimer) {
+          clearTimeout(ttftTimer);
+          ttftTimer = undefined;
+        }
         // --- Retry decision ---
-        if (attempt === 0 && !retried && isTransientError(err, clientSignal)) {
+        if (attempt === 0 && !retried && isTransientError(effectiveErr, clientSignal)) {
           retried = true;
 
           if (iterContent) {
@@ -330,8 +361,12 @@ export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoop
         }
 
         // Not retryable or already retried — propagate
-        logger.error(`ToolLoop: ${fetchOk ? 'stream read' : 'LLM fetch'} error (iteration ${iteration}): ${err}`);
-        throw err;
+        logger.error(`ToolLoop: ${fetchOk ? 'stream read' : 'LLM fetch'} error (iteration ${iteration}): ${effectiveErr}`);
+        throw effectiveErr;
+      }
+      if (ttftTimer) {
+        clearTimeout(ttftTimer);
+        ttftTimer = undefined;
       }
 
       // --- Success path (no error thrown) ---

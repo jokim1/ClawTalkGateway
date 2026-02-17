@@ -31,13 +31,31 @@ const RESERVED_OVERHEAD_BYTES = 8 * 1024;
 /** Never shrink history budget below this floor. */
 const MIN_HISTORY_BUDGET_BYTES = 4 * 1024;
 const CLAWTALK_DEFAULT_AGENT_ID = 'clawtalk';
-const DEFAULT_TALK_TOOL_LOOP_TIMEOUT_MS = 180_000;
+const DEFAULT_TALK_FIRST_TOKEN_TIMEOUT_MS = 90_000;
+const DEFAULT_TALK_TOTAL_TIMEOUT_MS = 900_000;
+const DEFAULT_TALK_INACTIVITY_TIMEOUT_MS = 300_000;
 
-function resolveTalkToolLoopTimeoutMs(): number {
-  const raw = process.env.CLAWTALK_TALK_TOOLLOOP_TIMEOUT_MS;
-  if (!raw) return DEFAULT_TALK_TOOL_LOOP_TIMEOUT_MS;
+function resolveTalkFirstTokenTimeoutMs(): number {
+  const raw = process.env.CLAWTALK_TALK_TTFT_TIMEOUT_MS;
+  if (!raw) return DEFAULT_TALK_FIRST_TOKEN_TIMEOUT_MS;
   const parsed = Number.parseInt(raw, 10);
-  if (!Number.isFinite(parsed)) return DEFAULT_TALK_TOOL_LOOP_TIMEOUT_MS;
+  if (!Number.isFinite(parsed)) return DEFAULT_TALK_FIRST_TOKEN_TIMEOUT_MS;
+  return Math.min(300_000, Math.max(10_000, parsed));
+}
+
+function resolveTalkTotalTimeoutMs(): number {
+  const raw = process.env.CLAWTALK_TALK_TOTAL_TIMEOUT_MS ?? process.env.CLAWTALK_TALK_TOOLLOOP_TIMEOUT_MS;
+  if (!raw) return DEFAULT_TALK_TOTAL_TIMEOUT_MS;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) return DEFAULT_TALK_TOTAL_TIMEOUT_MS;
+  return Math.min(1_800_000, Math.max(60_000, parsed));
+}
+
+function resolveTalkInactivityTimeoutMs(): number {
+  const raw = process.env.CLAWTALK_TALK_INACTIVITY_TIMEOUT_MS;
+  if (!raw) return DEFAULT_TALK_INACTIVITY_TIMEOUT_MS;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) return DEFAULT_TALK_INACTIVITY_TIMEOUT_MS;
   return Math.min(900_000, Math.max(30_000, parsed));
 }
 
@@ -120,6 +138,13 @@ function buildTalkSessionKey(talkId: string, agentPart: string): string {
   const talk = sanitizeSessionPart(talkId) || 'talk';
   const agent = sanitizeSessionPart(agentPart) || CLAWTALK_DEFAULT_AGENT_ID;
   return `agent_${agent}_clawtalk_talk_${talk}_chat`;
+}
+
+function buildRunScopedSessionPart(basePart: string, model: string, traceId: string): string {
+  const base = sanitizeSessionPart(basePart) || 'talk';
+  const modelPart = sanitizeSessionPart(model).slice(0, 20) || 'model';
+  const tracePart = sanitizeSessionPart(traceId).slice(0, 8) || 'trace';
+  return `${base}_${modelPart}_${tracePart}`;
 }
 
 function estimateHistoryMessageBytes(msg: TalkMessage): number {
@@ -434,8 +459,9 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
     || routeDiag.matchedRequestedModelAgentId?.trim()
     || routing.sessionAgentPart
     || `model_${sanitizeSessionPart(model)}`;
+  const runScopedSessionPart = buildRunScopedSessionPart(sessionRoutePart, model, traceId);
   const extraHeaders: Record<string, string> = {
-    'x-openclaw-session-key': buildTalkSessionKey(talkId, sessionRoutePart),
+    'x-openclaw-session-key': buildTalkSessionKey(talkId, runScopedSessionPart),
     'x-openclaw-trace-id': traceId,
   };
   if (resolvedHeaderAgentId?.trim()) {
@@ -443,7 +469,7 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
   }
   logger.info(
     `ModelRoute trace=${traceId} flow=talk-chat talkId=${talkId} requestedModel=${routeDiag.requestedModel} `
-    + `sessionRoutePart=${sessionRoutePart} sessionKey=${extraHeaders['x-openclaw-session-key']} `
+    + `sessionRoutePart=${sessionRoutePart} runScopedSessionPart=${runScopedSessionPart} sessionKey=${extraHeaders['x-openclaw-session-key']} `
     + `headerAgentId=${routing.headerAgentId ?? '-'} effectiveHeaderAgentId=${resolvedHeaderAgentId ?? '-'} `
     + `configuredAgentId=${routeDiag.configuredAgentId ?? '-'} `
     + `configuredAgentModel=${routeDiag.configuredAgentModel ?? '-'} defaultAgentId=${routeDiag.defaultAgentId ?? '-'} `
@@ -509,8 +535,9 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
       logger,
       clientSignal: clientAbort.signal,
       traceId,
-      timeoutMs: resolveTalkToolLoopTimeoutMs(),
-      maxTotalMs: resolveTalkToolLoopTimeoutMs(),
+      firstTokenTimeoutMs: resolveTalkFirstTokenTimeoutMs(),
+      timeoutMs: resolveTalkInactivityTimeoutMs(),
+      maxTotalMs: resolveTalkTotalTimeoutMs(),
       maxIterations,
       toolChoice: disableTools ? 'none' : 'auto',
     });
