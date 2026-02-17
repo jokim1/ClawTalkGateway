@@ -134,10 +134,13 @@ function resolveTalkAgentRouting(meta: { agents?: Array<{ name: string; openClaw
   };
 }
 
-function buildTalkSessionKey(talkId: string, agentPart: string): string {
+function buildTalkSessionKey(talkId: string, agentPart: string, lanePart?: string): string {
   const talk = sanitizeSessionPart(talkId) || 'talk';
   const agent = sanitizeSessionPart(agentPart) || CLAWTALK_DEFAULT_AGENT_ID;
-  return `agent:${agent}:clawtalk:talk:${talk}:chat`;
+  const lane = lanePart ? sanitizeSessionPart(lanePart) : '';
+  return lane
+    ? `agent:${agent}:clawtalk:talk:${talk}:chat:lane:${lane}`
+    : `agent:${agent}:clawtalk:talk:${talk}:chat`;
 }
 
 function buildRunScopedSessionPart(basePart: string, model: string, traceId: string): string {
@@ -451,17 +454,22 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
         ? routeDiag.matchedRequestedModelAgentId
         : undefined
     );
-  // Route-isolated session key:
-  // Bind the OpenClaw session lane to the resolved agent route (or model fallback),
-  // so turns don't accidentally reuse a stale lane that points at a different model.
-  const sessionRoutePart =
+  // Keep `agent:<id>` stable and real so OpenClaw resolves workspace/identity correctly.
+  // Use a separate lane suffix for per-run isolation.
+  const resolvedSessionAgentId =
     resolvedHeaderAgentId?.trim()
     || routeDiag.matchedRequestedModelAgentId?.trim()
-    || routing.sessionAgentPart
-    || `model_${sanitizeSessionPart(model)}`;
-  const runScopedSessionPart = buildRunScopedSessionPart(sessionRoutePart, model, traceId);
+    || routeDiag.configuredAgentId?.trim()
+    || routeDiag.defaultAgentId?.trim()
+    || CLAWTALK_DEFAULT_AGENT_ID;
+  const sessionRoutePart = resolvedSessionAgentId;
+  const runScopedSessionPart = buildRunScopedSessionPart(
+    routing.sessionAgentPart || resolvedSessionAgentId,
+    model,
+    traceId,
+  );
   const extraHeaders: Record<string, string> = {
-    'x-openclaw-session-key': buildTalkSessionKey(talkId, runScopedSessionPart),
+    'x-openclaw-session-key': buildTalkSessionKey(talkId, resolvedSessionAgentId, runScopedSessionPart),
     'x-openclaw-trace-id': traceId,
   };
   if (resolvedHeaderAgentId?.trim()) {
