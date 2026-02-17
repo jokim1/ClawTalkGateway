@@ -282,6 +282,27 @@ async function googleFetchJson(url: string, init: RequestInit, profile?: string)
   return await res.json();
 }
 
+async function googleFetchText(url: string, init: RequestInit, profile?: string): Promise<string> {
+  const token = await getAccessToken(profile);
+  const headers = new Headers(init.headers ?? {});
+  headers.set('Authorization', `Bearer ${token}`);
+
+  const res = await fetch(url, { ...init, headers });
+  if (!res.ok) {
+    const err = await res.text().catch(() => '');
+    throw new Error(`Google API failed (${res.status}): ${err.slice(0, 300)}`);
+  }
+  return await res.text();
+}
+
+function isDocsApiDisabledErrorMessage(message: string): boolean {
+  const m = message.toLowerCase();
+  return (
+    m.includes('google docs api has not been used')
+    || (m.includes('docs.googleapis.com') && m.includes('disabled'))
+  );
+}
+
 async function getDocumentEndIndex(docId: string, profile?: string): Promise<number> {
   const doc = await googleFetchJson(
     `https://docs.googleapis.com/v1/documents/${encodeURIComponent(docId)}`,
@@ -416,14 +437,41 @@ export async function googleDocsRead(params: {
   const documentId = parseDocumentId(params.docId);
   const maxChars = Math.max(500, Math.min(200_000, Number(params.maxChars) || 20_000));
 
-  const doc = await googleFetchJson(
-    `https://docs.googleapis.com/v1/documents/${encodeURIComponent(documentId)}`,
-    { method: 'GET' },
-    params.profile,
-  );
+  let title = 'Untitled';
+  let fullText = '';
+  try {
+    const doc = await googleFetchJson(
+      `https://docs.googleapis.com/v1/documents/${encodeURIComponent(documentId)}`,
+      { method: 'GET' },
+      params.profile,
+    );
+    title = String(doc?.title ?? 'Untitled');
+    fullText = extractDocumentText(doc);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!isDocsApiDisabledErrorMessage(msg)) throw err;
 
-  const title = String(doc?.title ?? 'Untitled');
-  const fullText = extractDocumentText(doc);
+    // Fallback for projects with Drive OAuth configured but Docs API disabled:
+    // export as plain text through Drive API.
+    fullText = (await googleFetchText(
+      `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(documentId)}/export?mimeType=text/plain`,
+      { method: 'GET' },
+      params.profile,
+    )).trim();
+    try {
+      const file = await googleFetchJson(
+        `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(documentId)}?fields=name`,
+        { method: 'GET' },
+        params.profile,
+      );
+      if (typeof file?.name === 'string' && file.name.trim()) {
+        title = file.name.trim();
+      }
+    } catch {
+      // best effort title lookup
+    }
+  }
+
   const truncated = fullText.length > maxChars;
   const text = truncated ? fullText.slice(0, maxChars) : fullText;
 
