@@ -19,6 +19,7 @@ import { sendJson, readJsonBody } from './http.js';
 import { validateSchedule, parseEventTrigger } from './job-scheduler.js';
 import { reconcileSlackRoutingForTalks } from './slack-routing-sync.js';
 import { randomUUID } from 'node:crypto';
+import { googleDocsAuthStatus, upsertGoogleDocsAuthConfig } from './google-docs.js';
 
 type PlatformBindingsValidationResult =
   | { ok: true; bindings: PlatformBinding[]; ownershipKeys: string[] }
@@ -1509,6 +1510,63 @@ async function handleDeleteAgent(ctx: HandlerContext, store: TalkStore, talkId: 
 export async function handleToolRoutes(ctx: HandlerContext, registry: ToolRegistry): Promise<void> {
   const { req, res, url } = ctx;
   const pathname = url.pathname;
+
+  // PATCH /api/tools — built-in tool management actions
+  if (pathname === '/api/tools' && req.method === 'PATCH') {
+    let body:
+      | {
+          action?: 'google_auth_status';
+        }
+      | {
+          action?: 'google_auth_config';
+          refreshToken?: string;
+          clientId?: string;
+          clientSecret?: string;
+          tokenUri?: string;
+        };
+    try {
+      body = (await readJsonBody(req)) as typeof body;
+    } catch {
+      sendJson(res, 400, { error: 'Invalid JSON body' });
+      return;
+    }
+
+    if (body.action === 'google_auth_status') {
+      const status = await googleDocsAuthStatus();
+      sendJson(res, 200, { status });
+      return;
+    }
+
+    if (body.action === 'google_auth_config') {
+      const payload = body as {
+        refreshToken?: string;
+        clientId?: string;
+        clientSecret?: string;
+        tokenUri?: string;
+      };
+      if (
+        payload.refreshToken === undefined
+        && payload.clientId === undefined
+        && payload.clientSecret === undefined
+        && payload.tokenUri === undefined
+      ) {
+        sendJson(res, 400, { error: 'Expected at least one of: refreshToken, clientId, clientSecret, tokenUri' });
+        return;
+      }
+      const updated = await upsertGoogleDocsAuthConfig({
+        refreshToken: payload.refreshToken,
+        clientId: payload.clientId,
+        clientSecret: payload.clientSecret,
+        tokenUri: payload.tokenUri,
+      });
+      const status = await googleDocsAuthStatus();
+      sendJson(res, 200, { updated, status });
+      return;
+    }
+
+    sendJson(res, 400, { error: 'Unknown PATCH /api/tools action' });
+    return;
+  }
 
   // GET /api/tools — list all tools
   if (pathname === '/api/tools' && req.method === 'GET') {

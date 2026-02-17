@@ -9,6 +9,13 @@ import { spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import type { Logger } from './types.js';
 import type { ToolRegistry } from './tool-registry.js';
+import {
+  googleDocsAppend,
+  googleDocsAuthStatus,
+  googleDocsCreate,
+  googleDocsRead,
+  GOOGLE_DOCS_REQUIRED_SCOPES,
+} from './google-docs.js';
 
 /** Maximum output size per tool execution (512KB). */
 const MAX_OUTPUT_BYTES = 512 * 1024;
@@ -70,6 +77,18 @@ export class ToolExecutor {
           break;
         case 'manage_tools':
           result = await this.execManageTools(args);
+          break;
+        case 'google_docs_create':
+          result = await this.execGoogleDocsCreate(args);
+          break;
+        case 'google_docs_append':
+          result = await this.execGoogleDocsAppend(args);
+          break;
+        case 'google_docs_read':
+          result = await this.execGoogleDocsRead(args);
+          break;
+        case 'google_docs_auth_status':
+          result = await this.execGoogleDocsAuthStatus();
           break;
         default:
           // Dynamic tools — execute via shell_exec with the tool's command template
@@ -256,6 +275,130 @@ export class ToolExecutor {
           content: `Unknown action: "${action}". Valid actions: register, update, remove, list`,
           durationMs: 0,
         };
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Google Docs tools
+  // -------------------------------------------------------------------------
+
+  private async execGoogleDocsCreate(args: Record<string, unknown>): Promise<ToolExecResult> {
+    const title = String(args.title ?? '').trim();
+    if (!title) {
+      return { success: false, content: 'Missing required field: title', durationMs: 0 };
+    }
+    const content = args.content === undefined ? undefined : String(args.content);
+    const folderId = args.folder_id === undefined ? undefined : String(args.folder_id).trim();
+
+    try {
+      const created = await googleDocsCreate({
+        title,
+        content,
+        folderId: folderId || undefined,
+      });
+      return {
+        success: true,
+        content:
+          `Created Google Doc successfully.\n` +
+          `Title: ${created.title}\n` +
+          `Document ID: ${created.documentId}\n` +
+          `URL: ${created.url}`,
+        durationMs: 0,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        success: false,
+        content:
+          `google_docs_create failed: ${msg}\n` +
+          `Required OAuth scopes: ${GOOGLE_DOCS_REQUIRED_SCOPES.join(', ')}`,
+        durationMs: 0,
+      };
+    }
+  }
+
+  private async execGoogleDocsAppend(args: Record<string, unknown>): Promise<ToolExecResult> {
+    const docId = String(args.doc_id ?? '').trim();
+    const text = String(args.text ?? '');
+    if (!docId || !text.trim()) {
+      return { success: false, content: 'Missing required fields: doc_id, text', durationMs: 0 };
+    }
+
+    try {
+      const appended = await googleDocsAppend({ docId, text });
+      return {
+        success: true,
+        content:
+          `Appended text to Google Doc.\n` +
+          `Document ID: ${appended.documentId}\n` +
+          `Appended characters: ${appended.appendedChars}\n` +
+          `URL: ${appended.url}`,
+        durationMs: 0,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        success: false,
+        content:
+          `google_docs_append failed: ${msg}\n` +
+          `Required OAuth scopes: ${GOOGLE_DOCS_REQUIRED_SCOPES.join(', ')}`,
+        durationMs: 0,
+      };
+    }
+  }
+
+  private async execGoogleDocsRead(args: Record<string, unknown>): Promise<ToolExecResult> {
+    const docId = String(args.doc_id ?? '').trim();
+    const maxChars = args.max_chars === undefined ? undefined : Number(args.max_chars);
+    if (!docId) {
+      return { success: false, content: 'Missing required field: doc_id', durationMs: 0 };
+    }
+
+    try {
+      const read = await googleDocsRead({ docId, maxChars });
+      return {
+        success: true,
+        content:
+          `Google Doc: ${read.title}\n` +
+          `Document ID: ${read.documentId}\n` +
+          `URL: ${read.url}\n` +
+          `Truncated: ${read.truncated ? 'yes' : 'no'}\n\n` +
+          read.text,
+        durationMs: 0,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        success: false,
+        content:
+          `google_docs_read failed: ${msg}\n` +
+          `Required OAuth scopes: ${GOOGLE_DOCS_REQUIRED_SCOPES.join(', ')}`,
+        durationMs: 0,
+      };
+    }
+  }
+
+  private async execGoogleDocsAuthStatus(): Promise<ToolExecResult> {
+    try {
+      const status = await googleDocsAuthStatus();
+      return {
+        success: status.accessTokenReady,
+        content:
+          `Google Docs auth status:\n` +
+          `Token path: ${status.tokenPath}\n` +
+          `hasClientId: ${status.hasClientId}\n` +
+          `hasClientSecret: ${status.hasClientSecret}\n` +
+          `hasRefreshToken: ${status.hasRefreshToken}\n` +
+          `accessTokenReady: ${status.accessTokenReady}\n` +
+          (status.error ? `error: ${status.error}` : 'error: (none)'),
+        durationMs: 0,
+      };
+    } catch (err) {
+      return {
+        success: false,
+        content: `google_docs_auth_status failed: ${err instanceof Error ? err.message : String(err)}`,
+        durationMs: 0,
+      };
     }
   }
 }

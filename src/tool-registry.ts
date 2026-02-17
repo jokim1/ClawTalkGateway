@@ -105,9 +105,100 @@ const MANAGE_TOOLS_TOOL: ToolDefinition = {
   },
 };
 
+const GOOGLE_DOCS_CREATE_TOOL: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'google_docs_create',
+    description:
+      'Create a Google Doc with a title, optionally seed it with initial text, ' +
+      'and optionally move it into a Drive folder. Requires configured Google OAuth token.',
+    parameters: {
+      type: 'object',
+      properties: {
+        title: {
+          type: 'string',
+          description: 'Document title.',
+        },
+        content: {
+          type: 'string',
+          description: 'Optional initial document content.',
+        },
+        folder_id: {
+          type: 'string',
+          description: 'Optional Google Drive folder ID to move the document into.',
+        },
+      },
+      required: ['title'],
+    },
+  },
+};
+
+const GOOGLE_DOCS_APPEND_TOOL: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'google_docs_append',
+    description:
+      'Append text to an existing Google Doc. Accepts either a raw doc ID or full Google Docs URL.',
+    parameters: {
+      type: 'object',
+      properties: {
+        doc_id: {
+          type: 'string',
+          description: 'Google Docs document ID or full docs.google.com document URL.',
+        },
+        text: {
+          type: 'string',
+          description: 'Text to append at the end of the document.',
+        },
+      },
+      required: ['doc_id', 'text'],
+    },
+  },
+};
+
+const GOOGLE_DOCS_READ_TOOL: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'google_docs_read',
+    description:
+      'Read text content from a Google Doc. Accepts either a raw doc ID or full Google Docs URL.',
+    parameters: {
+      type: 'object',
+      properties: {
+        doc_id: {
+          type: 'string',
+          description: 'Google Docs document ID or full docs.google.com document URL.',
+        },
+        max_chars: {
+          type: 'number',
+          description: 'Optional max characters to return (default 20000).',
+        },
+      },
+      required: ['doc_id'],
+    },
+  },
+};
+
+const GOOGLE_DOCS_AUTH_STATUS_TOOL: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'google_docs_auth_status',
+    description:
+      'Check Google Docs OAuth readiness for this gateway (token file/env presence + access token refresh test).',
+    parameters: {
+      type: 'object',
+      properties: {},
+    },
+  },
+};
+
 const BUILTIN_TOOLS = new Map<string, ToolDefinition>([
   ['shell_exec', SHELL_EXEC_TOOL],
   ['manage_tools', MANAGE_TOOLS_TOOL],
+  ['google_docs_create', GOOGLE_DOCS_CREATE_TOOL],
+  ['google_docs_append', GOOGLE_DOCS_APPEND_TOOL],
+  ['google_docs_read', GOOGLE_DOCS_READ_TOOL],
+  ['google_docs_auth_status', GOOGLE_DOCS_AUTH_STATUS_TOOL],
 ]);
 
 // ---------------------------------------------------------------------------
