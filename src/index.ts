@@ -808,8 +808,8 @@ const plugin = {
             }
 
             const requestedAccount = (url.searchParams.get('accountId')?.trim().toLowerCase() || undefined);
-            const requestedLimit = parseInt(url.searchParams.get('limit') ?? '50', 10);
-            const limit = Number.isFinite(requestedLimit) ? Math.min(200, Math.max(1, requestedLimit)) : 50;
+            const requestedLimit = parseInt(url.searchParams.get('limit') ?? '200', 10);
+            const limit = Number.isFinite(requestedLimit) ? Math.min(1000, Math.max(1, requestedLimit)) : 200;
 
             const accounts = listSlackAccountOptions(cfg);
             const selectedAccountId = requestedAccount

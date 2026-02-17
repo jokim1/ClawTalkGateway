@@ -591,14 +591,15 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
 
   if (isModelQuestion) {
     const effectiveAgentId = resolvedHeaderAgentId ?? resolvedSessionAgentId ?? '-';
-    const effectiveAgentModel = routeDiag.matchedRequestedModelAgentModel
-      ?? routeDiag.configuredAgentModel
+    const effectiveAgentModel = model;
+    const routedAgentDefaultModel = routeDiag.configuredAgentModel
       ?? routeDiag.defaultAgentModel
-      ?? model;
+      ?? '-';
     const directReply =
       `Requested model: ${model}\n` +
       `Effective agent route: ${effectiveAgentId}\n` +
-      `Effective agent model: ${effectiveAgentModel}`;
+      `Effective agent model: ${effectiveAgentModel}\n` +
+      `Routed agent default model: ${routedAgentDefaultModel}`;
 
     // Return deterministic model-routing truth without invoking the LLM.
     res.write(`data: ${JSON.stringify({
