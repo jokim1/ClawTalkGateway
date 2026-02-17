@@ -717,6 +717,21 @@ const plugin = {
           return true;
         }
 
+        // =================================================================
+        // GET /api/tools/google/oauth/callback — unauthenticated OAuth callback
+        // =================================================================
+        if (url.pathname === '/api/tools/google/oauth/callback') {
+          if (req.method !== 'GET') {
+            sendJson(res, 405, { error: 'Method not allowed' });
+            return true;
+          }
+          const { handleGoogleOAuthCallback } = await import('./talks.js');
+          const cfg = api.runtime.config.loadConfig();
+          const ctx = { req, res, url, cfg, pluginCfg, logger: api.logger };
+          await handleGoogleOAuthCallback(ctx);
+          return true;
+        }
+
         // Auth (all other routes require authorization)
         const cfg = api.runtime.config.loadConfig();
         if (!authorize(req, cfg)) {

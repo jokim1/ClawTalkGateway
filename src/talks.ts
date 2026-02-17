@@ -20,10 +20,13 @@ import { validateSchedule, parseEventTrigger } from './job-scheduler.js';
 import { reconcileSlackRoutingForTalks } from './slack-routing-sync.js';
 import { randomUUID } from 'node:crypto';
 import {
+  completeGoogleOAuthConnect,
+  getGoogleOAuthConnectSessionStatus,
   googleDocsAuthStatus,
   googleDocsAuthStatusForProfile,
   listGoogleDocsAuthProfiles,
   setGoogleDocsActiveProfile,
+  startGoogleOAuthConnect,
   upsertGoogleDocsAuthConfig,
 } from './google-docs.js';
 import { getToolCatalog } from './tool-catalog.js';
@@ -1623,6 +1626,32 @@ async function handleDeleteAgent(ctx: HandlerContext, store: TalkStore, talkId: 
 // Tool handlers
 // ---------------------------------------------------------------------------
 
+export async function handleGoogleOAuthCallback(ctx: HandlerContext): Promise<void> {
+  const state = ctx.url.searchParams.get('state')?.trim() ?? '';
+  const code = ctx.url.searchParams.get('code')?.trim() ?? undefined;
+  const error = ctx.url.searchParams.get('error')?.trim() ?? undefined;
+
+  const result = await completeGoogleOAuthConnect({ state, code, error });
+  const html = result.ok
+    ? `<!doctype html><html><head><meta charset="utf-8"><title>Google Connected</title></head>
+       <body style="font-family: sans-serif; padding: 24px;">
+       <h2>Google account connected</h2>
+       <p>Profile: <b>${result.profile ?? 'default'}</b></p>
+       <p>Account: <b>${result.accountEmail ?? '(unknown)'}</b></p>
+       <p>You can close this tab and return to ClawTalk.</p>
+       </body></html>`
+    : `<!doctype html><html><head><meta charset="utf-8"><title>Google Connect Failed</title></head>
+       <body style="font-family: sans-serif; padding: 24px;">
+       <h2>Google connect failed</h2>
+       <p>${result.error ?? 'Unknown error'}</p>
+       <p>You can close this tab and retry from ClawTalk.</p>
+       </body></html>`;
+
+  ctx.res.statusCode = result.ok ? 200 : 400;
+  ctx.res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  ctx.res.end(html);
+}
+
 /**
  * Route /api/tools requests for managing the tool registry.
  */
@@ -1630,6 +1659,44 @@ export async function handleToolRoutes(ctx: HandlerContext, registry: ToolRegist
   const { req, res, url } = ctx;
   const pathname = url.pathname;
   const catalog = getToolCatalog(ctx.pluginCfg.dataDir, ctx.logger);
+
+  // POST /api/tools/google/oauth/start — start browser OAuth flow.
+  if (pathname === '/api/tools/google/oauth/start' && req.method === 'POST') {
+    let body: { profile?: string };
+    try {
+      body = (await readJsonBody(req)) as typeof body;
+    } catch {
+      sendJson(res, 400, { error: 'Invalid JSON body' });
+      return;
+    }
+    const profile = normalizeGoogleAuthProfileInput(body.profile);
+    if (body.profile !== undefined && !profile) {
+      sendJson(res, 400, { error: 'profile must be a non-empty string when provided' });
+      return;
+    }
+    const proto = (ctx.req.headers['x-forwarded-proto'] as string | undefined)?.split(',')[0]?.trim()
+      || ((ctx.req.socket as any)?.encrypted ? 'https' : 'http');
+    const host = ctx.req.headers.host ?? 'localhost:18789';
+    const redirectUri = `${proto}://${host}/api/tools/google/oauth/callback`;
+    try {
+      const started = await startGoogleOAuthConnect({ redirectUri, profile: profile || undefined });
+      sendJson(res, 200, started);
+    } catch (err) {
+      sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+    }
+    return;
+  }
+
+  // GET /api/tools/google/oauth/status?sessionId=... — poll connection result.
+  if (pathname === '/api/tools/google/oauth/status' && req.method === 'GET') {
+    const sessionId = url.searchParams.get('sessionId')?.trim() ?? '';
+    if (!sessionId) {
+      sendJson(res, 400, { error: 'Missing query param: sessionId' });
+      return;
+    }
+    sendJson(res, 200, getGoogleOAuthConnectSessionStatus(sessionId));
+    return;
+  }
 
   // PATCH /api/tools — built-in tool management actions
   if (pathname === '/api/tools' && req.method === 'PATCH') {

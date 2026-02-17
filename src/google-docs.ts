@@ -1,6 +1,7 @@
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import { homedir } from 'node:os';
+import { randomUUID } from 'node:crypto';
 
 type OAuthTokenFile = {
   client_id?: string;
@@ -21,12 +22,52 @@ const DEFAULT_TOKEN_PATH = path.join(homedir(), '.openclaw', 'workspace', 'gdocs
 const GOOGLE_DOCS_SCOPE = 'https://www.googleapis.com/auth/documents';
 const GOOGLE_DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive';
 const DEFAULT_PROFILE = 'default';
+const OAUTH_SESSION_TTL_MS = 10 * 60_000;
+
+type OAuthConnectSession = {
+  id: string;
+  state: string;
+  profile?: string;
+  redirectUri: string;
+  createdAt: number;
+  status: 'pending' | 'success' | 'error';
+  error?: string;
+  profileResolved?: string;
+  accountEmail?: string;
+  accountDisplayName?: string;
+};
+
+const oauthSessions = new Map<string, OAuthConnectSession>();
 
 function normalizeProfileName(raw: string | undefined): string {
   const trimmed = (raw ?? '').trim().toLowerCase();
   if (!trimmed) return DEFAULT_PROFILE;
   const normalized = trimmed.replace(/[^a-z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '');
   return normalized || DEFAULT_PROFILE;
+}
+
+function normalizeProfileFromEmail(email: string): string {
+  const local = email.split('@')[0] ?? '';
+  const domain = email.split('@')[1] ?? '';
+  const base = `${local}-${domain}`.toLowerCase();
+  const normalized = base.replace(/[^a-z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '');
+  return normalized || DEFAULT_PROFILE;
+}
+
+function cleanupOAuthSessions(now = Date.now()): void {
+  for (const [id, session] of oauthSessions.entries()) {
+    if (now - session.createdAt > OAUTH_SESSION_TTL_MS) {
+      oauthSessions.delete(id);
+    }
+  }
+}
+
+function findOAuthSessionByState(state: string): OAuthConnectSession | undefined {
+  cleanupOAuthSessions();
+  for (const session of oauthSessions.values()) {
+    if (session.state === state) return session;
+  }
+  return undefined;
 }
 
 function resolveTokenPath(): string {
@@ -104,6 +145,23 @@ function mergeEnvOAuthOverrides(profile: string, record: OAuthTokenFile): OAuthT
     ...(process.env.GOOGLE_OAUTH_REFRESH_TOKEN?.trim() ? { refresh_token: process.env.GOOGLE_OAUTH_REFRESH_TOKEN.trim() } : {}),
     ...(process.env.GOOGLE_OAUTH_TOKEN_URI?.trim() ? { token_uri: process.env.GOOGLE_OAUTH_TOKEN_URI.trim() } : {}),
   };
+}
+
+function getOAuthClientConfig(profile: string, record: OAuthTokenFile): {
+  clientId: string;
+  clientSecret: string;
+  tokenUri: string;
+} {
+  const auth = mergeEnvOAuthOverrides(profile, record);
+  const clientId = auth.client_id?.trim() ?? '';
+  const clientSecret = auth.client_secret?.trim() ?? '';
+  const tokenUri = auth.token_uri?.trim() || 'https://oauth2.googleapis.com/token';
+  if (!clientId || !clientSecret) {
+    throw new Error(
+      `Google OAuth client is not configured for profile "${profile}". Set client_id and client_secret first.`,
+    );
+  }
+  return { clientId, clientSecret, tokenUri };
 }
 
 async function refreshAccessToken(profile: string, record: OAuthTokenFile): Promise<{ accessToken: string; expiresIn?: number }> {
@@ -786,4 +844,231 @@ export async function setGoogleDocsActiveProfile(profile: string): Promise<{ tok
   };
   await saveTokenStore(tokenPath, nextStore);
   return { tokenPath, activeProfile: normalized };
+}
+
+export async function startGoogleOAuthConnect(input: {
+  redirectUri: string;
+  profile?: string;
+}): Promise<{ sessionId: string; authUrl: string; profile?: string; expiresAt: number }> {
+  const redirectUri = input.redirectUri.trim();
+  if (!redirectUri) {
+    throw new Error('redirectUri is required.');
+  }
+  const { store } = await loadTokenStore().catch(() => ({
+    store: {
+      version: 2,
+      activeProfile: DEFAULT_PROFILE,
+      profiles: { [DEFAULT_PROFILE]: {} },
+    } as OAuthTokenStore,
+  }));
+  const requestedProfile = input.profile?.trim() ? normalizeProfileName(input.profile) : undefined;
+  const activeProfile = normalizeProfileName(store.activeProfile);
+  const candidateProfile = requestedProfile ?? activeProfile;
+  const record = (store.profiles ?? {})[candidateProfile] ?? {};
+  const { clientId } = getOAuthClientConfig(candidateProfile, record);
+
+  const sessionId = randomUUID();
+  const state = randomUUID();
+  const now = Date.now();
+  oauthSessions.set(sessionId, {
+    id: sessionId,
+    state,
+    profile: requestedProfile,
+    redirectUri,
+    createdAt: now,
+    status: 'pending',
+  });
+  cleanupOAuthSessions(now);
+
+  const authUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+  authUrl.searchParams.set('client_id', clientId);
+  authUrl.searchParams.set('redirect_uri', redirectUri);
+  authUrl.searchParams.set('response_type', 'code');
+  authUrl.searchParams.set('scope', `${GOOGLE_DOCS_SCOPE} ${GOOGLE_DRIVE_SCOPE}`);
+  authUrl.searchParams.set('access_type', 'offline');
+  authUrl.searchParams.set('prompt', 'consent');
+  authUrl.searchParams.set('include_granted_scopes', 'true');
+  authUrl.searchParams.set('state', state);
+
+  return {
+    sessionId,
+    authUrl: authUrl.toString(),
+    ...(requestedProfile ? { profile: requestedProfile } : {}),
+    expiresAt: now + OAUTH_SESSION_TTL_MS,
+  };
+}
+
+export async function completeGoogleOAuthConnect(input: {
+  state: string;
+  code?: string;
+  error?: string;
+}): Promise<{
+  ok: boolean;
+  sessionId?: string;
+  profile?: string;
+  accountEmail?: string;
+  accountDisplayName?: string;
+  error?: string;
+}> {
+  const state = input.state.trim();
+  if (!state) return { ok: false, error: 'Missing state.' };
+  const session = findOAuthSessionByState(state);
+  if (!session) return { ok: false, error: 'OAuth session not found or expired.' };
+
+  if (input.error) {
+    session.status = 'error';
+    session.error = `OAuth provider error: ${input.error}`;
+    oauthSessions.set(session.id, session);
+    return { ok: false, sessionId: session.id, error: session.error };
+  }
+  const code = input.code?.trim() ?? '';
+  if (!code) {
+    session.status = 'error';
+    session.error = 'Missing authorization code.';
+    oauthSessions.set(session.id, session);
+    return { ok: false, sessionId: session.id, error: session.error };
+  }
+
+  const tokenPath = resolveTokenPath();
+  let store: OAuthTokenStore = {
+    version: 2,
+    activeProfile: DEFAULT_PROFILE,
+    profiles: { [DEFAULT_PROFILE]: {} },
+  };
+  try {
+    const loaded = await loadTokenStore();
+    store = loaded.store;
+  } catch {
+    // keep default empty store
+  }
+
+  const targetProfile = session.profile
+    ? normalizeProfileName(session.profile)
+    : normalizeProfileName(store.activeProfile);
+  const targetRecord = { ...((store.profiles ?? {})[targetProfile] ?? {}) };
+  let clientCfg;
+  try {
+    clientCfg = getOAuthClientConfig(targetProfile, targetRecord);
+  } catch (err) {
+    session.status = 'error';
+    session.error = err instanceof Error ? err.message : String(err);
+    oauthSessions.set(session.id, session);
+    return { ok: false, sessionId: session.id, error: session.error };
+  }
+
+  const body = new URLSearchParams({
+    client_id: clientCfg.clientId,
+    client_secret: clientCfg.clientSecret,
+    code,
+    grant_type: 'authorization_code',
+    redirect_uri: session.redirectUri,
+  });
+  const tokenRes = await fetch(clientCfg.tokenUri, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  });
+  if (!tokenRes.ok) {
+    const errBody = await tokenRes.text().catch(() => '');
+    session.status = 'error';
+    session.error = `Token exchange failed (${tokenRes.status}): ${errBody.slice(0, 400)}`;
+    oauthSessions.set(session.id, session);
+    return { ok: false, sessionId: session.id, error: session.error };
+  }
+  const tokenJson = await tokenRes.json() as {
+    access_token?: string;
+    refresh_token?: string;
+    expires_in?: number;
+  };
+
+  const refreshToken = tokenJson.refresh_token?.trim() || targetRecord.refresh_token?.trim() || '';
+  if (!refreshToken) {
+    session.status = 'error';
+    session.error = 'Google token response did not include a refresh_token.';
+    oauthSessions.set(session.id, session);
+    return { ok: false, sessionId: session.id, error: session.error };
+  }
+
+  const accessToken = tokenJson.access_token?.trim() || '';
+  let accountEmail: string | undefined;
+  let accountDisplayName: string | undefined;
+  if (accessToken) {
+    try {
+      const aboutRes = await fetch(
+        'https://www.googleapis.com/drive/v3/about?fields=user(emailAddress,displayName)',
+        { headers: { Authorization: `Bearer ${accessToken}` } },
+      );
+      if (aboutRes.ok) {
+        const about = await aboutRes.json() as any;
+        accountEmail = typeof about?.user?.emailAddress === 'string' ? about.user.emailAddress : undefined;
+        accountDisplayName = typeof about?.user?.displayName === 'string' ? about.user.displayName : undefined;
+      }
+    } catch {
+      // best effort
+    }
+  }
+
+  const resolvedProfile = session.profile
+    ? targetProfile
+    : (accountEmail ? normalizeProfileFromEmail(accountEmail) : targetProfile);
+
+  const nextStore: OAuthTokenStore = {
+    version: 2,
+    activeProfile: normalizeProfileName(store.activeProfile),
+    profiles: { ...(store.profiles ?? {}) },
+  };
+  const nextRecord: OAuthTokenFile = {
+    ...(nextStore.profiles ?? {})[resolvedProfile] ?? {},
+    client_id: clientCfg.clientId,
+    client_secret: clientCfg.clientSecret,
+    token_uri: clientCfg.tokenUri,
+    refresh_token: refreshToken,
+    ...(accessToken ? { access_token: accessToken } : {}),
+  };
+  if (typeof tokenJson.expires_in === 'number' && accessToken) {
+    nextRecord.expiry_date = Date.now() + tokenJson.expires_in * 1000;
+  } else {
+    delete nextRecord.expiry_date;
+  }
+  nextStore.profiles = {
+    ...(nextStore.profiles ?? {}),
+    [resolvedProfile]: nextRecord,
+  };
+  await saveTokenStore(tokenPath, nextStore);
+
+  session.status = 'success';
+  session.profileResolved = resolvedProfile;
+  session.accountEmail = accountEmail;
+  session.accountDisplayName = accountDisplayName;
+  oauthSessions.set(session.id, session);
+  return {
+    ok: true,
+    sessionId: session.id,
+    profile: resolvedProfile,
+    ...(accountEmail ? { accountEmail } : {}),
+    ...(accountDisplayName ? { accountDisplayName } : {}),
+  };
+}
+
+export function getGoogleOAuthConnectSessionStatus(sessionId: string): {
+  found: boolean;
+  status?: 'pending' | 'success' | 'error';
+  profile?: string;
+  accountEmail?: string;
+  accountDisplayName?: string;
+  error?: string;
+  expiresAt?: number;
+} {
+  cleanupOAuthSessions();
+  const session = oauthSessions.get(sessionId.trim());
+  if (!session) return { found: false };
+  return {
+    found: true,
+    status: session.status,
+    profile: session.profileResolved ?? session.profile,
+    ...(session.accountEmail ? { accountEmail: session.accountEmail } : {}),
+    ...(session.accountDisplayName ? { accountDisplayName: session.accountDisplayName } : {}),
+    ...(session.error ? { error: session.error } : {}),
+    expiresAt: session.createdAt + OAUTH_SESSION_TTL_MS,
+  };
 }
