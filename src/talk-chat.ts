@@ -95,6 +95,32 @@ function hasExplicitToolApproval(message: string): boolean {
   );
 }
 
+function isGoogleDriveIntent(message: string): boolean {
+  const text = message.trim().toLowerCase();
+  if (!text) return false;
+  return (
+    /\bgoogle drive\b/.test(text)
+    || /\bgdrive\b/.test(text)
+    || /\bdrive files?\b/.test(text)
+    || /\brecent files?\b/.test(text)
+  );
+}
+
+function prioritizeTurnToolInfos(tools: ToolInfo[], message: string): ToolInfo[] {
+  if (!isGoogleDriveIntent(message)) return tools;
+  const hasDriveTool = tools.some((tool) => tool.name.trim().toLowerCase() === 'google_drive_files');
+  if (!hasDriveTool) return tools;
+  const blockedForDriveIntent = new Set([
+    'exec',
+    'shell_exec',
+    'manage_tools',
+    'read',
+    'write',
+    'edit',
+  ]);
+  return tools.filter((tool) => !blockedForDriveIntent.has(tool.name.trim().toLowerCase()));
+}
+
 function filterToolInfos(
   tools: ToolInfo[],
   allow: string[] | undefined,
@@ -278,11 +304,11 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
     );
   const catalog = getToolCatalog(dataDir, logger);
   const globallyEnabledTools = catalog.filterEnabledTools(registry.listTools());
-  const availableToolInfos = filterToolInfos(
+  const availableToolInfos = prioritizeTurnToolInfos(filterToolInfos(
     globallyEnabledTools,
     meta.toolsAllow,
     meta.toolsDeny,
-  );
+  ), body.message);
 
   // Load context and pinned messages
   const contextMd = await store.getContextMd(talkId);
