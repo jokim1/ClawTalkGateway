@@ -90,6 +90,9 @@ export class ToolExecutor {
         case 'google_docs_auth_status':
           result = await this.execGoogleDocsAuthStatus();
           break;
+        case 'web_fetch_extract':
+          result = await this.execWebFetchExtract(args);
+          break;
         default:
           // Dynamic tools — execute via shell_exec with the tool's command template
           result = {
@@ -399,6 +402,95 @@ export class ToolExecutor {
         content: `google_docs_auth_status failed: ${err instanceof Error ? err.message : String(err)}`,
         durationMs: 0,
       };
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Web fetch
+  // -------------------------------------------------------------------------
+
+  private async execWebFetchExtract(args: Record<string, unknown>): Promise<ToolExecResult> {
+    const urlRaw = String(args.url ?? '').trim();
+    if (!urlRaw) {
+      return { success: false, content: 'Missing required field: url', durationMs: 0 };
+    }
+
+    let parsed: URL;
+    try {
+      parsed = new URL(urlRaw);
+    } catch {
+      return { success: false, content: `Invalid URL: ${urlRaw}`, durationMs: 0 };
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return { success: false, content: 'Only http:// and https:// URLs are supported.', durationMs: 0 };
+    }
+
+    const maxChars = Math.min(50_000, Math.max(500, Number(args.max_chars) || 12_000));
+    const timeoutS = Math.min(60, Math.max(1, Number(args.timeout) || 15));
+
+    try {
+      const res = await fetch(parsed, {
+        method: 'GET',
+        headers: { 'User-Agent': 'ClawTalkGateway/1.0 (+tool:web_fetch_extract)' },
+        signal: AbortSignal.timeout(timeoutS * 1000),
+      });
+      if (!res.ok) {
+        return {
+          success: false,
+          content: `Fetch failed with HTTP ${res.status} ${res.statusText}`,
+          durationMs: 0,
+        };
+      }
+
+      const contentType = (res.headers.get('content-type') ?? '').toLowerCase();
+      const body = await res.text();
+      let text = body;
+      let title = '';
+
+      if (contentType.includes('text/html') || /<html[\s>]/i.test(body)) {
+        const titleMatch = body.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+        title = titleMatch?.[1]?.replace(/\s+/g, ' ').trim() ?? '';
+        text = body
+          .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+          .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+          .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/&nbsp;/gi, ' ')
+          .replace(/&amp;/gi, '&')
+          .replace(/&lt;/gi, '<')
+          .replace(/&gt;/gi, '>')
+          .replace(/\s+/g, ' ')
+          .trim();
+      } else if (contentType.includes('application/json')) {
+        try {
+          text = JSON.stringify(JSON.parse(body), null, 2);
+        } catch {
+          text = body;
+        }
+      } else {
+        text = body.replace(/\s+/g, ' ').trim();
+      }
+
+      if (!text) {
+        return { success: true, content: 'Fetched successfully, but no readable text was extracted.', durationMs: 0 };
+      }
+
+      const clipped = text.length > maxChars;
+      const output = text.slice(0, maxChars);
+      const meta =
+        `URL: ${parsed.toString()}\n` +
+        (title ? `Title: ${title}\n` : '') +
+        `Content-Type: ${contentType || '(unknown)'}\n` +
+        `Characters: ${text.length}${clipped ? ` (clipped to ${maxChars})` : ''}\n`;
+
+      return {
+        success: true,
+        content: `${meta}\n${output}`,
+        durationMs: 0,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { success: false, content: `web_fetch_extract failed: ${msg}`, durationMs: 0 };
     }
   }
 }

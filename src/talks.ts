@@ -20,6 +20,7 @@ import { validateSchedule, parseEventTrigger } from './job-scheduler.js';
 import { reconcileSlackRoutingForTalks } from './slack-routing-sync.js';
 import { randomUUID } from 'node:crypto';
 import { googleDocsAuthStatus, upsertGoogleDocsAuthConfig } from './google-docs.js';
+import { getToolCatalog } from './tool-catalog.js';
 
 type PlatformBindingsValidationResult =
   | { ok: true; bindings: PlatformBinding[]; ownershipKeys: string[] }
@@ -1014,11 +1015,13 @@ function selectTalkTools(
   allTools: Array<{ name: string; description: string; builtin: boolean }>,
   allow: string[] | undefined,
   deny: string[] | undefined,
+  isToolEnabled?: (toolName: string) => boolean,
 ): Array<{ name: string; description: string; builtin: boolean }> {
   const allowSet = new Set((allow ?? []).map((n) => n.toLowerCase()));
   const denySet = new Set((deny ?? []).map((n) => n.toLowerCase()));
   return allTools.filter((tool) => {
     const key = tool.name.toLowerCase();
+    if (isToolEnabled && !isToolEnabled(key)) return false;
     if (denySet.has(key)) return false;
     if (allowSet.size > 0 && !allowSet.has(key)) return false;
     return true;
@@ -1036,7 +1039,9 @@ async function handleGetTalkTools(
     sendJson(ctx.res, 404, { error: 'Talk not found' });
     return;
   }
-  const allTools = registry?.listTools() ?? [];
+  const catalog = getToolCatalog(ctx.pluginCfg.dataDir, ctx.logger);
+  const registeredTools = registry?.listTools() ?? [];
+  const allTools = catalog.filterEnabledTools(registeredTools);
   const enabledTools = selectTalkTools(allTools, talk.toolsAllow, talk.toolsDeny);
   sendJson(ctx.res, 200, {
     talkId,
@@ -1090,7 +1095,9 @@ async function handleUpdateTalkTools(
     return;
   }
 
-  const allTools = registry?.listTools() ?? [];
+  const catalog = getToolCatalog(ctx.pluginCfg.dataDir, ctx.logger);
+  const registeredTools = registry?.listTools() ?? [];
+  const allTools = catalog.filterEnabledTools(registeredTools);
   const enabledTools = selectTalkTools(allTools, updated.toolsAllow, updated.toolsDeny);
   sendJson(ctx.res, 200, {
     talkId,
@@ -1535,6 +1542,7 @@ async function handleDeleteAgent(ctx: HandlerContext, store: TalkStore, talkId: 
 export async function handleToolRoutes(ctx: HandlerContext, registry: ToolRegistry): Promise<void> {
   const { req, res, url } = ctx;
   const pathname = url.pathname;
+  const catalog = getToolCatalog(ctx.pluginCfg.dataDir, ctx.logger);
 
   // PATCH /api/tools — built-in tool management actions
   if (pathname === '/api/tools' && req.method === 'PATCH') {
@@ -1595,7 +1603,72 @@ export async function handleToolRoutes(ctx: HandlerContext, registry: ToolRegist
 
   // GET /api/tools — list all tools
   if (pathname === '/api/tools' && req.method === 'GET') {
-    sendJson(res, 200, { tools: registry.listTools() });
+    const tools = registry.listTools();
+    const catalogEntries = catalog.list(tools);
+    sendJson(res, 200, {
+      tools,
+      installedTools: catalog.filterEnabledTools(tools),
+      catalog: catalogEntries,
+      installedCatalogIds: catalog.getInstalledIds(),
+    });
+    return;
+  }
+
+  // GET /api/tools/catalog — list tool catalog + installed state
+  if (pathname === '/api/tools/catalog' && req.method === 'GET') {
+    const tools = registry.listTools();
+    sendJson(res, 200, {
+      catalog: catalog.list(tools),
+      installedCatalogIds: catalog.getInstalledIds(),
+      installedTools: catalog.filterEnabledTools(tools),
+      registeredTools: tools,
+    });
+    return;
+  }
+
+  // POST /api/tools/catalog/install — install a catalog tool by id
+  if (pathname === '/api/tools/catalog/install' && req.method === 'POST') {
+    let body: { id?: string };
+    try {
+      body = (await readJsonBody(req)) as typeof body;
+    } catch {
+      sendJson(res, 400, { error: 'Invalid JSON body' });
+      return;
+    }
+    const id = body.id?.trim();
+    if (!id) {
+      sendJson(res, 400, { error: 'Missing required field: id' });
+      return;
+    }
+    const result = catalog.install(id, registry.listTools());
+    if (!result.ok) {
+      sendJson(res, 409, { error: result.error ?? 'Install failed' });
+      return;
+    }
+    sendJson(res, 200, { ok: true, installed: result.entry });
+    return;
+  }
+
+  // POST /api/tools/catalog/uninstall — uninstall a catalog tool by id
+  if (pathname === '/api/tools/catalog/uninstall' && req.method === 'POST') {
+    let body: { id?: string };
+    try {
+      body = (await readJsonBody(req)) as typeof body;
+    } catch {
+      sendJson(res, 400, { error: 'Invalid JSON body' });
+      return;
+    }
+    const id = body.id?.trim();
+    if (!id) {
+      sendJson(res, 400, { error: 'Missing required field: id' });
+      return;
+    }
+    const result = catalog.uninstall(id, registry.listTools());
+    if (!result.ok) {
+      sendJson(res, 404, { error: result.error ?? 'Uninstall failed' });
+      return;
+    }
+    sendJson(res, 200, { ok: true, uninstalled: result.entry });
     return;
   }
 

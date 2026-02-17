@@ -192,6 +192,34 @@ const GOOGLE_DOCS_AUTH_STATUS_TOOL: ToolDefinition = {
   },
 };
 
+const WEB_FETCH_EXTRACT_TOOL: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'web_fetch_extract',
+    description:
+      'Fetch a URL and return cleaned text content for summarization/research. ' +
+      'Supports HTML, plain text, and JSON responses.',
+    parameters: {
+      type: 'object',
+      properties: {
+        url: {
+          type: 'string',
+          description: 'HTTP(S) URL to fetch.',
+        },
+        max_chars: {
+          type: 'number',
+          description: 'Optional max characters to return (default 12000, max 50000).',
+        },
+        timeout: {
+          type: 'number',
+          description: 'Optional timeout in seconds (default 15, max 60).',
+        },
+      },
+      required: ['url'],
+    },
+  },
+};
+
 const BUILTIN_TOOLS = new Map<string, ToolDefinition>([
   ['shell_exec', SHELL_EXEC_TOOL],
   ['manage_tools', MANAGE_TOOLS_TOOL],
@@ -199,6 +227,7 @@ const BUILTIN_TOOLS = new Map<string, ToolDefinition>([
   ['google_docs_append', GOOGLE_DOCS_APPEND_TOOL],
   ['google_docs_read', GOOGLE_DOCS_READ_TOOL],
   ['google_docs_auth_status', GOOGLE_DOCS_AUTH_STATUS_TOOL],
+  ['web_fetch_extract', WEB_FETCH_EXTRACT_TOOL],
 ]);
 
 // ---------------------------------------------------------------------------

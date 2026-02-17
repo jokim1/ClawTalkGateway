@@ -18,6 +18,7 @@ import { composeSystemPrompt } from './system-prompt.js';
 import { scheduleContextUpdate } from './context-updater.js';
 import { runToolLoop } from './tool-loop.js';
 import { collectRoutingDiagnostics } from './model-routing-diagnostics.js';
+import { getToolCatalog } from './tool-catalog.js';
 
 /** Maximum number of history messages to include in LLM context. */
 const MAX_CONTEXT_MESSAGES = 50;
@@ -163,6 +164,7 @@ export interface TalkChatContext {
   logger: Logger;
   registry: ToolRegistry;
   executor: ToolExecutor;
+  dataDir?: string;
 }
 
 /** Extract ```job``` blocks from AI response text. */
@@ -185,7 +187,7 @@ function parseJobBlocks(text: string): Array<{ schedule: string; prompt: string 
 }
 
 export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
-  const { req, res, talkId, store, gatewayOrigin, authToken, logger, registry, executor } = ctx;
+  const { req, res, talkId, store, gatewayOrigin, authToken, logger, registry, executor, dataDir } = ctx;
 
   if (req.method !== 'POST') {
     sendJson(res, 405, { error: 'Method not allowed' });
@@ -246,8 +248,10 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
       (talkToolMode === 'auto' && likelyActionRequest)
       || (talkToolMode === 'confirm' && explicitToolApproval)
     );
+  const catalog = getToolCatalog(dataDir, logger);
+  const globallyEnabledTools = catalog.filterEnabledTools(registry.listTools());
   const availableToolInfos = filterToolInfos(
-    registry.listTools(),
+    globallyEnabledTools,
     meta.toolsAllow,
     meta.toolsDeny,
   );

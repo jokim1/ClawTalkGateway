@@ -640,7 +640,8 @@ const plugin = {
         );
 
         const isTalkRoute = url.pathname === '/api/talks' || url.pathname.startsWith('/api/talks/');
-        if (!ROUTES.has(url.pathname) && !isTalkRoute) return false;
+        const isToolRoute = url.pathname === '/api/tools' || url.pathname.startsWith('/api/tools/');
+        if (!ROUTES.has(url.pathname) && !isTalkRoute && !isToolRoute) return false;
         if (handleCors(req, res)) return true;
 
         // =================================================================
@@ -768,6 +769,7 @@ const plugin = {
               logger: api.logger,
               registry: toolRegistry,
               executor: toolExecutor,
+              dataDir: pluginCfg.dataDir,
             });
             return true;
           }
@@ -777,7 +779,7 @@ const plugin = {
         }
 
         // /api/tools routes (also match /api/tools/:name)
-        if (url.pathname === '/api/tools' || url.pathname.startsWith('/api/tools/')) {
+        if (isToolRoute) {
           const { handleToolRoutes } = await import('./talks.js');
           await handleToolRoutes(ctx, toolRegistry);
           return true;
