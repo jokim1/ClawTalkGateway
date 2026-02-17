@@ -545,6 +545,7 @@ export interface ToolLoopNonStreamOptions {
   tools: ToolDefinition[];
   gatewayOrigin: string;
   authToken: string | undefined;
+  extraHeaders?: Record<string, string>;
   executor: ToolExecutor;
   logger: Logger;
   timeoutMs?: number;
@@ -564,14 +565,17 @@ export interface ToolLoopNonStreamResult {
  * Same logic as streaming variant but uses stream: false and no SSE events.
  */
 export async function runToolLoopNonStreaming(opts: ToolLoopNonStreamOptions): Promise<ToolLoopNonStreamResult> {
-  const { messages, model, tools, gatewayOrigin, authToken, executor, logger, timeoutMs = 120_000 } = opts;
+  const { messages, model, tools, gatewayOrigin, authToken, extraHeaders, executor, logger, timeoutMs = 120_000 } = opts;
   let fullContent = '';
   let responseModel: string | undefined;
   let lastUsage: { prompt_tokens: number; completion_tokens: number } | undefined;
   let continuations = 0;
 
   for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      ...(extraHeaders ?? {}),
+    };
     if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
 
     const response = await fetch(`${gatewayOrigin}/v1/chat/completions`, {

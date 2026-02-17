@@ -57,6 +57,7 @@ export interface EventDispatcherOptions {
   logger: Logger;
   registry: ToolRegistry;
   executor: ToolExecutor;
+  dataDir?: string;
   jobTimeoutMs?: number;
   /** Optional callback to deliver event job output back to the originating platform. */
   replyToEvent?: ReplyToEventFn;
@@ -181,6 +182,7 @@ export class EventDispatcher {
         logger: this.opts.logger,
         registry: this.opts.registry,
         executor: this.opts.executor,
+        dataDir: this.opts.dataDir,
         jobTimeoutMs: this.opts.jobTimeoutMs,
       };
 

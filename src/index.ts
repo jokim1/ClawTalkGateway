@@ -544,6 +544,7 @@ const plugin = {
           logger: api.logger,
           registry: toolRegistry,
           executor: toolExecutor,
+          dataDir: pluginCfg.dataDir,
           jobTimeoutMs: pluginCfg.jobTimeoutMs,
         });
       },
@@ -568,6 +569,7 @@ const plugin = {
           logger: api.logger,
           registry: toolRegistry,
           executor: toolExecutor,
+          dataDir: pluginCfg.dataDir,
           jobTimeoutMs: pluginCfg.jobTimeoutMs,
           replyToEvent: replyHandler,
         });

@@ -17,10 +17,12 @@
 import { randomUUID } from 'node:crypto';
 import type { TalkStore } from './talk-store.js';
 import type { TalkJob, JobReport, Logger } from './types.js';
+import type { ToolInfo } from './tool-registry.js';
 import type { ToolRegistry } from './tool-registry.js';
 import type { ToolExecutor } from './tool-executor.js';
 import { composeSystemPrompt } from './system-prompt.js';
 import { runToolLoopNonStreaming } from './tool-loop.js';
+import { getToolCatalog } from './tool-catalog.js';
 
 /** How often the scheduler checks for due jobs. */
 const CHECK_INTERVAL_MS = 60_000; // 1 minute
@@ -43,7 +45,41 @@ export interface JobSchedulerOptions {
   logger: Logger;
   registry: ToolRegistry;
   executor: ToolExecutor;
+  dataDir?: string;
   jobTimeoutMs?: number;
+}
+
+const CLAWTALK_DEFAULT_AGENT_ID = 'clawtalk';
+
+function sanitizeSessionPart(value: string): string {
+  return value.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '_').slice(0, 96);
+}
+
+function buildTalkJobSessionKey(talkId: string, jobId: string, agentId: string): string {
+  const talk = sanitizeSessionPart(talkId) || 'talk';
+  const job = sanitizeSessionPart(jobId) || 'job';
+  const agent = sanitizeSessionPart(agentId) || CLAWTALK_DEFAULT_AGENT_ID;
+  return `agent:${agent}:clawtalk:talk:${talk}:job:${job}`;
+}
+
+function buildUnsandboxedTalkSessionKey(talkId: string): string {
+  const talk = sanitizeSessionPart(talkId) || 'talk';
+  return `agent:${CLAWTALK_DEFAULT_AGENT_ID}:clawtalk:talk:${talk}:main`;
+}
+
+function filterToolInfos(
+  tools: ToolInfo[],
+  allow: string[] | undefined,
+  deny: string[] | undefined,
+): ToolInfo[] {
+  const allowSet = new Set((allow ?? []).map((n) => n.toLowerCase()));
+  const denySet = new Set((deny ?? []).map((n) => n.toLowerCase()));
+  return tools.filter((tool) => {
+    const key = tool.name.toLowerCase();
+    if (denySet.has(key)) return false;
+    if (allowSet.size > 0 && !allowSet.has(key)) return false;
+    return true;
+  });
 }
 
 /**
@@ -672,7 +708,7 @@ export async function executeJob(
   /** Extra context injected before the job prompt (e.g. event trigger details). */
   triggerContext?: string,
 ): Promise<JobReport | null> {
-  const { store, gatewayOrigin, authToken, logger, registry, executor } = opts;
+  const { store, gatewayOrigin, authToken, logger, registry, executor, dataDir } = opts;
   const runAt = Date.now();
 
   logger.info(`JobScheduler: executing job ${job.id} for talk ${talkId}: "${job.prompt}"`);
@@ -691,11 +727,28 @@ export async function executeJob(
       meta.pinnedMessageIds.map(id => store.getMessage(talkId, id)),
     );
 
+    const catalog = getToolCatalog(dataDir, logger);
+    const globallyEnabledTools = catalog.filterEnabledTools(registry.listTools());
+    const availableToolInfos = filterToolInfos(
+      globallyEnabledTools,
+      meta.toolsAllow,
+      meta.toolsDeny,
+    );
+    const enabledToolNames = new Set(availableToolInfos.map((tool) => tool.name.toLowerCase()));
+    const tools = registry.getToolSchemas().filter(
+      (tool) => enabledToolNames.has(tool.function.name.toLowerCase()),
+    );
+    logger.info(
+      `JobScheduler: tool availability talkId=${talkId} jobId=${job.id} count=${tools.length} names=${tools.map((t) => t.function.name).join(',') || '-'}`,
+    );
+
     const systemPrompt = composeSystemPrompt({
       meta,
       contextMd,
       pinnedMessages: pinnedMessages.filter(Boolean) as any[],
       registry,
+      toolManifest: availableToolInfos,
+      toolMode: meta.toolMode ?? 'auto',
     });
 
     // Build the job execution prompt
@@ -703,12 +756,16 @@ export async function executeJob(
       ? `\n${triggerContext}\n`
       : '';
     const jobKind = job.type === 'event' ? 'event-triggered' : 'scheduled';
+    const docsAppendHint = tools.some((tool) => tool.function.name === 'google_docs_append')
+      ? '\nIf the task asks you to update a Google Doc, call `google_docs_append` with the target doc URL/ID and full text to append.'
+      : '';
     const jobPrompt = `You are running a ${jobKind} background job for this conversation.
 
 Job schedule: ${job.schedule}${triggerSection}
 Job task: ${job.prompt}
 
 You have tools available — use them if the task requires actions (file ops, web requests, etc.).
+Tool calls are enabled in this environment.${docsAppendHint}
 Provide a concise report of your findings or actions. Start with a one-line summary, then provide details if needed. Be direct and actionable.`;
 
     const messages: Array<{ role: string; content: string }> = [];
@@ -719,12 +776,22 @@ Provide a concise report of your findings or actions. Start with a one-line summ
 
     // Run the tool loop (non-streaming for background jobs)
     const model = meta.model ?? 'openclaw';
-    const tools = registry.getToolSchemas();
+    const traceId = randomUUID();
+    const talkExecutionMode = meta.executionMode ?? 'inherit';
+    const sessionKey = talkExecutionMode === 'unsandboxed'
+      ? buildUnsandboxedTalkSessionKey(talkId)
+      : buildTalkJobSessionKey(talkId, job.id, CLAWTALK_DEFAULT_AGENT_ID);
+    const extraHeaders: Record<string, string> = {
+      'x-openclaw-session-key': sessionKey,
+      'x-openclaw-trace-id': traceId,
+      'x-openclaw-agent-id': CLAWTALK_DEFAULT_AGENT_ID,
+    };
 
     const result = await runToolLoopNonStreaming({
       messages,
       model,
       tools,
+      extraHeaders,
       toolChoice: 'auto',
       gatewayOrigin,
       authToken,
