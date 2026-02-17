@@ -603,10 +603,7 @@ const plugin = {
     api.on('gateway_start', () => {
       refreshSlackIngressRoute();
       logSlackOwnershipConflicts();
-      void reconcileAnthropicProxyBaseUrls(proxyPort, api.logger).catch((err) => {
-        const message = err instanceof Error ? err.message : String(err);
-        api.logger.warn(`ClawTalk: failed to reconcile Anthropic baseUrl: ${message}`);
-      });
+      // Avoid duplicate config writes/reload churn: reconciliation already runs during register.
       void reconcileSlackRoutingForTalks(talkStore.listTalks(), api.logger);
       api.logger.info('ClawTalk: gateway_start event received');
     });

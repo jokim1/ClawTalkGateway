@@ -84,6 +84,8 @@ export function composeSystemPrompt(input: SystemPromptInput): string | undefine
         '- **Do not use tools** for simple conversational/meta questions (e.g., "what model are you?", greetings, clarifications).\n' +
         '- If a tool call fails, tell the user what happened and suggest alternatives.\n' +
         '- For multi-step tasks, chain tool calls as needed — you can call tools multiple times in sequence.\n' +
+        '- For `read`, always provide a concrete `file_path` argument. Never call `read` with empty or missing path.\n' +
+        '- For `edit`/`apply_patch`, include all required fields and validate target paths before calling.\n' +
         '- `shell_exec` runs commands in a bash shell on the server. Use it for file creation, curl, package installs, etc.\n' +
         '- `manage_tools` lets you register new custom tools to expand your capabilities.\n' +
         '- Always report tool results clearly. Show relevant output, not just "done".\n' +
