@@ -15,6 +15,8 @@ import { sendJson, readJsonBody } from './http.js';
 const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB decoded
 const MAX_BODY_SIZE = 70 * 1024 * 1024; // ~70MB to account for base64 overhead
 const DEFAULT_UPLOAD_DIR = join(homedir(), 'Downloads', 'ClawTalk');
+const DEFAULT_AGENT_WORKSPACE_DIR = join(homedir(), '.openclaw', 'workspace-clawtalk');
+const AGENT_UPLOAD_SUBDIR = 'uploads';
 
 /** Sanitize filename: strip directory traversal, replace unsafe characters. */
 function sanitizeFilename(name: string): string {
@@ -91,21 +93,31 @@ export async function handleFileUpload(
   const safeName = sanitizeFilename(body.filename);
   const finalName = `${timestampPrefix()}_${safeName}`;
   const destPath = join(dir, finalName);
+  const agentWorkspaceDir = (process.env.CLAWTALK_AGENT_WORKSPACE_DIR || DEFAULT_AGENT_WORKSPACE_DIR).trim() || DEFAULT_AGENT_WORKSPACE_DIR;
+  const mirroredHostPath = join(agentWorkspaceDir, AGENT_UPLOAD_SUBDIR, finalName);
+  const mirroredAgentPath = `/workspace/${AGENT_UPLOAD_SUBDIR}/${finalName}`;
 
   try {
     await mkdir(dir, { recursive: true });
     await writeFile(destPath, fileBuffer);
+    await mkdir(join(agentWorkspaceDir, AGENT_UPLOAD_SUBDIR), { recursive: true });
+    await writeFile(mirroredHostPath, fileBuffer);
   } catch (err) {
     logger.error(`ClawTalk: file upload write failed: ${err}`);
     sendJson(res, 500, { error: 'Failed to save file on server' });
     return;
   }
 
-  logger.info(`ClawTalk: file uploaded: ${finalName} (${fileBuffer.length} bytes) → ${destPath}`);
+  logger.info(
+    `ClawTalk: file uploaded: ${finalName} (${fileBuffer.length} bytes) `
+    + `serverPath=${destPath} workspacePath=${mirroredHostPath} agentPath=${mirroredAgentPath}`,
+  );
 
   sendJson(res, 200, {
     ok: true,
     serverPath: destPath,
+    workspacePath: mirroredHostPath,
+    agentPath: mirroredAgentPath,
     filename: finalName,
     sizeBytes: fileBuffer.length,
   });
