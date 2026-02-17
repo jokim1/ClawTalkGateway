@@ -231,6 +231,18 @@ interface WeeklySchedule {
  * Returns null if not a daily format.
  */
 export function parseDailySchedule(schedule: string): DailySchedule | null {
+  // Support: "every weekday at 9am IST", "every weekend at 10:30", "every day at 8am"
+  const everyMatch = schedule.match(/^every\s+(day|daily|weekday|weekdays|weekend|weekends)\s+at\s+(.+)$/i);
+  if (everyMatch) {
+    let days: 'all' | 'weekdays' | 'weekends' = 'all';
+    const kind = everyMatch[1].toLowerCase();
+    if (kind === 'weekday' || kind === 'weekdays') days = 'weekdays';
+    if (kind === 'weekend' || kind === 'weekends') days = 'weekends';
+    const tail = everyMatch[2].trim();
+    const normalized = `daily ${tail}${days === 'all' ? '' : ` ${days}`}`;
+    return parseDailySchedule(normalized);
+  }
+
   // Match: [daily] time [am/pm] [tokens...]
   // Tokens can be timezone and/or day constraint in any order
   const match = schedule.match(/^(?:daily\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(.*)$/i);
@@ -395,8 +407,12 @@ export function validateSchedule(schedule: string): string | null {
   // "10am weekdays", "9am weekends"
   if (parseDailySchedule(s) !== null) return null;
 
-  // Cron: 5 space-separated fields
-  if (s.split(/\s+/).length === 5) return null;
+  // Cron: strict 5-field expression
+  if (isValidCronExpression(s)) return null;
+  if (s.split(/\s+/).length === 5) {
+    return `Schedule looks like 5-field cron but is invalid: "${s}". `
+      + `Use valid cron like "0 9 * * 1-5", or natural language like "every weekday at 9am IST".`;
+  }
 
   return `Unrecognized schedule format: "${s}". Supported: "on <scope>" (event), "every Xh/Xm/Xd", "every Monday [TZ] at 5pm", "daily 9am", "10am IST weekdays", "in Xh/Xm", "at 3pm/14:00", or 5-field cron`;
 }
@@ -511,7 +527,7 @@ export function isJobDue(job: TalkJob): boolean {
   // Cron-like: basic 5-field cron "min hour dom month dow"
   // For now, support simple cases; full cron can be added later
   const cronParts = job.schedule.trim().split(/\s+/);
-  if (cronParts.length === 5) {
+  if (isValidCronExpression(job.schedule) && cronParts.length === 5) {
     return isCronDue(cronParts, job.lastRunAt ?? 0);
   }
 
@@ -521,6 +537,52 @@ export function isJobDue(job: TalkJob): boolean {
 /**
  * Basic 5-field cron check. Supports *, numeric values, and ranges (1-5).
  */
+function isValidCronFieldPart(part: string, min: number, max: number): boolean {
+  const trimmed = part.trim();
+  if (!trimmed) return false;
+  if (trimmed === '*') return true;
+  const stepAny = trimmed.match(/^\*\/(\d+)$/);
+  if (stepAny) {
+    const step = parseInt(stepAny[1], 10);
+    return Number.isFinite(step) && step > 0;
+  }
+  const rangeStep = trimmed.match(/^(\d+)-(\d+)\/(\d+)$/);
+  if (rangeStep) {
+    const lo = parseInt(rangeStep[1], 10);
+    const hi = parseInt(rangeStep[2], 10);
+    const step = parseInt(rangeStep[3], 10);
+    return Number.isFinite(lo) && Number.isFinite(hi) && Number.isFinite(step)
+      && lo >= min && hi <= max && lo <= hi && step > 0;
+  }
+  const range = trimmed.match(/^(\d+)-(\d+)$/);
+  if (range) {
+    const lo = parseInt(range[1], 10);
+    const hi = parseInt(range[2], 10);
+    return Number.isFinite(lo) && Number.isFinite(hi) && lo >= min && hi <= max && lo <= hi;
+  }
+  const single = trimmed.match(/^\d+$/);
+  if (single) {
+    const val = parseInt(trimmed, 10);
+    return Number.isFinite(val) && val >= min && val <= max;
+  }
+  return false;
+}
+
+function isValidCronExpression(schedule: string): boolean {
+  const parts = schedule.trim().split(/\s+/);
+  if (parts.length !== 5) return false;
+  const [minF, hourF, domF, monthF, dowF] = parts;
+  const validList = (field: string, min: number, max: number) =>
+    field.split(',').every((part) => isValidCronFieldPart(part, min, max));
+  return (
+    validList(minF, 0, 59) &&
+    validList(hourF, 0, 23) &&
+    validList(domF, 1, 31) &&
+    validList(monthF, 1, 12) &&
+    validList(dowF, 0, 7)
+  );
+}
+
 function isCronDue(parts: string[], lastRunAt: number): boolean {
   const now = new Date();
   const currentMin = now.getMinutes();

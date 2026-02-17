@@ -76,6 +76,20 @@ describe('validateSchedule (weekly)', () => {
     expect(validateSchedule('every Monday PST at 5PM')).toBeNull();
     expect(validateSchedule('every Monday at 5PM PST')).toBeNull();
   });
+
+  it('accepts every weekday/day schedules with timezones', () => {
+    expect(validateSchedule('every weekday at 9AM IST')).toBeNull();
+    expect(validateSchedule('every day at 7:30am PST')).toBeNull();
+    expect(validateSchedule('every weekend at 10am')).toBeNull();
+  });
+
+  it('does not treat arbitrary 5-word text as cron', () => {
+    const err2 = validateSchedule('foo bar baz qux quux');
+    expect(err2).not.toBeNull();
+    expect(err2).toContain('looks like 5-field cron');
+    const err3 = validateSchedule('every weekday at 9AM IST now');
+    expect(err3).not.toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -175,20 +189,48 @@ describe('isJobDue (daily schedules)', () => {
   });
 
   it('returns false when the target time has not been reached yet today', () => {
-    // Target is 2 hours in the future
-    const twoHoursLater = new Date();
-    twoHoursLater.setHours(twoHoursLater.getHours() + 2);
-    twoHoursLater.setMinutes(0, 0, 0);
+    // Target is in the future on the same calendar day to avoid day-wrap edge cases.
+    const now = new Date();
+    const future = new Date(now);
+    if (now.getHours() < 23) {
+      future.setHours(now.getHours() + 1, 0, 0, 0);
+    } else if (now.getMinutes() < 59) {
+      future.setHours(23, now.getMinutes() + 1, 0, 0);
+    } else {
+      // At 23:59 there is no future minute in the same day; skip this edge.
+      expect(true).toBe(true);
+      return;
+    }
 
-    const hour = twoHoursLater.getHours();
-    // Use 24-hour format to avoid am/pm edge cases
-    const schedule = `daily ${hour}:00`;
+    const schedule = `daily ${future.getHours()}:${String(future.getMinutes()).padStart(2, '0')}`;
 
     const job = makeJob({
       schedule,
       lastRunAt: undefined,
     });
     expect(isJobDue(job)).toBe(false);
+  });
+
+  it('supports "every day at <time> <TZ>" schedules', () => {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Asia/Kolkata',
+      hour: 'numeric',
+      minute: 'numeric',
+      hour12: false,
+    }).formatToParts(new Date());
+    const hour = parseInt(parts.find((p) => p.type === 'hour')?.value ?? '0', 10);
+    let minute = parseInt(parts.find((p) => p.type === 'minute')?.value ?? '0', 10) - 1;
+    let hh = hour;
+    if (minute < 0) {
+      minute = 59;
+      hh = (hour + 23) % 24;
+    }
+    const schedule = `every day at ${hh}:${String(minute).padStart(2, '0')} IST`;
+    const job = makeJob({
+      schedule,
+      lastRunAt: Date.now() - 86_400_000 * 2,
+    });
+    expect(isJobDue(job)).toBe(true);
   });
 });
 
