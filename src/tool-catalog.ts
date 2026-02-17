@@ -51,9 +51,9 @@ const CATALOG_DEFINITIONS: CatalogToolDefinition[] = [
     id: 'google_drive_files',
     name: 'Google Drive Files',
     description: 'List/search/move files and folders in Google Drive.',
-    version: '0.0.0',
-    status: 'planned',
-    toolNames: [],
+    version: '1.0.0',
+    status: 'installable',
+    toolNames: ['google_drive_files'],
     requiredAuth: ['google_oauth'],
   },
   {

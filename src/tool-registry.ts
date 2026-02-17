@@ -220,6 +220,50 @@ const WEB_FETCH_EXTRACT_TOOL: ToolDefinition = {
   },
 };
 
+const GOOGLE_DRIVE_FILES_TOOL: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'google_drive_files',
+    description:
+      'Work with Google Drive files and folders. Supports list, search by name, and move file operations.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          description: 'Action to perform.',
+          enum: ['list', 'search', 'move'],
+        },
+        folder_id: {
+          type: 'string',
+          description: 'Optional Drive folder ID (or URL) to scope list/search.',
+        },
+        query: {
+          type: 'string',
+          description: 'Search text for action=search (matches file/folder names).',
+        },
+        page_size: {
+          type: 'number',
+          description: 'Optional result count (default 25, max 200).',
+        },
+        page_token: {
+          type: 'string',
+          description: 'Optional pagination token for action=list.',
+        },
+        file_id: {
+          type: 'string',
+          description: 'File ID (or URL) for action=move.',
+        },
+        target_folder_id: {
+          type: 'string',
+          description: 'Target folder ID (or URL) for action=move.',
+        },
+      },
+      required: ['action'],
+    },
+  },
+};
+
 const BUILTIN_TOOLS = new Map<string, ToolDefinition>([
   ['shell_exec', SHELL_EXEC_TOOL],
   ['manage_tools', MANAGE_TOOLS_TOOL],
@@ -227,6 +271,7 @@ const BUILTIN_TOOLS = new Map<string, ToolDefinition>([
   ['google_docs_append', GOOGLE_DOCS_APPEND_TOOL],
   ['google_docs_read', GOOGLE_DOCS_READ_TOOL],
   ['google_docs_auth_status', GOOGLE_DOCS_AUTH_STATUS_TOOL],
+  ['google_drive_files', GOOGLE_DRIVE_FILES_TOOL],
   ['web_fetch_extract', WEB_FETCH_EXTRACT_TOOL],
 ]);
 

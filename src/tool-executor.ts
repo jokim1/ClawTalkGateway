@@ -13,6 +13,9 @@ import {
   googleDocsAppend,
   googleDocsAuthStatus,
   googleDocsCreate,
+  googleDriveListFiles,
+  googleDriveMoveFile,
+  googleDriveSearchFiles,
   googleDocsRead,
   GOOGLE_DOCS_REQUIRED_SCOPES,
 } from './google-docs.js';
@@ -89,6 +92,9 @@ export class ToolExecutor {
           break;
         case 'google_docs_auth_status':
           result = await this.execGoogleDocsAuthStatus();
+          break;
+        case 'google_drive_files':
+          result = await this.execGoogleDriveFiles(args);
           break;
         case 'web_fetch_extract':
           result = await this.execWebFetchExtract(args);
@@ -400,6 +406,94 @@ export class ToolExecutor {
       return {
         success: false,
         content: `google_docs_auth_status failed: ${err instanceof Error ? err.message : String(err)}`,
+        durationMs: 0,
+      };
+    }
+  }
+
+  private async execGoogleDriveFiles(args: Record<string, unknown>): Promise<ToolExecResult> {
+    const action = String(args.action ?? '').trim().toLowerCase();
+    if (!action) {
+      return { success: false, content: 'Missing required field: action', durationMs: 0 };
+    }
+
+    try {
+      if (action === 'list') {
+        const listed = await googleDriveListFiles({
+          folderId: args.folder_id === undefined ? undefined : String(args.folder_id),
+          pageSize: args.page_size === undefined ? undefined : Number(args.page_size),
+          pageToken: args.page_token === undefined ? undefined : String(args.page_token),
+        });
+        const lines = listed.files.map((file) => {
+          const type = file.mimeType?.includes('folder') ? 'folder' : 'file';
+          return `- ${file.name} (${type}) id=${file.id}${file.webViewLink ? ` url=${file.webViewLink}` : ''}`;
+        });
+        return {
+          success: true,
+          content:
+            `Google Drive list results (${listed.files.length}):\n` +
+            `${lines.join('\n') || '(none)'}\n` +
+            `${listed.nextPageToken ? `nextPageToken: ${listed.nextPageToken}` : ''}`.trim(),
+          durationMs: 0,
+        };
+      }
+
+      if (action === 'search') {
+        const query = String(args.query ?? '').trim();
+        if (!query) {
+          return { success: false, content: 'Missing required field for action=search: query', durationMs: 0 };
+        }
+        const found = await googleDriveSearchFiles({
+          query,
+          folderId: args.folder_id === undefined ? undefined : String(args.folder_id),
+          pageSize: args.page_size === undefined ? undefined : Number(args.page_size),
+        });
+        const lines = found.files.map((file) => {
+          const type = file.mimeType?.includes('folder') ? 'folder' : 'file';
+          return `- ${file.name} (${type}) id=${file.id}${file.webViewLink ? ` url=${file.webViewLink}` : ''}`;
+        });
+        return {
+          success: true,
+          content: `Google Drive search results (${found.files.length}) for "${query}":\n${lines.join('\n') || '(none)'}`,
+          durationMs: 0,
+        };
+      }
+
+      if (action === 'move') {
+        const fileId = String(args.file_id ?? '').trim();
+        const targetFolderId = String(args.target_folder_id ?? '').trim();
+        if (!fileId || !targetFolderId) {
+          return {
+            success: false,
+            content: 'Missing required fields for action=move: file_id, target_folder_id',
+            durationMs: 0,
+          };
+        }
+        const moved = await googleDriveMoveFile({ fileId, targetFolderId });
+        return {
+          success: true,
+          content:
+            `Moved file successfully.\n` +
+            `Name: ${moved.name}\n` +
+            `ID: ${moved.id}\n` +
+            `${moved.webViewLink ? `URL: ${moved.webViewLink}\n` : ''}` +
+            `${moved.parents?.length ? `Parents: ${moved.parents.join(', ')}` : ''}`.trim(),
+          durationMs: 0,
+        };
+      }
+
+      return {
+        success: false,
+        content: `Unknown action "${action}". Valid actions: list, search, move`,
+        durationMs: 0,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        success: false,
+        content:
+          `google_drive_files failed: ${msg}\n` +
+          `Required OAuth scopes: ${GOOGLE_DOCS_REQUIRED_SCOPES.join(', ')}`,
         durationMs: 0,
       };
     }

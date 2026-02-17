@@ -101,6 +101,18 @@ function parseDocumentId(input: string): string {
   return (fromUrl?.[1] ?? trimmed).trim();
 }
 
+function parseDriveFileId(input: string): string {
+  const trimmed = input.trim();
+  if (!trimmed) throw new Error('File ID is required.');
+  const fromDocsUrl =
+    trimmed.match(/\/document\/d\/([a-zA-Z0-9_-]+)/)
+    ?? trimmed.match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/)
+    ?? trimmed.match(/\/presentation\/d\/([a-zA-Z0-9_-]+)/)
+    ?? trimmed.match(/\/file\/d\/([a-zA-Z0-9_-]+)/)
+    ?? trimmed.match(/\/folders\/([a-zA-Z0-9_-]+)/);
+  return (fromDocsUrl?.[1] ?? trimmed).trim();
+}
+
 async function googleFetchJson(url: string, init: RequestInit): Promise<any> {
   const token = await getAccessToken();
   const headers = new Headers(init.headers ?? {});
@@ -312,6 +324,134 @@ export async function googleDocsAuthStatus(): Promise<{
 }
 
 export const GOOGLE_DOCS_REQUIRED_SCOPES = [GOOGLE_DOCS_SCOPE, GOOGLE_DRIVE_SCOPE];
+
+export async function googleDriveListFiles(params: {
+  folderId?: string;
+  pageSize?: number;
+  pageToken?: string;
+}): Promise<{
+  files: Array<{
+    id: string;
+    name: string;
+    mimeType?: string;
+    webViewLink?: string;
+    modifiedTime?: string;
+    parents?: string[];
+  }>;
+  nextPageToken?: string;
+}> {
+  const pageSize = Math.max(1, Math.min(200, Number(params.pageSize) || 25));
+  const pageToken = params.pageToken?.trim();
+  const folderId = params.folderId?.trim() ? parseDriveFileId(params.folderId) : undefined;
+
+  const url = new URL('https://www.googleapis.com/drive/v3/files');
+  url.searchParams.set(
+    'fields',
+    'nextPageToken,files(id,name,mimeType,webViewLink,modifiedTime,parents)',
+  );
+  url.searchParams.set('pageSize', String(pageSize));
+  url.searchParams.set('orderBy', 'modifiedTime desc');
+  if (pageToken) url.searchParams.set('pageToken', pageToken);
+  url.searchParams.set('q', folderId
+    ? `'${folderId}' in parents and trashed=false`
+    : 'trashed=false');
+
+  const data = await googleFetchJson(url.toString(), { method: 'GET' });
+  const files = Array.isArray(data?.files) ? data.files : [];
+  return {
+    files: files.map((file: any) => ({
+      id: String(file?.id ?? ''),
+      name: String(file?.name ?? ''),
+      mimeType: typeof file?.mimeType === 'string' ? file.mimeType : undefined,
+      webViewLink: typeof file?.webViewLink === 'string' ? file.webViewLink : undefined,
+      modifiedTime: typeof file?.modifiedTime === 'string' ? file.modifiedTime : undefined,
+      parents: Array.isArray(file?.parents) ? file.parents.filter((p: unknown): p is string => typeof p === 'string') : undefined,
+    })).filter((file: { id: string; name: string }) => Boolean(file.id && file.name)),
+    nextPageToken: typeof data?.nextPageToken === 'string' ? data.nextPageToken : undefined,
+  };
+}
+
+export async function googleDriveSearchFiles(params: {
+  query: string;
+  folderId?: string;
+  pageSize?: number;
+}): Promise<{
+  files: Array<{
+    id: string;
+    name: string;
+    mimeType?: string;
+    webViewLink?: string;
+    modifiedTime?: string;
+    parents?: string[];
+  }>;
+}> {
+  const query = params.query.trim();
+  if (!query) throw new Error('query is required.');
+  const pageSize = Math.max(1, Math.min(200, Number(params.pageSize) || 25));
+  const folderId = params.folderId?.trim() ? parseDriveFileId(params.folderId) : undefined;
+
+  const escaped = query.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  const qParts = [`trashed=false`, `name contains '${escaped}'`];
+  if (folderId) qParts.push(`'${folderId}' in parents`);
+
+  const url = new URL('https://www.googleapis.com/drive/v3/files');
+  url.searchParams.set(
+    'fields',
+    'files(id,name,mimeType,webViewLink,modifiedTime,parents)',
+  );
+  url.searchParams.set('pageSize', String(pageSize));
+  url.searchParams.set('orderBy', 'modifiedTime desc');
+  url.searchParams.set('q', qParts.join(' and '));
+
+  const data = await googleFetchJson(url.toString(), { method: 'GET' });
+  const files = Array.isArray(data?.files) ? data.files : [];
+  return {
+    files: files.map((file: any) => ({
+      id: String(file?.id ?? ''),
+      name: String(file?.name ?? ''),
+      mimeType: typeof file?.mimeType === 'string' ? file.mimeType : undefined,
+      webViewLink: typeof file?.webViewLink === 'string' ? file.webViewLink : undefined,
+      modifiedTime: typeof file?.modifiedTime === 'string' ? file.modifiedTime : undefined,
+      parents: Array.isArray(file?.parents) ? file.parents.filter((p: unknown): p is string => typeof p === 'string') : undefined,
+    })).filter((file: { id: string; name: string }) => Boolean(file.id && file.name)),
+  };
+}
+
+export async function googleDriveMoveFile(params: {
+  fileId: string;
+  targetFolderId: string;
+}): Promise<{
+  id: string;
+  name: string;
+  webViewLink?: string;
+  parents?: string[];
+}> {
+  const fileId = parseDriveFileId(params.fileId);
+  const targetFolderId = parseDriveFileId(params.targetFolderId);
+
+  const current = await googleFetchJson(
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?fields=id,name,parents`,
+    { method: 'GET' },
+  );
+  const existingParents = Array.isArray(current?.parents)
+    ? current.parents.filter((p: unknown): p is string => typeof p === 'string')
+    : [];
+
+  const moveUrl = new URL(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`);
+  moveUrl.searchParams.set('addParents', targetFolderId);
+  if (existingParents.length > 0) {
+    moveUrl.searchParams.set('removeParents', existingParents.join(','));
+  }
+  moveUrl.searchParams.set('fields', 'id,name,webViewLink,parents');
+
+  const moved = await googleFetchJson(moveUrl.toString(), { method: 'PATCH' });
+  return {
+    id: String(moved?.id ?? fileId),
+    name: String(moved?.name ?? ''),
+    webViewLink: typeof moved?.webViewLink === 'string' ? moved.webViewLink : undefined,
+    parents: Array.isArray(moved?.parents) ? moved.parents.filter((p: unknown): p is string => typeof p === 'string') : undefined,
+  };
+}
 
 export interface GoogleDocsAuthConfigInput {
   refreshToken?: string;
