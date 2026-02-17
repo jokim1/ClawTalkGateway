@@ -199,8 +199,8 @@ function buildTalkSessionKey(talkId: string, agentPart: string, lanePart?: strin
     : `agent:${agent}:clawtalk:talk:${talk}:chat`;
 }
 
-function buildTalkMainSessionKey(agentPart: string): string {
-  return `agent:${sanitizeSessionPart(agentPart) || CLAWTALK_DEFAULT_AGENT_ID}:main`;
+function buildTalkMainSessionKey(): string {
+  return `agent:${CLAWTALK_DEFAULT_AGENT_ID}:main`;
 }
 
 function buildRunScopedSessionPart(basePart: string, model: string, traceId: string): string {
@@ -592,7 +592,9 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
   const talkExecutionMode = meta.executionMode ?? 'inherit';
   const sessionKey = (() => {
     if (talkExecutionMode === 'unsandboxed') {
-      return buildTalkMainSessionKey(resolvedSessionAgentId);
+      // Keep unsandboxed talks pinned to a single stable main session key.
+      // Agent routing still happens through x-openclaw-agent-id when present.
+      return buildTalkMainSessionKey();
     }
     return buildTalkSessionKey(talkId, resolvedSessionAgentId, runScopedSessionPart);
   })();
