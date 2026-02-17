@@ -210,9 +210,12 @@ function buildTalkSessionKey(talkId: string, agentPart: string, lanePart?: strin
     : `agent:${agent}:clawtalk:talk:${talk}:chat`;
 }
 
-function buildUnsandboxedTalkSessionKey(talkId: string): string {
+function buildFullControlTalkSessionKey(talkId: string, lanePart?: string): string {
   const talk = sanitizeSessionPart(talkId) || 'talk';
-  return `agent:${CLAWTALK_DEFAULT_AGENT_ID}:clawtalk:talk:${talk}:main`;
+  const lane = lanePart ? sanitizeSessionPart(lanePart) : '';
+  return lane
+    ? `talk:clawtalk:talk:${talk}:chat:lane:${lane}`
+    : `talk:clawtalk:talk:${talk}:chat`;
 }
 
 function buildRunScopedSessionPart(basePart: string, model: string, traceId: string): string {
@@ -722,12 +725,12 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
     model,
     traceId,
   );
-  const talkExecutionMode = meta.executionMode ?? 'inherit';
+  const talkExecutionMode = meta.executionMode ?? 'openclaw';
   const sessionKey = (() => {
-    if (talkExecutionMode === 'unsandboxed') {
-      // Keep unsandboxed talks stable per talk (not global) to prevent cross-talk leakage.
-      // Agent routing still happens through x-openclaw-agent-id when present.
-      return buildUnsandboxedTalkSessionKey(talkId);
+    if (talkExecutionMode === 'full_control') {
+      // No `agent:` prefix — keeps request in transparent LLM-proxy mode so
+      // gateway tools are callable instead of being replaced by OpenClaw agent tools.
+      return buildFullControlTalkSessionKey(talkId, runScopedSessionPart);
     }
     return buildTalkSessionKey(talkId, resolvedSessionAgentId, runScopedSessionPart);
   })();
@@ -735,7 +738,9 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
     'x-openclaw-session-key': sessionKey,
     'x-openclaw-trace-id': traceId,
   };
-  if (resolvedHeaderAgentId?.trim()) {
+  // In full_control mode, suppress agent-id header so OpenClaw doesn't activate
+  // its embedded agent. Model routing happens via the `model` param instead.
+  if (talkExecutionMode !== 'full_control' && resolvedHeaderAgentId?.trim()) {
     extraHeaders['x-openclaw-agent-id'] = resolvedHeaderAgentId.trim();
   }
   logger.info(

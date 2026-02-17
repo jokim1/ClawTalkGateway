@@ -59,10 +59,13 @@ function normalizeToolMode(raw: unknown): 'off' | 'confirm' | 'auto' {
   return 'auto';
 }
 
-function normalizeExecutionMode(raw: unknown): 'inherit' | 'sandboxed' | 'unsandboxed' {
+function normalizeExecutionMode(raw: unknown): 'openclaw' | 'full_control' {
   const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
-  if (value === 'inherit' || value === 'sandboxed' || value === 'unsandboxed') return value;
-  return 'inherit';
+  if (value === 'openclaw' || value === 'full_control') return value;
+  // Migrate old values
+  if (value === 'unsandboxed') return 'full_control';
+  if (value === 'inherit' || value === 'sandboxed') return 'openclaw';
+  return 'openclaw';
 }
 
 function normalizeToolNames(input: unknown): string[] {
@@ -267,7 +270,7 @@ export class TalkStore {
       directives: [],
       platformBindings: [],
       platformBehaviors: [],
-      executionMode: 'inherit',
+      executionMode: 'openclaw',
       toolMode: 'auto',
       toolsAllow: [],
       toolsDeny: [],

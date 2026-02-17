@@ -72,11 +72,6 @@ function buildTalkJobSessionKey(talkId: string, jobId: string): string {
   return `job:clawtalk:talk:${talk}:job:${job}`;
 }
 
-function buildUnsandboxedTalkJobSessionKey(talkId: string, jobId: string): string {
-  const talk = sanitizeSessionPart(talkId) || 'talk';
-  const job = sanitizeSessionPart(jobId) || 'job';
-  return `job:clawtalk:talk:${talk}:unsandboxed:${job}`;
-}
 
 function filterToolInfos(
   tools: ToolInfo[],
@@ -788,13 +783,11 @@ Provide a concise report of your findings or actions. Start with a one-line summ
     // Run the tool loop (non-streaming for background jobs)
     const model = meta.model ?? 'openclaw';
     const traceId = randomUUID();
-    const talkExecutionMode = meta.executionMode ?? 'inherit';
+    const talkExecutionMode = meta.executionMode ?? 'openclaw';
     // Use `job:` prefixed session keys (see buildTalkJobSessionKey comment).
-    // Even unsandboxed talks get a per-job session to avoid inheriting
-    // agent-mode state from interactive chat sessions.
-    const sessionKey = talkExecutionMode === 'unsandboxed'
-      ? buildUnsandboxedTalkJobSessionKey(talkId, job.id)
-      : buildTalkJobSessionKey(talkId, job.id);
+    // Both modes use the same key format — the `job:` prefix keeps the
+    // request in transparent LLM-proxy mode regardless of execution mode.
+    const sessionKey = buildTalkJobSessionKey(talkId, job.id);
     const extraHeaders: Record<string, string> = {
       'x-openclaw-session-key': sessionKey,
       'x-openclaw-trace-id': traceId,

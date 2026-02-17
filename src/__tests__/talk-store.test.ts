@@ -37,7 +37,7 @@ describe('Talk CRUD', () => {
     expect(talk.pinnedMessageIds).toEqual([]);
     expect(talk.jobs).toEqual([]);
     expect(talk.toolMode).toBe('auto');
-    expect(talk.executionMode).toBe('inherit');
+    expect(talk.executionMode).toBe('openclaw');
     expect(talk.createdAt).toBeGreaterThan(0);
     expect(talk.updatedAt).toBeGreaterThan(0);
   });
@@ -76,13 +76,13 @@ describe('Talk CRUD', () => {
       topicTitle: 'Sprint Planning',
       objective: 'Plan Q2 sprint',
       model: 'claude-sonnet',
-      executionMode: 'unsandboxed',
+      executionMode: 'full_control',
     });
     expect(updated).not.toBeNull();
     expect(updated!.topicTitle).toBe('Sprint Planning');
     expect(updated!.objective).toBe('Plan Q2 sprint');
     expect(updated!.model).toBe('claude-sonnet');
-    expect(updated!.executionMode).toBe('unsandboxed');
+    expect(updated!.executionMode).toBe('full_control');
     expect(updated!.updatedAt).toBeGreaterThanOrEqual(talk.updatedAt);
   });
 
@@ -154,6 +154,29 @@ describe('Talk CRUD', () => {
     expect(loaded).not.toBeNull();
     expect(loaded!.topicTitle).toBe('Persisted Talk');
     expect(loaded!.model).toBe('claude-opus');
+  });
+
+  it('migrates old executionMode values on load', async () => {
+    const talk = store.createTalk('test-model');
+    // Manually write an old-format talk.json to disk
+    const talkDir = path.join(tmpDir, 'talks', talk.id);
+    await fsp.mkdir(talkDir, { recursive: true });
+    const meta = { ...store.getTalk(talk.id)!, executionMode: 'unsandboxed' };
+    await fsp.writeFile(path.join(talkDir, 'talk.json'), JSON.stringify(meta, null, 2));
+
+    // Reload from disk
+    const store2 = new TalkStore(tmpDir, mockLogger);
+    await store2.init();
+    const loaded = store2.getTalk(talk.id);
+    expect(loaded).not.toBeNull();
+    expect(loaded!.executionMode).toBe('full_control');
+
+    // Also test inherit → openclaw
+    const meta2 = { ...loaded!, executionMode: 'inherit' };
+    await fsp.writeFile(path.join(talkDir, 'talk.json'), JSON.stringify(meta2, null, 2));
+    const store3 = new TalkStore(tmpDir, mockLogger);
+    await store3.init();
+    expect(store3.getTalk(talk.id)!.executionMode).toBe('openclaw');
   });
 });
 

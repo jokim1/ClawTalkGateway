@@ -145,10 +145,13 @@ function normalizeToolModeInput(raw: unknown): 'off' | 'confirm' | 'auto' | unde
   return undefined;
 }
 
-function normalizeExecutionModeInput(raw: unknown): 'inherit' | 'sandboxed' | 'unsandboxed' | undefined {
+function normalizeExecutionModeInput(raw: unknown): 'openclaw' | 'full_control' | undefined {
   if (typeof raw !== 'string') return undefined;
   const value = raw.trim().toLowerCase();
-  if (value === 'inherit' || value === 'sandboxed' || value === 'unsandboxed') return value;
+  if (value === 'openclaw' || value === 'full_control') return value;
+  // Accept old values from stale clients
+  if (value === 'unsandboxed') return 'full_control';
+  if (value === 'inherit' || value === 'sandboxed') return 'openclaw';
   return undefined;
 }
 
@@ -1018,7 +1021,7 @@ async function handleCreateTalk(ctx: HandlerContext, store: TalkStore): Promise<
   }
   const executionMode = normalizeExecutionModeInput(body.executionMode);
   if (body.executionMode !== undefined && executionMode === undefined) {
-    sendJson(ctx.res, 400, { error: 'executionMode must be one of: inherit, sandboxed, unsandboxed' });
+    sendJson(ctx.res, 400, { error: 'executionMode must be one of: openclaw, full_control' });
     return;
   }
   const toolsAllow = normalizeToolNameListInput(body.toolsAllow);
@@ -1134,8 +1137,8 @@ async function handleGetTalkTools(
   sendJson(ctx.res, 200, {
     talkId,
     toolMode: talk.toolMode ?? 'auto',
-    executionMode: talk.executionMode ?? 'inherit',
-    executionModeOptions: ['inherit', 'sandboxed', 'unsandboxed'],
+    executionMode: talk.executionMode ?? 'openclaw',
+    executionModeOptions: ['openclaw', 'full_control'],
     toolsAllow: talk.toolsAllow ?? [],
     toolsDeny: talk.toolsDeny ?? [],
     googleAuthProfile: talk.googleAuthProfile,
@@ -1177,7 +1180,7 @@ async function handleUpdateTalkTools(
   }
   const executionMode = normalizeExecutionModeInput(body.executionMode);
   if (body.executionMode !== undefined && executionMode === undefined) {
-    sendJson(ctx.res, 400, { error: 'executionMode must be one of: inherit, sandboxed, unsandboxed' });
+    sendJson(ctx.res, 400, { error: 'executionMode must be one of: openclaw, full_control' });
     return;
   }
   const toolsAllow = normalizeToolNameListInput(body.toolsAllow);
@@ -1207,8 +1210,8 @@ async function handleUpdateTalkTools(
   sendJson(ctx.res, 200, {
     talkId,
     toolMode: updated.toolMode ?? 'auto',
-    executionMode: updated.executionMode ?? 'inherit',
-    executionModeOptions: ['inherit', 'sandboxed', 'unsandboxed'],
+    executionMode: updated.executionMode ?? 'openclaw',
+    executionModeOptions: ['openclaw', 'full_control'],
     toolsAllow: updated.toolsAllow ?? [],
     toolsDeny: updated.toolsDeny ?? [],
     googleAuthProfile: updated.googleAuthProfile,
@@ -1291,7 +1294,7 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
   }
   const executionMode = normalizeExecutionModeInput(body.executionMode);
   if (body.executionMode !== undefined && executionMode === undefined) {
-    sendJson(ctx.res, 400, { error: 'executionMode must be one of: inherit, sandboxed, unsandboxed' });
+    sendJson(ctx.res, 400, { error: 'executionMode must be one of: openclaw, full_control' });
     return;
   }
   const toolsAllow = normalizeToolNameListInput(body.toolsAllow);
