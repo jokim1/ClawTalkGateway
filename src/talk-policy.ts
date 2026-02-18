@@ -49,7 +49,7 @@ const NETWORK_TOOLS = new Set([
   'pdf_extract_text',
 ]);
 
-const BROWSER_TOOL_NAME_RE = /(browser|chrome|tab|playwright|puppeteer|relay|snapshot|navigate)/i;
+const BROWSER_TOOL_NAME_RE = /(browser|chrome|playwright|puppeteer|relay|snapshot|navigate)/i;
 const BROWSER_INTENT_RE =
   /\b(browser|tab|chrome|take over|control (my )?browser|attach(ed)? tab|openclaw browser relay)\b/i;
 

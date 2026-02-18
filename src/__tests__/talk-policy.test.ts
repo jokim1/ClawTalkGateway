@@ -57,4 +57,23 @@ describe('talk policy availability reasons', () => {
     expect(states[0]?.enabled).toBe(false);
     expect(states[0]?.reasonCode).toBe('blocked_tool_mode');
   });
+
+  test('does not treat google docs tab tools as browser tools in full_control mode', () => {
+    const states = evaluateToolAvailability(
+      [{ name: 'google_docs_list_tabs', description: 'docs tabs', builtin: true }],
+      {
+        executionMode: 'full_control',
+        filesystemAccess: 'full_host_access',
+        networkAccess: 'full_outbound',
+        toolsAllow: [],
+        toolsDeny: [],
+        toolMode: 'auto',
+      },
+      {
+        isInstalled: () => true,
+      },
+    );
+    expect(states[0]?.enabled).toBe(true);
+    expect(states[0]?.reasonCode).toBeUndefined();
+  });
 });
