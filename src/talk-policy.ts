@@ -147,6 +147,12 @@ function deriveToolBlockedReason(
   if (allowSet.size > 0 && !allowSet.has(key)) {
     return { code: 'blocked_allowlist', reason: 'Not included in Talk allow-list.' };
   }
+  if (executionMode === 'openclaw') {
+    return {
+      code: 'blocked_execution_mode',
+      reason: 'Blocked by Execution Mode: OpenClaw Agent uses native OpenClaw tools only.',
+    };
+  }
   if (executionMode === 'full_control' && isBrowserTool(key)) {
     return {
       code: 'blocked_execution_mode',
