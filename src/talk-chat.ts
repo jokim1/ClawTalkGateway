@@ -21,6 +21,7 @@ import { collectRoutingDiagnostics } from './model-routing-diagnostics.js';
 import { getToolCatalog } from './tool-catalog.js';
 import { parseEventTrigger, validateSchedule } from './job-scheduler.js';
 import { extractGoogleDocsDocumentIdFromUrl, hasGoogleDocsDocumentUrl } from './google-docs-url.js';
+import { googleDocsAuthStatusForProfile } from './google-docs.js';
 import {
   evaluateToolAvailability,
   isBrowserIntent,
@@ -69,6 +70,23 @@ function emitStatusEvent(res: ServerResponse, payload: { code: string; message: 
 function emitErrorEvent(res: ServerResponse, payload: TalkErrorPayload): void {
   if (res.writableEnded) return;
   res.write(`event: error\ndata: ${JSON.stringify(payload)}\n\n`);
+}
+
+function buildTalkAuthReadyResolver(input: {
+  googleOAuthReady: boolean;
+  googleAuthProfile?: string;
+  getToolRequiredAuth: (toolName: string) => string[];
+}): (toolName: string) => { ready: boolean; reason?: string } | undefined {
+  const profileLabel = input.googleAuthProfile?.trim() || 'default';
+  return (toolName: string) => {
+    const required = input.getToolRequiredAuth(toolName);
+    if (!required.includes('google_oauth')) return undefined;
+    if (input.googleOAuthReady) return { ready: true };
+    return {
+      ready: false,
+      reason: `Blocked by Google OAuth: profile "${profileLabel}" is not ready.`,
+    };
+  };
 }
 
 function classifyTalkError(err: unknown, clientSignal?: AbortSignal): TalkErrorPayload {
@@ -496,8 +514,21 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
     meta.toolsAllow,
     meta.toolsDeny,
   );
-  const policyStates = evaluateToolAvailability(prePolicyToolInfos, meta);
-  const policyFilteredToolInfos = policyStates
+  const needsGoogleOAuth = prePolicyToolInfos.some((tool) =>
+    catalog.getToolRequiredAuth(tool.name).includes('google_oauth'),
+  );
+  const googleAuthStatus = needsGoogleOAuth
+    ? await googleDocsAuthStatusForProfile(meta.googleAuthProfile)
+    : undefined;
+  const isAuthReady = buildTalkAuthReadyResolver({
+    googleOAuthReady: Boolean(googleAuthStatus?.accessTokenReady ?? true),
+    googleAuthProfile: meta.googleAuthProfile,
+    getToolRequiredAuth: (toolName) => catalog.getToolRequiredAuth(toolName),
+  });
+  const policyStatesWithAuth = evaluateToolAvailability(prePolicyToolInfos, meta, {
+    isAuthReady,
+  });
+  const policyFilteredToolInfos = policyStatesWithAuth
     .filter((tool) => tool.enabled)
     .map(({ name, description, builtin }) => ({ name, description, builtin }));
   const availableToolInfos = prioritizeTurnToolInfos(policyFilteredToolInfos, body.message);
@@ -857,7 +888,7 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
     logger.info(`TalkChat: tool bypass (${reason}) talkId=${talkId}`);
   }
   if (hasPolicyBlockedTools) {
-    const blocked = policyStates.find((tool) => !tool.enabled && tool.reason);
+    const blocked = policyStatesWithAuth.find((tool) => !tool.enabled && tool.reason);
     emitStatusEvent(res, {
       code: 'TOOLS_BLOCKED_BY_POLICY',
       message: blocked?.reason || 'Tools are blocked by current Talk policy settings.',

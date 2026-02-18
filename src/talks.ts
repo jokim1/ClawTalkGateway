@@ -127,6 +127,23 @@ async function resolveCatalogAuth(requirements: string[] | undefined): Promise<{
   };
 }
 
+function buildTalkAuthReadyResolver(input: {
+  googleOAuthReady: boolean;
+  googleAuthProfile?: string;
+  getToolRequiredAuth: (toolName: string) => string[];
+}): (toolName: string) => { ready: boolean; reason?: string } | undefined {
+  const profileLabel = input.googleAuthProfile?.trim() || 'default';
+  return (toolName: string) => {
+    const required = input.getToolRequiredAuth(toolName);
+    if (!required.includes('google_oauth')) return undefined;
+    if (input.googleOAuthReady) return { ready: true };
+    return {
+      ready: false,
+      reason: `Blocked by Google OAuth: profile "${profileLabel}" is not ready.`,
+    };
+  };
+}
+
 function normalizePermission(raw: unknown): PlatformPermission {
   const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
   if (value === 'read' || value === 'write' || value === 'read+write') {
@@ -1188,8 +1205,15 @@ async function handleGetTalkTools(
   const catalog = getToolCatalog(ctx.pluginCfg.dataDir, ctx.logger);
   const registeredTools = registry?.listTools() ?? [];
   const allTools = registeredTools;
+  const googleAuthStatus = await googleDocsAuthStatusForProfile(talk.googleAuthProfile);
+  const isAuthReady = buildTalkAuthReadyResolver({
+    googleOAuthReady: Boolean(googleAuthStatus.accessTokenReady),
+    googleAuthProfile: talk.googleAuthProfile,
+    getToolRequiredAuth: (toolName) => catalog.getToolRequiredAuth(toolName),
+  });
   const effectiveToolStates = evaluateToolAvailability(allTools, talk, {
     isInstalled: (toolName) => catalog.isToolEnabled(toolName),
+    isAuthReady,
   });
   const enabledTools = effectiveToolStates
     .filter((tool) => tool.enabled)
@@ -1287,8 +1311,15 @@ async function handleUpdateTalkTools(
   const catalog = getToolCatalog(ctx.pluginCfg.dataDir, ctx.logger);
   const registeredTools = registry?.listTools() ?? [];
   const allTools = registeredTools;
+  const googleAuthStatus = await googleDocsAuthStatusForProfile(updated.googleAuthProfile);
+  const isAuthReady = buildTalkAuthReadyResolver({
+    googleOAuthReady: Boolean(googleAuthStatus.accessTokenReady),
+    googleAuthProfile: updated.googleAuthProfile,
+    getToolRequiredAuth: (toolName) => catalog.getToolRequiredAuth(toolName),
+  });
   const effectiveToolStates = evaluateToolAvailability(allTools, updated, {
     isInstalled: (toolName) => catalog.isToolEnabled(toolName),
+    isAuthReady,
   });
   const enabledTools = effectiveToolStates
     .filter((tool) => tool.enabled)

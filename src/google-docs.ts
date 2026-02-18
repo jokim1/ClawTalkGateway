@@ -993,6 +993,8 @@ export async function listGoogleDocsAuthProfiles(): Promise<{
     hasClientId: boolean;
     hasClientSecret: boolean;
     hasRefreshToken: boolean;
+    accessTokenReady: boolean;
+    error?: string;
     accountEmail?: string;
     accountDisplayName?: string;
   }>;
@@ -1020,11 +1022,19 @@ export async function listGoogleDocsAuthProfiles(): Promise<{
         const hasClientId = Boolean(record.client_id?.trim());
         const hasClientSecret = Boolean(record.client_secret?.trim());
         const hasRefreshToken = Boolean(record.refresh_token?.trim());
+        let accessTokenReady = false;
+        let error: string | undefined;
         let accountEmail: string | undefined;
         let accountDisplayName: string | undefined;
 
-        // Best-effort identity lookup to make profile selection clear in clients.
+        // Best-effort readiness + identity lookup to make profile state clear in clients.
         if (hasClientId && hasClientSecret && hasRefreshToken) {
+          try {
+            await getAccessToken(name);
+            accessTokenReady = true;
+          } catch (err) {
+            error = err instanceof Error ? err.message : String(err);
+          }
           try {
             const about = await googleFetchJson(
               'https://www.googleapis.com/drive/v3/about?fields=user(emailAddress,displayName)',
@@ -1043,6 +1053,8 @@ export async function listGoogleDocsAuthProfiles(): Promise<{
           hasClientId,
           hasClientSecret,
           hasRefreshToken,
+          accessTokenReady,
+          ...(error ? { error } : {}),
           ...(accountEmail ? { accountEmail } : {}),
           ...(accountDisplayName ? { accountDisplayName } : {}),
         };

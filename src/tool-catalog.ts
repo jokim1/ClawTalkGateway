@@ -137,6 +137,7 @@ export class ToolCatalog {
   private readonly persistPath?: string;
   private readonly installedIds = new Set<string>();
   private readonly managedToolToCatalogId = new Map<string, string>();
+  private readonly managedToolAuthRequirements = new Map<string, string[]>();
 
   constructor(dataDir: string | undefined, logger: Logger) {
     this.logger = logger;
@@ -146,6 +147,7 @@ export class ToolCatalog {
     for (const entry of CATALOG_DEFINITIONS) {
       for (const toolName of entry.toolNames) {
         this.managedToolToCatalogId.set(toolName.toLowerCase(), entry.id);
+        this.managedToolAuthRequirements.set(toolName.toLowerCase(), [...(entry.requiredAuth ?? [])]);
       }
       if (entry.defaultInstalled) this.installedIds.add(entry.id);
     }
@@ -174,6 +176,10 @@ export class ToolCatalog {
     const catalogId = this.managedToolToCatalogId.get(toolName.toLowerCase());
     if (!catalogId) return true;
     return this.installedIds.has(catalogId);
+  }
+
+  getToolRequiredAuth(toolName: string): string[] {
+    return [...(this.managedToolAuthRequirements.get(toolName.toLowerCase()) ?? [])];
   }
 
   filterEnabledTools<T extends { name: string }>(tools: T[]): T[] {

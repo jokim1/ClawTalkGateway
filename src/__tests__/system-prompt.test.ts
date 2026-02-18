@@ -219,4 +219,16 @@ describe('composeSystemPrompt', () => {
     expect(result).toContain('Test objective');
     expect(result).toContain('Some context');
   });
+
+  it('includes Google gateway-only tool guidance', () => {
+    const result = composeSystemPrompt({
+      meta: makeMeta(),
+      contextMd: '',
+      pinnedMessages: [],
+      registry: { listTools: () => [] } as any,
+      toolManifest: [{ name: 'google_docs_create', description: 'Create docs', builtin: true }],
+    })!;
+    expect(result).toContain('google_docs_*');
+    expect(result).toContain('Do not use or mention `gog` CLI');
+  });
 });

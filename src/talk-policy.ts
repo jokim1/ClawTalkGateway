@@ -52,6 +52,8 @@ const NETWORK_TOOLS = new Set([
 const BROWSER_TOOL_NAME_RE = /(browser|chrome|playwright|puppeteer|relay|snapshot|navigate)/i;
 const BROWSER_INTENT_RE =
   /\b(browser|tab|chrome|take over|control (my )?browser|attach(ed)? tab|openclaw browser relay)\b/i;
+const BROWSER_INTENT_NEGATION_RE =
+  /\b(?:without|rather than|instead of|avoid|skip|do not|don't|dont|not)\s+(?:using\s+|use\s+)?(?:the\s+)?(?:browser|chrome|tabs?|openclaw browser relay)\b/i;
 
 export function normalizeExecutionModeInput(raw: unknown): ExecutionMode | undefined {
   if (typeof raw !== 'string') return undefined;
@@ -102,6 +104,7 @@ export function executionModeLabel(mode: ExecutionMode): ExecutionModeLabel {
 }
 
 export function isBrowserIntent(message: string): boolean {
+  if (BROWSER_INTENT_NEGATION_RE.test(message)) return false;
   return BROWSER_INTENT_RE.test(message);
 }
 
@@ -111,6 +114,7 @@ export function isBrowserTool(toolName: string): boolean {
 
 export type ToolBlockedReasonCode =
   | 'blocked_not_installed'
+  | 'blocked_auth'
   | 'blocked_allowlist'
   | 'blocked_denylist'
   | 'blocked_execution_mode'
@@ -133,6 +137,7 @@ function deriveToolBlockedReason(
   allowSet: Set<string>,
   denySet: Set<string>,
   isInstalled?: (toolName: string) => boolean,
+  isAuthReady?: (toolName: string) => { ready: boolean; reason?: string } | undefined,
 ): { code: ToolBlockedReasonCode; reason: string } | null {
   const key = toolName.toLowerCase();
   if (isInstalled && !isInstalled(key)) {
@@ -171,6 +176,15 @@ function deriveToolBlockedReason(
       reason: 'Blocked by Network Access: Restricted.',
     };
   }
+  if (isAuthReady) {
+    const authState = isAuthReady(key);
+    if (authState && !authState.ready) {
+      return {
+        code: 'blocked_auth',
+        reason: authState.reason || 'Blocked by OAuth readiness: connect required account first.',
+      };
+    }
+  }
   if (toolMode === 'off') {
     return {
       code: 'blocked_tool_mode',
@@ -185,6 +199,7 @@ export function evaluateToolAvailability(
   talk: Pick<TalkMeta, 'executionMode' | 'filesystemAccess' | 'networkAccess' | 'toolsAllow' | 'toolsDeny' | 'toolMode'>,
   options?: {
     isInstalled?: (toolName: string) => boolean;
+    isAuthReady?: (toolName: string) => { ready: boolean; reason?: string } | undefined;
   },
 ): ToolAvailabilityState[] {
   const executionMode = resolveExecutionMode(talk);
@@ -206,6 +221,7 @@ export function evaluateToolAvailability(
       allowSet,
       denySet,
       options?.isInstalled,
+      options?.isAuthReady,
     );
     if (!blocked) return { ...tool, enabled: true };
     return {

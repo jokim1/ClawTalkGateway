@@ -162,6 +162,15 @@ export class ToolExecutor {
         durationMs: 0,
       });
     }
+    if (/\bgog\b/i.test(command)) {
+      return Promise.resolve({
+        success: false,
+        content:
+          'Blocked command: `gog` is not supported in ClawTalk talk runs. ' +
+          'Use gateway Google tools (`google_docs_*`, `google_drive_files`) instead.',
+        durationMs: 0,
+      });
+    }
 
     const timeoutS = Math.min(
       Math.max(1, Number(args.timeout) || DEFAULT_TIMEOUT_S),
