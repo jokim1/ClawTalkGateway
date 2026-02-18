@@ -55,7 +55,7 @@ const BROWSER_INTENT_RE =
 const BROWSER_INTENT_NEGATION_RE =
   /\b(?:without|rather than|instead of|avoid|skip|do not|don't|dont|not)\s+(?:using\s+|use\s+)?(?:the\s+)?(?:browser|chrome|tabs?|openclaw browser relay)\b/i;
 const GOOGLE_DOCS_TAB_INTENT_RE =
-  /\bgoogle\s+doc(s)?\b.*\btab(s)?\b|\btab(s)?\b.*\bgoogle\s+doc(s)?\b/i;
+  /\b(?:google\s+doc(s)?|doc(s|ument)?)\b.*\btab(s)?\b|\btab(s)?\b.*\b(?:google\s+doc(s)?|doc(s|ument)?)\b/i;
 
 export function normalizeExecutionModeInput(raw: unknown): ExecutionMode | undefined {
   if (typeof raw !== 'string') return undefined;

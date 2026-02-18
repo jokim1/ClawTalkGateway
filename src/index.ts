@@ -556,6 +556,21 @@ const plugin = {
           executor: toolExecutor,
           dataDir: pluginCfg.dataDir,
           jobTimeoutMs: pluginCfg.jobTimeoutMs,
+          sendSlackMessage: async (params: {
+            accountId?: string;
+            channelId: string;
+            threadTs?: string;
+            message: string;
+          }) =>
+            replyHandler(
+              {
+                platform: 'slack',
+                accountId: params.accountId,
+                platformChannelId: params.channelId,
+                threadId: params.threadTs,
+              },
+              params.message,
+            ),
         });
       },
       stop: () => {

@@ -229,10 +229,25 @@ export interface TalkJob {
   type?: 'once' | 'recurring' | 'event';  // default 'recurring' for backwards compat
   schedule: string;  // time-based schedule OR "on <scope>" for event-driven
   prompt: string;
+  output?: JobOutputDestination;
   active: boolean;
   createdAt: number;
   lastRunAt?: number;
   lastStatus?: string;
+}
+
+export interface JobOutputDestination {
+  type: 'report_only' | 'talk' | 'slack';
+  accountId?: string;
+  channelId?: string;
+  threadTs?: string;
+}
+
+export interface JobDeliveryResult {
+  attempted: boolean;
+  destination: string;
+  success: boolean;
+  error?: string;
 }
 
 export interface JobReport {
@@ -240,9 +255,10 @@ export interface JobReport {
   jobId: string;
   talkId: string;
   runAt: number;
-  status: 'success' | 'error';
+  status: 'success' | 'partial_success' | 'error';
   summary: string;
   fullOutput: string;
+  delivery?: JobDeliveryResult;
   tokenUsage?: { input: number; output: number };
 }
 

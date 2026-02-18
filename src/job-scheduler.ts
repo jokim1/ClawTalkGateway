@@ -16,7 +16,7 @@
 
 import { randomUUID } from 'node:crypto';
 import type { TalkStore } from './talk-store.js';
-import type { TalkJob, JobReport, Logger } from './types.js';
+import type { TalkJob, JobReport, JobDeliveryResult, Logger } from './types.js';
 import type { ToolInfo } from './tool-registry.js';
 import type { ToolRegistry } from './tool-registry.js';
 import type { ToolExecutor } from './tool-executor.js';
@@ -47,6 +47,12 @@ export interface JobSchedulerOptions {
   executor: ToolExecutor;
   dataDir?: string;
   jobTimeoutMs?: number;
+  sendSlackMessage?: (params: {
+    accountId?: string;
+    channelId: string;
+    threadTs?: string;
+    message: string;
+  }) => Promise<boolean>;
 }
 
 const CLAWTALK_DEFAULT_AGENT_ID = 'clawtalk';
@@ -810,14 +816,19 @@ Provide a concise report of your findings or actions. Start with a one-line summ
     const fullOutput = result.fullContent.trim();
     const summary = fullOutput.split('\n')[0].slice(0, 200);
 
+    const delivery = await deliverJobOutput(opts, talkId, job, fullOutput);
+    const status: JobReport['status'] =
+      delivery.attempted && !delivery.success ? 'partial_success' : 'success';
+
     const report: JobReport = {
       id: randomUUID(),
       jobId: job.id,
       talkId,
       runAt,
-      status: 'success',
+      status,
       summary,
       fullOutput,
+      ...(delivery.attempted ? { delivery } : {}),
       tokenUsage: result.usage ? {
         input: result.usage.prompt_tokens,
         output: result.usage.completion_tokens,
@@ -825,14 +836,14 @@ Provide a concise report of your findings or actions. Start with a one-line summ
     };
 
     await store.appendReport(talkId, report);
-    store.updateJob(talkId, job.id, { lastRunAt: runAt, lastStatus: 'success' });
+    store.updateJob(talkId, job.id, { lastRunAt: runAt, lastStatus: status });
 
     // Auto-deactivate one-off jobs after execution
     if (job.type === 'once') {
       store.updateJob(talkId, job.id, { active: false });
-      logger.info(`JobScheduler: one-off job ${job.id} completed and deactivated — "${summary}"`);
+      logger.info(`JobScheduler: one-off job ${job.id} completed (${status}) and deactivated — "${summary}"`);
     } else {
-      logger.info(`JobScheduler: job ${job.id} completed — "${summary}"`);
+      logger.info(`JobScheduler: job ${job.id} completed (${status}) — "${summary}"`);
     }
 
     return report;
@@ -859,4 +870,84 @@ Provide a concise report of your findings or actions. Start with a one-line summ
   } finally {
     store.setProcessing(talkId, false);
   }
+}
+
+async function deliverJobOutput(
+  opts: JobSchedulerOptions,
+  talkId: string,
+  job: TalkJob,
+  message: string,
+): Promise<JobDeliveryResult> {
+  const output = job.output ?? { type: 'report_only' as const };
+  if (output.type === 'report_only') {
+    return {
+      attempted: false,
+      destination: 'report_only',
+      success: true,
+    };
+  }
+
+  if (output.type === 'talk') {
+    try {
+      await opts.store.appendMessage(talkId, {
+        id: randomUUID(),
+        role: 'assistant',
+        content: message,
+        timestamp: Date.now(),
+        agentName: 'Automation',
+      });
+      return {
+        attempted: true,
+        destination: 'talk',
+        success: true,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        attempted: true,
+        destination: 'talk',
+        success: false,
+        error: msg,
+      };
+    }
+  }
+
+  if (output.type === 'slack') {
+    if (!opts.sendSlackMessage) {
+      return {
+        attempted: true,
+        destination: 'slack',
+        success: false,
+        error: 'Slack delivery callback is not configured',
+      };
+    }
+    try {
+      const sent = await opts.sendSlackMessage({
+        accountId: output.accountId,
+        channelId: output.channelId ?? '',
+        threadTs: output.threadTs,
+        message,
+      });
+      return {
+        attempted: true,
+        destination: `slack:${output.channelId ?? 'unknown'}`,
+        success: sent,
+        ...(sent ? {} : { error: 'Slack API delivery returned false' }),
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        attempted: true,
+        destination: `slack:${output.channelId ?? 'unknown'}`,
+        success: false,
+        error: msg,
+      };
+    }
+  }
+
+  return {
+    attempted: false,
+    destination: 'report_only',
+    success: true,
+  };
 }

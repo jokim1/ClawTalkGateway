@@ -8,6 +8,7 @@
 import type { HandlerContext } from './types.js';
 import type { TalkStore } from './talk-store.js';
 import type {
+  JobOutputDestination,
   PlatformBehavior,
   PlatformBinding,
   PlatformPermission,
@@ -52,6 +53,9 @@ type PlatformBindingsValidationResult =
 type PlatformBehaviorsValidationResult =
   | { ok: true; behaviors: PlatformBehavior[] }
   | { ok: false; error: string };
+type AgentsValidationResult =
+  | { ok: true; agents: TalkAgent[] }
+  | { ok: false; error: string };
 
 type SlackScopeResolutionResult =
   | { ok: true; canonicalScope: string; accountId?: string; displayScope?: string }
@@ -85,9 +89,45 @@ type SlackConversationInfoResponse = {
 const SLACK_LOOKUP_TIMEOUT_MS = 10_000;
 const SLACK_CHANNEL_CACHE_TTL_MS = 5 * 60_000;
 const DEFAULT_SLACK_ACCOUNT_ID = 'default';
+const TALK_AGENT_ROLES = new Set(['analyst', 'critic', 'strategist', 'devils-advocate', 'synthesizer', 'editor']);
 
 const slackChannelNameByIdCache = new Map<string, { name: string; expiresAt: number }>();
 const slackChannelIdByNameCache = new Map<string, { id: string; name: string; expiresAt: number }>();
+
+function normalizeJobOutputInput(raw: unknown): { ok: true; output: JobOutputDestination } | { ok: false; error: string } {
+  if (raw === undefined || raw === null) {
+    return { ok: true, output: { type: 'report_only' } };
+  }
+  if (typeof raw !== 'object') {
+    return { ok: false, error: 'output must be an object' };
+  }
+  const row = raw as Record<string, unknown>;
+  const type = typeof row.type === 'string' ? row.type.trim().toLowerCase() : '';
+  if (type === 'report_only') {
+    return { ok: true, output: { type: 'report_only' } };
+  }
+  if (type === 'talk') {
+    return { ok: true, output: { type: 'talk' } };
+  }
+  if (type === 'slack') {
+    const channelId = typeof row.channelId === 'string' ? row.channelId.trim() : '';
+    if (!channelId) {
+      return { ok: false, error: 'output.channelId is required when output.type is "slack"' };
+    }
+    const accountId = typeof row.accountId === 'string' ? row.accountId.trim() : '';
+    const threadTs = typeof row.threadTs === 'string' ? row.threadTs.trim() : '';
+    return {
+      ok: true,
+      output: {
+        type: 'slack',
+        channelId,
+        ...(accountId ? { accountId } : {}),
+        ...(threadTs ? { threadTs } : {}),
+      },
+    };
+  }
+  return { ok: false, error: 'output.type must be one of: report_only, talk, slack' };
+}
 
 type CatalogAuthRequirement = {
   id: string;
@@ -214,6 +254,47 @@ function normalizeToolNameListInput(raw: unknown): string[] | undefined {
   return out;
 }
 
+function normalizeAndValidateAgentsInput(input: unknown): AgentsValidationResult {
+  if (!Array.isArray(input)) {
+    return { ok: false, error: 'agents must be an array' };
+  }
+  const seen = new Set<string>();
+  let primaryCount = 0;
+  const normalized: TalkAgent[] = [];
+  for (let i = 0; i < input.length; i += 1) {
+    const entry = input[i];
+    if (!entry || typeof entry !== 'object') {
+      return { ok: false, error: `agents[${i + 1}] must be an object` };
+    }
+    const row = entry as Record<string, unknown>;
+    const name = typeof row.name === 'string' ? row.name.trim() : '';
+    const model = typeof row.model === 'string' ? row.model.trim() : '';
+    const role = typeof row.role === 'string' ? row.role.trim().toLowerCase() : '';
+    const isPrimary = row.isPrimary === true;
+    const openClawAgentId = typeof row.openClawAgentId === 'string' ? row.openClawAgentId.trim() : '';
+    if (!name) return { ok: false, error: `agents[${i + 1}].name is required` };
+    if (!model) return { ok: false, error: `agents[${i + 1}].model is required` };
+    if (!TALK_AGENT_ROLES.has(role)) {
+      return { ok: false, error: `agents[${i + 1}].role must be one of: ${Array.from(TALK_AGENT_ROLES).join(', ')}` };
+    }
+    const key = name.toLowerCase();
+    if (seen.has(key)) return { ok: false, error: `Duplicate agent name "${name}"` };
+    seen.add(key);
+    if (isPrimary) primaryCount += 1;
+    normalized.push({
+      name,
+      model,
+      role: role as TalkAgent['role'],
+      isPrimary,
+      ...(openClawAgentId ? { openClawAgentId } : {}),
+    });
+  }
+  if (primaryCount > 1) {
+    return { ok: false, error: 'Only one agent can be primary (isPrimary=true)' };
+  }
+  return { ok: true, agents: normalized };
+}
+
 function normalizeGoogleAuthProfileInput(raw: unknown): string | undefined {
   if (raw === undefined) return undefined;
   if (typeof raw !== 'string') return undefined;
@@ -257,6 +338,61 @@ function mapChannelResponseSettingsInput(input: unknown): unknown {
       ...(responderAgent ? { agentName: responderAgent } : {}),
       ...(responseInstruction ? { onMessagePrompt: responseInstruction } : {}),
       ...(autoRespond !== undefined ? { autoRespond } : {}),
+    };
+  });
+}
+
+function resolveBindingIdFromAlias(
+  alias: string,
+  bindings: PlatformBinding[],
+): string | undefined {
+  const trimmed = alias.trim();
+  if (!trimmed) return undefined;
+
+  const byDirectId = bindings.find((binding) => binding.id === trimmed);
+  if (byDirectId) return byDirectId.id;
+
+  const byPlatformIndex = trimmed.match(/^platform(\d+)$/i);
+  if (byPlatformIndex) {
+    const idx = parseInt(byPlatformIndex[1], 10);
+    if (idx >= 1 && idx <= bindings.length) {
+      return bindings[idx - 1].id;
+    }
+  }
+
+  const lowered = trimmed.toLowerCase();
+  const byScope = bindings.find((binding) => binding.scope.trim().toLowerCase() === lowered);
+  if (byScope) return byScope.id;
+
+  const byDisplayScope = bindings.find(
+    (binding) => (binding.displayScope ?? '').trim().toLowerCase() === lowered,
+  );
+  if (byDisplayScope) return byDisplayScope.id;
+
+  return undefined;
+}
+
+export function resolvePlatformBehaviorBindingRefsInput(
+  input: unknown,
+  bindings: PlatformBinding[],
+): unknown {
+  if (!Array.isArray(input) || bindings.length === 0) return input;
+  return input.map((entry) => {
+    if (!entry || typeof entry !== 'object') return entry;
+    const row = entry as Record<string, unknown>;
+    const explicitBindingId =
+      typeof row.platformBindingId === 'string' ? row.platformBindingId.trim() : '';
+    const connectionId =
+      typeof row.connectionId === 'string' ? row.connectionId.trim() : '';
+
+    const resolvedBindingId =
+      resolveBindingIdFromAlias(explicitBindingId, bindings) ??
+      resolveBindingIdFromAlias(connectionId, bindings) ??
+      (bindings.length === 1 ? bindings[0].id : undefined);
+
+    return {
+      ...row,
+      ...(resolvedBindingId ? { platformBindingId: resolvedBindingId } : {}),
     };
   });
 }
@@ -1132,8 +1268,13 @@ async function handleCreateTalk(ctx: HandlerContext, store: TalkStore): Promise<
   }
 
   if (body.platformBehaviors !== undefined) {
+    const effectiveBindings = body.platformBindings ?? [];
+    body.platformBehaviors = resolvePlatformBehaviorBindingRefsInput(
+      body.platformBehaviors,
+      effectiveBindings,
+    ) as any[];
     const behaviorParse = normalizeAndValidatePlatformBehaviorsInput(body.platformBehaviors, {
-      bindings: body.platformBindings ?? [],
+      bindings: effectiveBindings,
       agents: [],
     });
     if (!behaviorParse.ok) {
@@ -1420,6 +1561,7 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
     objectives?: string | string[];
     model?: string;
     agents?: any[];
+    replaceAgents?: boolean;
     directives?: any[];
     rules?: any[];
     platformBindings?: any[];
@@ -1543,9 +1685,33 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
     body.platformBindings = parsed.bindings;
   }
 
+  let normalizedAgentsForUpdate: TalkAgent[] | undefined;
+  if (body.agents !== undefined) {
+    const parsedAgents = normalizeAndValidateAgentsInput(body.agents);
+    if (!parsedAgents.ok) {
+      sendJson(ctx.res, 400, { error: parsedAgents.error });
+      return;
+    }
+    const replaceAgents = body.replaceAgents === true;
+    if (replaceAgents) {
+      normalizedAgentsForUpdate = parsedAgents.agents;
+    } else {
+      // Safety default: preserve existing agents not included in partial client payloads.
+      const existingAgents = talk.agents ?? [];
+      const incomingNames = new Set(parsedAgents.agents.map((agent) => agent.name.toLowerCase()));
+      const preserved = existingAgents.filter((agent) => !incomingNames.has(agent.name.toLowerCase()));
+      normalizedAgentsForUpdate = [...parsedAgents.agents, ...preserved];
+    }
+    body.agents = normalizedAgentsForUpdate;
+  }
+
   if (body.platformBehaviors !== undefined) {
     const effectiveBindings = body.platformBindings ?? (talk.platformBindings ?? []);
-    const effectiveAgents = body.agents ?? (talk.agents ?? []);
+    body.platformBehaviors = resolvePlatformBehaviorBindingRefsInput(
+      body.platformBehaviors,
+      effectiveBindings,
+    ) as any[];
+    const effectiveAgents = normalizedAgentsForUpdate ?? (talk.agents ?? []);
     const behaviorParse = normalizeAndValidatePlatformBehaviorsInput(body.platformBehaviors, {
       bindings: effectiveBindings,
       agents: effectiveAgents,
@@ -1557,8 +1723,8 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
     body.platformBehaviors = behaviorParse.behaviors;
   }
 
-  if (body.agents !== undefined) {
-    await store.setAgents(talkId, body.agents);
+  if (normalizedAgentsForUpdate !== undefined) {
+    await store.setAgents(talkId, normalizedAgentsForUpdate);
   }
   if (body.directives !== undefined) {
     await store.setDirectives(talkId, body.directives);
@@ -1694,7 +1860,7 @@ async function handleCreateJob(ctx: HandlerContext, store: TalkStore, talkId: st
     return;
   }
 
-  let body: { schedule?: string; prompt?: string };
+  let body: { schedule?: string; prompt?: string; output?: unknown };
   try {
     body = (await readJsonBody(ctx.req)) as typeof body;
   } catch {
@@ -1704,6 +1870,11 @@ async function handleCreateJob(ctx: HandlerContext, store: TalkStore, talkId: st
 
   if (!body.schedule || !body.prompt) {
     sendJson(ctx.res, 400, { error: 'Missing schedule or prompt' });
+    return;
+  }
+  const outputResult = normalizeJobOutputInput(body.output);
+  if (!outputResult.ok) {
+    sendJson(ctx.res, 400, { error: outputResult.error });
     return;
   }
 
@@ -1753,7 +1924,7 @@ async function handleCreateJob(ctx: HandlerContext, store: TalkStore, talkId: st
     jobType = 'event';
   }
 
-  const job = store.addJob(talkId, body.schedule, body.prompt, jobType);
+  const job = store.addJob(talkId, body.schedule, body.prompt, jobType, outputResult.output);
   if (!job) {
     sendJson(ctx.res, 500, { error: 'Failed to create job' });
     return;
@@ -1779,12 +1950,22 @@ async function handleUpdateJob(ctx: HandlerContext, store: TalkStore, talkId: st
     return;
   }
 
-  let body: { active?: boolean; schedule?: string; prompt?: string };
+  let body: { active?: boolean; schedule?: string; prompt?: string; output?: unknown };
   try {
     body = (await readJsonBody(ctx.req)) as typeof body;
   } catch {
     sendJson(ctx.res, 400, { error: 'Invalid JSON body' });
     return;
+  }
+
+  let nextOutput: JobOutputDestination | undefined;
+  if (body.output !== undefined) {
+    const outputResult = normalizeJobOutputInput(body.output);
+    if (!outputResult.ok) {
+      sendJson(ctx.res, 400, { error: outputResult.error });
+      return;
+    }
+    nextOutput = outputResult.output;
   }
 
   let nextType: 'once' | 'recurring' | 'event' | undefined;
@@ -1832,7 +2013,10 @@ async function handleUpdateJob(ctx: HandlerContext, store: TalkStore, talkId: st
   }
 
   const updated = store.updateJob(talkId, jobId, {
-    ...body,
+    ...(body.active !== undefined ? { active: body.active } : {}),
+    ...(body.schedule !== undefined ? { schedule: body.schedule } : {}),
+    ...(body.prompt !== undefined ? { prompt: body.prompt } : {}),
+    ...(nextOutput ? { output: nextOutput } : {}),
     ...(nextType ? { type: nextType } : {}),
   });
   if (!updated) {

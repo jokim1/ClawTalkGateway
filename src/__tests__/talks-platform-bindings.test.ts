@@ -5,6 +5,7 @@ import {
   normalizeAndValidatePlatformBehaviorsInput,
   normalizeAndValidatePlatformBindingsInput,
   normalizeSlackBindingScope,
+  resolvePlatformBehaviorBindingRefsInput,
 } from '../talks';
 
 function makeTalk(bindings: Array<{
@@ -202,5 +203,50 @@ describe('findSlackBindingConflicts', () => {
         skipTalkId: existingWritable.id,
       }),
     ).toHaveLength(0);
+  });
+});
+
+describe('resolvePlatformBehaviorBindingRefsInput', () => {
+  it('resolves channelResponseSettings connectionId platformN aliases', () => {
+    const bindings = [
+      {
+        id: randomUUID(),
+        platform: 'slack',
+        scope: 'channel:C111',
+        permission: 'read+write' as const,
+        createdAt: Date.now(),
+      },
+      {
+        id: randomUUID(),
+        platform: 'slack',
+        scope: 'channel:C222',
+        permission: 'read+write' as const,
+        createdAt: Date.now(),
+      },
+    ];
+
+    const mapped = resolvePlatformBehaviorBindingRefsInput(
+      [{ connectionId: 'platform2', onMessagePrompt: 'Do work' }],
+      bindings,
+    ) as Array<{ platformBindingId?: string }>;
+
+    expect(mapped[0]?.platformBindingId).toBe(bindings[1].id);
+  });
+
+  it('defaults to the only binding when none specified', () => {
+    const bindings = [
+      {
+        id: randomUUID(),
+        platform: 'slack',
+        scope: 'channel:C111',
+        permission: 'read+write' as const,
+        createdAt: Date.now(),
+      },
+    ];
+    const mapped = resolvePlatformBehaviorBindingRefsInput(
+      [{ onMessagePrompt: 'Do work' }],
+      bindings,
+    ) as Array<{ platformBindingId?: string }>;
+    expect(mapped[0]?.platformBindingId).toBe(bindings[0].id);
   });
 });

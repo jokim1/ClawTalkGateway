@@ -20,6 +20,7 @@ import type {
   TalkPlatformBinding,
   TalkPlatformBehavior,
   JobReport,
+  JobOutputDestination,
   Directive,
   PlatformBinding,
   PlatformBehavior,
@@ -130,6 +131,70 @@ function normalizeDirectives(input: unknown): Directive[] {
     .filter((entry): entry is Directive => Boolean(entry));
 }
 
+function normalizeJobOutput(raw: unknown): JobOutputDestination {
+  if (!raw || typeof raw !== 'object') {
+    return { type: 'report_only' };
+  }
+
+  const row = raw as Record<string, unknown>;
+  const type = typeof row.type === 'string' ? row.type.trim().toLowerCase() : '';
+  if (type === 'talk') {
+    return { type: 'talk' };
+  }
+
+  if (type === 'slack') {
+    const channelId = typeof row.channelId === 'string' ? row.channelId.trim() : '';
+    const accountId = typeof row.accountId === 'string' ? row.accountId.trim() : '';
+    const threadTs = typeof row.threadTs === 'string' ? row.threadTs.trim() : '';
+    if (!channelId) return { type: 'report_only' };
+    return {
+      type: 'slack',
+      channelId,
+      ...(accountId ? { accountId } : {}),
+      ...(threadTs ? { threadTs } : {}),
+    };
+  }
+
+  return { type: 'report_only' };
+}
+
+function normalizeJob(raw: unknown): TalkJob | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const row = raw as Record<string, unknown>;
+
+  const id = typeof row.id === 'string' ? row.id.trim() : '';
+  const schedule = typeof row.schedule === 'string' ? row.schedule.trim() : '';
+  const prompt = typeof row.prompt === 'string' ? row.prompt.trim() : '';
+  if (!id || !schedule || !prompt) return null;
+
+  const rawType = typeof row.type === 'string' ? row.type.trim().toLowerCase() : '';
+  const type: TalkJob['type'] =
+    rawType === 'once' || rawType === 'recurring' || rawType === 'event'
+      ? rawType
+      : 'recurring';
+
+  return {
+    id,
+    type,
+    schedule,
+    prompt,
+    output: normalizeJobOutput(row.output),
+    active: row.active !== false,
+    createdAt: typeof row.createdAt === 'number' ? row.createdAt : Date.now(),
+    ...(typeof row.lastRunAt === 'number' ? { lastRunAt: row.lastRunAt } : {}),
+    ...(typeof row.lastStatus === 'string' && row.lastStatus.trim()
+      ? { lastStatus: row.lastStatus.trim() }
+      : {}),
+  };
+}
+
+function normalizeJobs(input: unknown): TalkJob[] {
+  if (!Array.isArray(input)) return [];
+  return input
+    .map(normalizeJob)
+    .filter((job): job is TalkJob => Boolean(job));
+}
+
 function normalizePlatformBindings(input: unknown): PlatformBinding[] {
   if (!Array.isArray(input)) return [];
   const now = Date.now();
@@ -236,7 +301,7 @@ export class TalkStore {
           const meta = JSON.parse(raw) as TalkMeta;
           // Ensure arrays exist (for older files)
           meta.pinnedMessageIds ??= [];
-          meta.jobs ??= [];
+          meta.jobs = normalizeJobs(meta.jobs);
           meta.agents ??= [];
           meta.directives = normalizeDirectives(meta.directives);
           meta.platformBindings = normalizePlatformBindings(meta.platformBindings);
@@ -664,6 +729,7 @@ export class TalkStore {
     schedule: string,
     prompt: string,
     type?: 'once' | 'recurring' | 'event',
+    output?: JobOutputDestination,
   ): TalkJob | null {
     const meta = this.talks.get(talkId);
     if (!meta) return null;
@@ -673,6 +739,7 @@ export class TalkStore {
       type: type ?? 'recurring',
       schedule,
       prompt,
+      output: normalizeJobOutput(output),
       active: true,
       createdAt: Date.now(),
     };
@@ -695,7 +762,7 @@ export class TalkStore {
     return meta?.jobs ?? [];
   }
 
-  updateJob(talkId: string, jobId: string, updates: Partial<Pick<TalkJob, 'active' | 'type' | 'schedule' | 'prompt' | 'lastRunAt' | 'lastStatus'>>): TalkJob | null {
+  updateJob(talkId: string, jobId: string, updates: Partial<Pick<TalkJob, 'active' | 'type' | 'schedule' | 'prompt' | 'output' | 'lastRunAt' | 'lastStatus'>>): TalkJob | null {
     const meta = this.talks.get(talkId);
     if (!meta) return null;
     const job = meta.jobs.find(j => j.id === jobId);
@@ -705,6 +772,7 @@ export class TalkStore {
     if (updates.type !== undefined) job.type = updates.type;
     if (updates.schedule !== undefined) job.schedule = updates.schedule;
     if (updates.prompt !== undefined) job.prompt = updates.prompt;
+    if (updates.output !== undefined) job.output = normalizeJobOutput(updates.output);
     if (updates.lastRunAt !== undefined) job.lastRunAt = updates.lastRunAt;
     if (updates.lastStatus !== undefined) job.lastStatus = updates.lastStatus;
     meta.updatedAt = Date.now();

@@ -281,16 +281,25 @@ function extractGoogleDocTabOnlyIntent(message: string): { tabTitles: string[] }
   const text = normalizeIntentText(message);
   if (!/\btab(s)?\b/i.test(text)) return undefined;
   const tabListMatch =
-    text.match(/\b(?:create|add|make)\s+(?:an?\s+)?(?:new\s+)?(?:\w+\s+)?tabs?(?:\s+in\s+[^,\n]+?)?\s+(?:called|named|titled)\s+(.+?)(?=(?:[.?!]|$))/i)
+    text.match(/\b(?:create|add|make)\s+(?:an?\s+)?(?:new\s+)?(?:\w+\s+)?tabs?(?:\s+(?:in|to)\s+[^,\n]+?)?\s+(?:called|named|titled)\s+(.+?)(?=(?:[.?!]|$))/i)
     ?? text.match(/\btabs?\s+(?:called|named|titled)\s+(.+?)(?=(?:[.?!]|$))/i);
   const tabMatch =
-    text.match(/\b(?:create|add|make)\s+(?:an?\s+)?(?:new\s+)?tab(?:\s+in\s+[^,\n]+?)?\s+(?:called|named|titled)\s+["“]?([^"\n”]+?)["”]?(?=(?:[.?!]|$))/i)
+    text.match(/\b(?:create|add|make)\s+(?:an?\s+)?(?:new\s+)?tab(?:\s+(?:in|to)\s+[^,\n]+?)?\s+(?:called|named|titled)\s+["“]?([^"\n”]+?)["”]?(?=(?:[.?!]|$))/i)
     ?? text.match(/\btab\s+(?:called|named|titled)\s+["“]?([^"\n”]+?)["”]?(?=(?:[.?!]|$))/i);
   const tabTitles = tabListMatch?.[1]
     ? splitTabTitles(tabListMatch[1])
     : (tabMatch?.[1]?.trim() ? [tabMatch[1].trim()] : []);
   if (tabTitles.length === 0) return undefined;
   return { tabTitles };
+}
+
+function buildTabClarificationPrompt(message: string, tabTitles: string[]): string | undefined {
+  const text = normalizeIntentText(message).toLowerCase();
+  const usesSingularTab = /\b(?:a|one|single|new)?\s*tab\b/.test(text) && !/\btabs\b/.test(text);
+  if (usesSingularTab && tabTitles.length > 1) {
+    return `I need clarification before changing the doc. You asked for "a tab" but provided multiple names: ${tabTitles.join(', ')}. Should I add one tab named "${tabTitles.join(' and ')}" or separate tabs (${tabTitles.join(', ')})?`;
+  }
+  return undefined;
 }
 
 function extractGoogleDocIdAndUrlFromCreateResult(content: string): { docId?: string; url?: string } {
@@ -725,6 +734,44 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
   // bypass model/tool-chaining for explicit create-doc requests.
   const createIntent = extractGoogleDocCreateIntent(body.message);
   if (!isModelQuestion && createIntent && hasGoogleDocsCreateTool) {
+    const clarification = createIntent.tabTitles
+      ? buildTabClarificationPrompt(body.message, createIntent.tabTitles)
+      : undefined;
+    if (clarification) {
+      const userMessageId = randomUUID();
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.write(`event: meta\ndata: ${JSON.stringify({ userMessageId })}\n\n`);
+      res.write(`data: ${JSON.stringify({
+        choices: [{ delta: { content: clarification } }],
+        model,
+      })}\n\n`);
+      await store.appendMessage(talkId, {
+        id: userMessageId,
+        role: 'user',
+        content: body.message,
+        timestamp: Date.now(),
+        ...(body.agentName && { agentName: body.agentName }),
+        ...(body.agentRole && { agentRole: body.agentRole as any }),
+      });
+      await store.appendMessage(talkId, {
+        id: randomUUID(),
+        role: 'assistant',
+        content: clarification,
+        timestamp: Date.now(),
+        model,
+        ...(body.agentName && { agentName: body.agentName }),
+        ...(body.agentRole && { agentRole: body.agentRole as any }),
+      });
+      if (!res.writableEnded) {
+        res.write('data: [DONE]\n\n');
+        res.end();
+      }
+      return;
+    }
     const userMessageId = randomUUID();
     const createResult = await executor.execute('google_docs_create', JSON.stringify({
       title: createIntent.title,
@@ -742,17 +789,22 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
         } else if (!parsed.docId) {
           directReply = `Created "${createIntent.title}" but could not resolve document ID to add requested tabs.\n\nRaw create result:\n${createResult.content}`;
         } else {
-          const failedTabs: string[] = [];
+          const failedTabs: Array<{ title: string; error: string }> = [];
           for (const tabTitle of createIntent.tabTitles) {
             const tabResult = await executor.execute('google_docs_add_tab', JSON.stringify({
               doc_id: parsed.docId,
               title: tabTitle,
               ...(meta.googleAuthProfile ? { profile: meta.googleAuthProfile } : {}),
             }));
-            if (!tabResult.success) failedTabs.push(tabTitle);
+            if (!tabResult.success) {
+              failedTabs.push({ title: tabTitle, error: tabResult.content });
+            }
           }
           if (failedTabs.length > 0) {
-            directReply = `Created "${createIntent.title}"${parsed.url ? `\n${parsed.url}` : ''}\n\nFailed to add tab(s): ${failedTabs.join(', ')}`;
+            const details = failedTabs
+              .map((entry) => `${entry.title}: ${entry.error}`)
+              .join('\n');
+            directReply = `Created "${createIntent.title}"${parsed.url ? `\n${parsed.url}` : ''}\n\nFailed to add tab(s):\n${details}`;
           } else {
             directReply = `**Created:** ${createIntent.title} with tabs "${createIntent.tabTitles.join(', ')}"${parsed.url ? `\n\n${parsed.url}` : ''}`;
           }
@@ -812,6 +864,42 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
   // supports follow-up requests like "add tabs ... in that doc".
   const tabOnlyIntent = extractGoogleDocTabOnlyIntent(body.message);
   if (!isModelQuestion && !createIntent && tabOnlyIntent && hasGoogleDocsAddTabTool) {
+    const clarification = buildTabClarificationPrompt(body.message, tabOnlyIntent.tabTitles);
+    if (clarification) {
+      const userMessageId = randomUUID();
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.write(`event: meta\ndata: ${JSON.stringify({ userMessageId })}\n\n`);
+      res.write(`data: ${JSON.stringify({
+        choices: [{ delta: { content: clarification } }],
+        model,
+      })}\n\n`);
+      await store.appendMessage(talkId, {
+        id: userMessageId,
+        role: 'user',
+        content: body.message,
+        timestamp: Date.now(),
+        ...(body.agentName && { agentName: body.agentName }),
+        ...(body.agentRole && { agentRole: body.agentRole as any }),
+      });
+      await store.appendMessage(talkId, {
+        id: randomUUID(),
+        role: 'assistant',
+        content: clarification,
+        timestamp: Date.now(),
+        model,
+        ...(body.agentName && { agentName: body.agentName }),
+        ...(body.agentRole && { agentRole: body.agentRole as any }),
+      });
+      if (!res.writableEnded) {
+        res.write('data: [DONE]\n\n');
+        res.end();
+      }
+      return;
+    }
     const userMessageId = randomUUID();
     let targetDocId = extractGoogleDocsDocumentIdFromUrl(body.message);
     if (!targetDocId) {
@@ -823,18 +911,20 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
     if (!targetDocId) {
       directReply = 'Could not determine target Google Doc for tab creation. Include the doc URL and retry.';
     } else {
-      const failedTabs: string[] = [];
+      const failedTabs: Array<{ title: string; error: string }> = [];
       for (const tabTitle of tabOnlyIntent.tabTitles) {
         const tabResult = await executor.execute('google_docs_add_tab', JSON.stringify({
           doc_id: targetDocId,
           title: tabTitle,
           ...(meta.googleAuthProfile ? { profile: meta.googleAuthProfile } : {}),
         }));
-        if (!tabResult.success) failedTabs.push(tabTitle);
+        if (!tabResult.success) {
+          failedTabs.push({ title: tabTitle, error: tabResult.content });
+        }
       }
       const docUrl = `https://docs.google.com/document/d/${targetDocId}/edit`;
       directReply = failedTabs.length > 0
-        ? `Added some tabs, but failed: ${failedTabs.join(', ')}\n\n${docUrl}`
+        ? `Added some tabs, but failed:\n${failedTabs.map((entry) => `${entry.title}: ${entry.error}`).join('\n')}\n\n${docUrl}`
         : `Added tabs "${tabOnlyIntent.tabTitles.join(', ')}"\n\n${docUrl}`;
     }
 
@@ -884,7 +974,44 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
 
   // Deterministic Google Docs read fast path:
   // bypass model/tool-chaining when the user directly provides a Google Docs URL.
+  const hasTabKeyword = /\btab(s)?\b/i.test(normalizeIntentText(body.message));
   const googleDocId = extractGoogleDocsDocumentIdFromUrl(body.message);
+  if (!isModelQuestion && googleDocId && hasTabKeyword && !createIntent && !tabOnlyIntent) {
+    const userMessageId = randomUUID();
+    const clarification = 'I found a Google Doc URL, but I could not clearly parse the tab names. Please provide tab names explicitly, for example: "add tabs called alpha and beta to this doc".';
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.write(`event: meta\ndata: ${JSON.stringify({ userMessageId })}\n\n`);
+    res.write(`data: ${JSON.stringify({
+      choices: [{ delta: { content: clarification } }],
+      model,
+    })}\n\n`);
+    await store.appendMessage(talkId, {
+      id: userMessageId,
+      role: 'user',
+      content: body.message,
+      timestamp: Date.now(),
+      ...(body.agentName && { agentName: body.agentName }),
+      ...(body.agentRole && { agentRole: body.agentRole as any }),
+    });
+    await store.appendMessage(talkId, {
+      id: randomUUID(),
+      role: 'assistant',
+      content: clarification,
+      timestamp: Date.now(),
+      model,
+      ...(body.agentName && { agentName: body.agentName }),
+      ...(body.agentRole && { agentRole: body.agentRole as any }),
+    });
+    if (!res.writableEnded) {
+      res.write('data: [DONE]\n\n');
+      res.end();
+    }
+    return;
+  }
   if (!isModelQuestion && googleDocId && hasGoogleDocsReadTool) {
     const userMessageId = randomUUID();
     const docsResult = await executor.execute('google_docs_read', JSON.stringify({
