@@ -100,7 +100,7 @@ export function composeSystemPrompt(input: SystemPromptInput): string | undefine
         'Your response is displayed in a terminal chat interface (ClawTalk). ' +
         'No tools are currently available. You can only output text.\n\n' +
         '- If asked to perform actions, explain that you have no tools and suggest alternatives.\n' +
-        '- You can schedule a ```job block for server-side follow-up work (see Talk Automations section below).',
+        '- You may schedule a ```job block only when the user explicitly asks for recurring/scheduled/follow-up work (see Talk Automations section below).',
       );
     }
   } else {
@@ -124,7 +124,7 @@ export function composeSystemPrompt(input: SystemPromptInput): string | undefine
       '- If asked to create a document or report, write the full content directly in your response.\n' +
       '- If asked to do something that requires tools you don\'t have (file upload, web search, API calls, code execution), ' +
       'say so IMMEDIATELY. Do not pretend you can do it. Do not say "let me try" and then produce nothing.\n' +
-      '- You can schedule a ```job block for server-side follow-up work (see Talk Automations section below).\n\n' +
+      '- You may schedule a ```job block only when the user explicitly asks for recurring/scheduled/follow-up work (see Talk Automations section below).\n\n' +
       '**CRITICAL: Never promise an action you cannot verify completing.** ' +
       'If you say "Let me create that file" or "I\'ll upload this now," you MUST actually produce output in this response. ' +
       'If you cannot, say so honestly on the first attempt — do not stall across multiple turns.',
@@ -285,7 +285,8 @@ export function composeSystemPrompt(input: SystemPromptInput): string | undefine
     `When you promise to follow up later (e.g. "I'll research this and have it for you in an hour"), ` +
     `create a one-off automation to ensure you deliver.\n\n` +
     `The prompt must be self-contained — it runs independently with only the Talk context. ` +
-    `Create automations when the user asks for something recurring, scheduled, or when you commit to a follow-up.\n\n` +
+    `Create automations when the user asks for something recurring, scheduled, or when you commit to a follow-up.\n` +
+    `Do NOT create automations for immediate one-turn requests that should be executed now with available tools.\n\n` +
     `### Moving External Tasks to Talk Automations\n` +
     `If the user asks to move an external cron job, scheduled task, or recurring reminder ` +
     `into this Talk, create a Talk automation for it. Talk automations are the preferred way to handle ` +

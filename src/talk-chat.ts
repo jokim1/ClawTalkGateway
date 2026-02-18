@@ -21,6 +21,13 @@ import { collectRoutingDiagnostics } from './model-routing-diagnostics.js';
 import { getToolCatalog } from './tool-catalog.js';
 import { parseEventTrigger, validateSchedule } from './job-scheduler.js';
 import { extractGoogleDocsDocumentIdFromUrl, hasGoogleDocsDocumentUrl } from './google-docs-url.js';
+import {
+  evaluateToolAvailability,
+  isBrowserIntent,
+  isBrowserTool,
+  resolveExecutionMode,
+} from './talk-policy.js';
+import { isTransientError } from './tool-loop.js';
 
 /** Maximum number of history messages to include in LLM context. */
 const MAX_CONTEXT_MESSAGES = 50;
@@ -36,6 +43,80 @@ const CLAWTALK_DEFAULT_AGENT_ID = 'clawtalk';
 const DEFAULT_TALK_FIRST_TOKEN_TIMEOUT_MS = 90_000;
 const DEFAULT_TALK_TOTAL_TIMEOUT_MS = 900_000;
 const DEFAULT_TALK_INACTIVITY_TIMEOUT_MS = 300_000;
+
+type TalkErrorCode =
+  | 'FIRST_TOKEN_TIMEOUT'
+  | 'MODE_BLOCKED_BROWSER'
+  | 'TOOL_BLOCKED_POLICY'
+  | 'PROVIDER_AUTH'
+  | 'PROVIDER_ERROR'
+  | 'CLIENT_DISCONNECTED'
+  | 'UNKNOWN';
+
+type TalkErrorPayload = {
+  code: TalkErrorCode;
+  message: string;
+  hint?: string;
+  transient: boolean;
+  retryable: boolean;
+};
+
+function emitStatusEvent(res: ServerResponse, payload: { code: string; message: string; level?: 'info' | 'warn' | 'error'; meta?: Record<string, unknown> }): void {
+  if (res.writableEnded) return;
+  res.write(`event: status\ndata: ${JSON.stringify(payload)}\n\n`);
+}
+
+function emitErrorEvent(res: ServerResponse, payload: TalkErrorPayload): void {
+  if (res.writableEnded) return;
+  res.write(`event: error\ndata: ${JSON.stringify(payload)}\n\n`);
+}
+
+function classifyTalkError(err: unknown, clientSignal?: AbortSignal): TalkErrorPayload {
+  const message = err instanceof Error ? err.message : 'Unknown error';
+  const normalized = message.toLowerCase();
+  if (normalized.includes('client disconnected')) {
+    return {
+      code: 'CLIENT_DISCONNECTED',
+      message,
+      transient: false,
+      retryable: false,
+    };
+  }
+  if (normalized.includes('first token timeout')) {
+    return {
+      code: 'FIRST_TOKEN_TIMEOUT',
+      message,
+      hint: 'The provider did not return any token before timeout. Retry, switch model, or verify provider routing.',
+      transient: true,
+      retryable: true,
+    };
+  }
+  if (normalized.includes('401') || normalized.includes('403') || normalized.includes('authentication')) {
+    return {
+      code: 'PROVIDER_AUTH',
+      message,
+      hint: 'Check provider API key/auth configuration.',
+      transient: false,
+      retryable: false,
+    };
+  }
+  if (normalized.includes('llm error') || normalized.includes('fetch')) {
+    return {
+      code: 'PROVIDER_ERROR',
+      message,
+      hint: 'Provider call failed. Retry or switch model/provider.',
+      transient: isTransientError(err, clientSignal),
+      retryable: isTransientError(err, clientSignal),
+    };
+  }
+  const transient = isTransientError(err, clientSignal);
+  return {
+    code: 'UNKNOWN',
+    message,
+    transient,
+    retryable: transient,
+  };
+}
 
 function resolveTalkFirstTokenTimeoutMs(): number {
   const raw = process.env.CLAWTALK_TALK_TTFT_TIMEOUT_MS;
@@ -289,6 +370,21 @@ function parseJobBlocks(text: string): Array<{ schedule: string; prompt: string 
   return results;
 }
 
+/**
+ * Guardrail for assistant-authored ```job``` blocks:
+ * only auto-create jobs when the user explicitly requested scheduling/automation.
+ */
+function userExplicitlyRequestedAutomation(message: string): boolean {
+  const text = message.trim().toLowerCase();
+  if (!text) return false;
+  return /\b(automation|automations|job|jobs|schedule|scheduled|reschedule|remind|reminder|follow\s*up|check\s*back|recurring|cron)\b/.test(text)
+    || /\b(every\s+\d+\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks))\b/.test(text)
+    || /\b(daily|weekly|monthly|yearly)\b/.test(text)
+    || /\b(in\s+\d+\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks))\b/.test(text)
+    || /\b(at\s+\d{1,2}(:\d{2})?\s*(am|pm)?)\b/.test(text)
+    || /\b(tomorrow|next\s+(hour|day|week|month))\b/.test(text);
+}
+
 export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
   const { req, res, talkId, store, gatewayOrigin, authToken, logger, registry, executor, dataDir } = ctx;
 
@@ -331,6 +427,7 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
 
   // Resolve model (request override → talk default)
   const model = body.model || meta.model || 'openclaw';
+  const talkExecutionMode = resolveExecutionMode(meta);
   // Only update the talk's default model for non-agent messages.
   // Agent messages use their own model without changing the talk default.
   if (body.model && body.model !== meta.model && !body.agentName) {
@@ -354,11 +451,16 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
     );
   const catalog = getToolCatalog(dataDir, logger);
   const globallyEnabledTools = catalog.filterEnabledTools(registry.listTools());
-  const availableToolInfos = prioritizeTurnToolInfos(filterToolInfos(
+  const prePolicyToolInfos = filterToolInfos(
     globallyEnabledTools,
     meta.toolsAllow,
     meta.toolsDeny,
-  ), body.message);
+  );
+  const policyStates = evaluateToolAvailability(prePolicyToolInfos, meta);
+  const policyFilteredToolInfos = policyStates
+    .filter((tool) => tool.enabled)
+    .map(({ name, description, builtin }) => ({ name, description, builtin }));
+  const availableToolInfos = prioritizeTurnToolInfos(policyFilteredToolInfos, body.message);
   const hasGoogleDriveTool = availableToolInfos.some(
     (tool) => tool.name.trim().toLowerCase() === 'google_drive_files',
   );
@@ -676,6 +778,11 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
 
   // Inject the user message ID as a custom SSE event so the client can reference it
   res.write(`event: meta\ndata: ${JSON.stringify({ userMessageId: userMsg.id })}\n\n`);
+  emitStatusEvent(res, {
+    code: 'ROUTE_READY',
+    message: `Routing request via ${talkExecutionMode === 'full_control' ? 'ClawTalk Proxy' : 'OpenClaw Agent'}...`,
+    level: 'info',
+  });
 
   // Tool policy derived above and mirrored in prompt composition.
   const disableTools = !enableToolsForTurn || availableToolInfos.length === 0;
@@ -698,6 +805,46 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
             ? 'mention-relay'
             : 'non-action-turn';
     logger.info(`TalkChat: tool bypass (${reason}) talkId=${talkId}`);
+  }
+  if (likelyActionRequest && policyFilteredToolInfos.length === 0 && prePolicyToolInfos.length > 0) {
+    const blocked = policyStates.find((tool) => !tool.enabled && tool.reason);
+    emitStatusEvent(res, {
+      code: 'TOOLS_BLOCKED_BY_POLICY',
+      message: blocked?.reason || 'Tools are blocked by current Talk policy settings.',
+      level: 'warn',
+      meta: blocked?.reasonCode ? { reasonCode: blocked.reasonCode } : undefined,
+    });
+  }
+
+  const browserIntent = isBrowserIntent(body.message);
+  const hasBrowserCapability = availableToolInfos.some((tool) => isBrowserTool(tool.name));
+  if (browserIntent && talkExecutionMode === 'full_control') {
+    const errPayload: TalkErrorPayload = {
+      code: 'MODE_BLOCKED_BROWSER',
+      message: 'Browser control is unavailable in ClawTalk Proxy mode.',
+      hint: 'Switch Execution Mode to OpenClaw Agent, then retry.',
+      transient: false,
+      retryable: true,
+    };
+    emitStatusEvent(res, {
+      code: 'BROWSER_PRECHECK_FAILED',
+      message: errPayload.message,
+      level: 'warn',
+    });
+    emitErrorEvent(res, errPayload);
+    store.setProcessing(talkId, false);
+    if (!res.writableEnded) {
+      res.write('data: [DONE]\n\n');
+      res.end();
+    }
+    return;
+  }
+  if (browserIntent && !hasBrowserCapability) {
+    emitStatusEvent(res, {
+      code: 'BROWSER_CAPABILITY_UNKNOWN',
+      message: 'No browser-specific tool is currently enabled for this talk. Response may be limited to guidance only.',
+      level: 'warn',
+    });
   }
 
   let fullContent = '';
@@ -725,7 +872,6 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
     model,
     traceId,
   );
-  const talkExecutionMode = meta.executionMode ?? 'openclaw';
   const sessionKey = (() => {
     if (talkExecutionMode === 'full_control') {
       // No `agent:` prefix — keeps request in transparent LLM-proxy mode so
@@ -819,6 +965,7 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
       maxIterations,
       toolChoice: disableTools ? 'none' : 'auto',
       defaultGoogleAuthProfile: meta.googleAuthProfile,
+      onStatus: (status) => emitStatusEvent(res, status),
     });
 
     fullContent = result.fullContent;
@@ -828,16 +975,13 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
       `ModelRoute trace=${traceId} flow=talk-chat-complete talkId=${talkId} responseModel=${responseModel ?? '-'} chars=${fullContent.length}`,
     );
   } catch (err) {
-    const errMessage = err instanceof Error ? err.message : 'Unknown error';
-    logger.error(`TalkChat: tool loop error: ${errMessage}`);
-    logger.warn(`ModelRoute trace=${traceId} flow=talk-chat-error talkId=${talkId} error=${errMessage}`);
+    const payload = classifyTalkError(err, clientAbort.signal);
+    logger.error(`TalkChat: tool loop error: ${payload.message}`);
+    logger.warn(`ModelRoute trace=${traceId} flow=talk-chat-error talkId=${talkId} error=${payload.message}`);
 
     // Don't write to a closed connection
     if (!clientAbort.signal.aborted && !res.writableEnded) {
-      // Determine if this is a transient error the client could retry
-      const { isTransientError } = await import('./tool-loop.js');
-      const transient = isTransientError(err, clientAbort.signal);
-      res.write(`event: error\ndata: ${JSON.stringify({ message: errMessage, transient })}\n\n`);
+      emitErrorEvent(res, payload);
     }
   } finally {
     store.setProcessing(talkId, false);
@@ -889,9 +1033,16 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
       };
       await store.appendMessage(talkId, assistantMsg);
 
-      // Auto-create jobs from ```job``` blocks in the response
+      // Auto-create jobs from ```job``` blocks in the response only when user explicitly
+      // asked for scheduled/automation behavior.
       const jobBlocks = parseJobBlocks(fullContent);
-      for (const { schedule, prompt } of jobBlocks) {
+      const allowAutoJobCreation = userExplicitlyRequestedAutomation(body.message);
+      if (!allowAutoJobCreation && jobBlocks.length > 0) {
+        logger.info(
+          `TalkChat: ignored ${jobBlocks.length} assistant job block(s) for immediate request in talk ${talkId}`,
+        );
+      }
+      for (const { schedule, prompt } of (allowAutoJobCreation ? jobBlocks : [])) {
         const scheduleError = validateSchedule(schedule);
         if (scheduleError) {
           logger.warn(`TalkChat: skipped auto-created job with invalid schedule "${schedule}": ${scheduleError}`);
