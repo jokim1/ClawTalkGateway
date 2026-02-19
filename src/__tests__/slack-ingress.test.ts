@@ -592,4 +592,138 @@ describe('slack ingress ownership hooks', () => {
 
     expect(hookResult).toBeUndefined();
   });
+
+  it('does not mirror Slack messages into talk when mirrorToTalk is off', async () => {
+    const talk = store.createTalk('test-model');
+    const bindingId = 'binding-mirror-off';
+    store.updateTalk(talk.id, {
+      platformBindings: [{
+        id: bindingId,
+        platform: 'slack',
+        accountId: 'kimfamily',
+        scope: 'channel:c890',
+        permission: 'read+write',
+        createdAt: Date.now(),
+      }],
+      platformBehaviors: [{
+        id: 'behavior-mirror-off',
+        platformBindingId: bindingId,
+        responseMode: 'all',
+        mirrorToTalk: 'off',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      }],
+    });
+
+    const sendSlackMessage = jest.fn(async (_params: { accountId?: string; channelId: string; threadTs?: string; message: string }) => true);
+    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: 'ack' } }],
+      }),
+    } as unknown as Response);
+    try {
+      const deps = {
+        ...buildDeps(),
+        autoProcessQueue: true,
+        sendSlackMessage,
+      };
+
+      await handleSlackMessageReceivedHook(
+        {
+          from: 'slack:channel:C890',
+          content: '2h homework',
+          metadata: {
+            to: 'channel:C890',
+            messageId: '1700000102.100',
+            senderId: 'U890',
+            senderName: 'Asher',
+          },
+        },
+        {
+          channelId: 'slack',
+          accountId: 'kimfamily',
+        },
+        deps,
+      );
+
+      for (let i = 0; i < 40 && sendSlackMessage.mock.calls.length < 1; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      const history = await store.getRecentMessages(talk.id, 50);
+      const mirroredSlackEntries = history.filter((m) => m.content.includes('[Slack #'));
+      expect(mirroredSlackEntries).toHaveLength(0);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it('mirrors inbound only when mirrorToTalk is inbound', async () => {
+    const talk = store.createTalk('test-model');
+    const bindingId = 'binding-mirror-inbound';
+    store.updateTalk(talk.id, {
+      platformBindings: [{
+        id: bindingId,
+        platform: 'slack',
+        accountId: 'kimfamily',
+        scope: 'channel:c891',
+        permission: 'read+write',
+        createdAt: Date.now(),
+      }],
+      platformBehaviors: [{
+        id: 'behavior-mirror-inbound',
+        platformBindingId: bindingId,
+        responseMode: 'all',
+        mirrorToTalk: 'inbound',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      }],
+    });
+
+    const sendSlackMessage = jest.fn(async (_params: { accountId?: string; channelId: string; threadTs?: string; message: string }) => true);
+    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: 'ack' } }],
+      }),
+    } as unknown as Response);
+    try {
+      const deps = {
+        ...buildDeps(),
+        autoProcessQueue: true,
+        sendSlackMessage,
+      };
+
+      await handleSlackMessageReceivedHook(
+        {
+          from: 'slack:channel:C891',
+          content: '1h art project',
+          metadata: {
+            to: 'channel:C891',
+            messageId: '1700000103.100',
+            senderId: 'U891',
+            senderName: 'Kaela',
+          },
+        },
+        {
+          channelId: 'slack',
+          accountId: 'kimfamily',
+        },
+        deps,
+      );
+
+      for (let i = 0; i < 40 && sendSlackMessage.mock.calls.length < 1; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      const history = await store.getRecentMessages(talk.id, 50);
+      const mirroredSlackEntries = history.filter((m) => m.content.includes('[Slack #'));
+      expect(mirroredSlackEntries.length).toBeGreaterThanOrEqual(1);
+      const assistantEntries = history.filter((m) => m.role === 'assistant');
+      expect(assistantEntries).toHaveLength(0);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
 });

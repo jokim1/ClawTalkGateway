@@ -66,6 +66,12 @@ function normalizeResponseMode(raw: unknown): 'off' | 'mentions' | 'all' | undef
   return undefined;
 }
 
+function normalizeMirrorToTalk(raw: unknown): 'off' | 'inbound' | 'full' | undefined {
+  const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (value === 'off' || value === 'inbound' || value === 'full') return value;
+  return undefined;
+}
+
 function normalizeDeliveryMode(raw: unknown): 'thread' | 'channel' | 'adaptive' | undefined {
   const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
   if (value === 'thread' || value === 'channel' || value === 'adaptive') return value;
@@ -281,6 +287,7 @@ function normalizePlatformBehaviors(
       const responseMode =
         normalizeResponseMode(row.responseMode) ??
         (autoRespond === false ? 'off' : autoRespond === true ? 'all' : undefined);
+      const mirrorToTalk = normalizeMirrorToTalk(row.mirrorToTalk);
       const deliveryMode = normalizeDeliveryMode(row.deliveryMode);
       const responsePolicyRaw =
         row.responsePolicy && typeof row.responsePolicy === 'object'
@@ -296,6 +303,7 @@ function normalizePlatformBehaviors(
         !agentName &&
         !onMessagePrompt &&
         responseMode === undefined &&
+        mirrorToTalk === undefined &&
         deliveryMode === undefined &&
         triggerPolicy === undefined &&
         allowedSenders === undefined &&
@@ -311,6 +319,7 @@ function normalizePlatformBehaviors(
         id,
         platformBindingId,
         ...(responseMode !== undefined ? { responseMode } : {}),
+        ...(mirrorToTalk !== undefined ? { mirrorToTalk } : {}),
         ...(agentName ? { agentName } : {}),
         ...(onMessagePrompt ? { onMessagePrompt } : {}),
         ...(deliveryMode !== undefined ? { deliveryMode } : {}),

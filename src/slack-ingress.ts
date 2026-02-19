@@ -63,6 +63,7 @@ type QueueItem = {
   replyAccountId?: string;
   behaviorAgentName?: string;
   behaviorOnMessagePrompt?: string;
+  behaviorMirrorToTalk?: 'off' | 'inbound' | 'full';
   behaviorDeliveryMode?: 'thread' | 'channel' | 'adaptive';
   behaviorIntent?: 'study' | 'advice' | 'other';
   attempt: number;
@@ -173,6 +174,7 @@ export type SlackOwnershipInspection = {
   bindingId?: string;
   behaviorAgentName?: string;
   behaviorOnMessagePrompt?: string;
+  behaviorMirrorToTalk?: 'off' | 'inbound' | 'full';
   behaviorDeliveryMode?: 'thread' | 'channel' | 'adaptive';
   behaviorIntent?: 'study' | 'advice' | 'other';
 };
@@ -657,6 +659,7 @@ function resolveBehaviorForBinding(meta: TalkMeta, bindingId: string): {
   responseMode?: 'off' | 'mentions' | 'all';
   agentName?: string;
   onMessagePrompt?: string;
+  mirrorToTalk?: 'off' | 'inbound' | 'full';
   deliveryMode?: 'thread' | 'channel' | 'adaptive';
   responsePolicy?: {
     triggerPolicy?: 'judgment' | 'study_entries_only' | 'advice_or_study';
@@ -669,6 +672,7 @@ function resolveBehaviorForBinding(meta: TalkMeta, bindingId: string): {
   const responseMode =
     behavior.responseMode ??
     ((behavior as { autoRespond?: boolean }).autoRespond === false ? 'off' : undefined);
+  const mirrorToTalk = behavior.mirrorToTalk;
   const deliveryMode = behavior.deliveryMode;
   const triggerPolicy = behavior.responsePolicy?.triggerPolicy;
   const allowedSenders = behavior.responsePolicy?.allowedSenders;
@@ -677,6 +681,7 @@ function resolveBehaviorForBinding(meta: TalkMeta, bindingId: string): {
     ...(responseMode ? { responseMode } : {}),
     agentName: behavior.agentName?.trim() || undefined,
     onMessagePrompt: behavior.onMessagePrompt?.trim() || undefined,
+    ...(mirrorToTalk ? { mirrorToTalk } : {}),
     ...(deliveryMode ? { deliveryMode } : {}),
     ...(
       triggerPolicy || (Array.isArray(allowedSenders) && allowedSenders.length > 0) || minConfidence !== undefined
@@ -750,6 +755,7 @@ function shouldHandleViaBehavior(
     responseMode?: 'off' | 'mentions' | 'all';
     agentName?: string;
     onMessagePrompt?: string;
+    mirrorToTalk?: 'off' | 'inbound' | 'full';
     deliveryMode?: 'thread' | 'channel' | 'adaptive';
     responsePolicy?: {
       triggerPolicy?: 'judgment' | 'study_entries_only' | 'advice_or_study';
@@ -968,6 +974,8 @@ async function callLlmForEvent(params: {
 }
 
 async function ensureInboundMessage(item: QueueItem, deps: SlackIngressDeps): Promise<void> {
+  const mirrorMode = item.behaviorMirrorToTalk ?? 'off';
+  if (mirrorMode !== 'inbound' && mirrorMode !== 'full') return;
   if (item.inboundPersisted) return;
   const inboundContent = item.inboundContent ?? buildInboundMessage(item.event);
   item.inboundContent = inboundContent;
@@ -986,17 +994,19 @@ async function persistAssistantResult(item: QueueItem, deps: SlackIngressDeps): 
   if (!item.reply || !item.model) {
     throw new Error('assistant result missing');
   }
-
-  const assistantMsg: TalkMessage = {
-    id: randomUUID(),
-    role: 'assistant',
-    content: item.reply,
-    timestamp: Date.now(),
-    model: item.model,
-    ...(item.agentName ? { agentName: item.agentName } : {}),
-    ...(item.agentRole ? { agentRole: item.agentRole } : {}),
-  };
-  await deps.store.appendMessage(item.talkId, assistantMsg);
+  const mirrorMode = item.behaviorMirrorToTalk ?? 'off';
+  if (mirrorMode === 'full') {
+    const assistantMsg: TalkMessage = {
+      id: randomUUID(),
+      role: 'assistant',
+      content: item.reply,
+      timestamp: Date.now(),
+      model: item.model,
+      ...(item.agentName ? { agentName: item.agentName } : {}),
+      ...(item.agentRole ? { agentRole: item.agentRole } : {}),
+    };
+    await deps.store.appendMessage(item.talkId, assistantMsg);
+  }
   item.assistantPersisted = true;
 
   scheduleContextUpdate({
@@ -1341,6 +1351,7 @@ function routeSlackIngressEvent(
     replyAccountId: event.accountId ?? ownerBinding?.accountId,
     behaviorAgentName: ownership.behaviorAgentName,
     behaviorOnMessagePrompt: ownership.behaviorOnMessagePrompt,
+    behaviorMirrorToTalk: ownership.behaviorMirrorToTalk,
     behaviorDeliveryMode: ownership.behaviorDeliveryMode,
     behaviorIntent: ownership.behaviorIntent,
     attempt: 0,
@@ -1410,6 +1421,7 @@ export function inspectSlackOwnership(
     bindingId: owner.binding.id,
     behaviorAgentName: behaviorDecision.behavior?.agentName,
     behaviorOnMessagePrompt: behaviorDecision.behavior?.onMessagePrompt,
+    behaviorMirrorToTalk: behaviorDecision.behavior?.mirrorToTalk,
     behaviorDeliveryMode: behaviorDecision.behavior?.deliveryMode,
     behaviorIntent: behaviorDecision.intent,
   };

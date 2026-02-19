@@ -144,6 +144,7 @@ describe('normalizeAndValidatePlatformBehaviorsInput', () => {
       [{
         platformBindingId: bindingId,
         responseMode: 'all',
+        mirrorToTalk: 'inbound',
         deliveryMode: 'adaptive',
         responsePolicy: {
           triggerPolicy: 'advice_or_study',
@@ -168,6 +169,7 @@ describe('normalizeAndValidatePlatformBehaviorsInput', () => {
     expect(result.behaviors[0]).toMatchObject({
       platformBindingId: bindingId,
       responseMode: 'all',
+      mirrorToTalk: 'inbound',
       deliveryMode: 'adaptive',
       responsePolicy: {
         triggerPolicy: 'advice_or_study',

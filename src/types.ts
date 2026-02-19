@@ -190,6 +190,13 @@ export interface TalkPlatformBehavior {
    */
   onMessagePrompt?: string;
   /**
+   * Controls whether Slack messages are mirrored into Talk history.
+   * - off: no Slack mirroring to Talk
+   * - inbound: mirror inbound Slack messages only
+   * - full: mirror inbound + assistant Slack responses
+   */
+  mirrorToTalk?: 'off' | 'inbound' | 'full';
+  /**
    * Delivery routing for Slack auto-responses.
    * - thread: reply in inbound thread when available
    * - channel: always post at top-level channel

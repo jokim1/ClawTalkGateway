@@ -246,6 +246,13 @@ function normalizeResponseModeInput(raw: unknown): 'off' | 'mentions' | 'all' | 
   return undefined;
 }
 
+function normalizeMirrorToTalkInput(raw: unknown): 'off' | 'inbound' | 'full' | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const value = raw.trim().toLowerCase();
+  if (value === 'off' || value === 'inbound' || value === 'full') return value;
+  return undefined;
+}
+
 function normalizeDeliveryModeInput(raw: unknown): 'thread' | 'channel' | 'adaptive' | undefined {
   if (typeof raw !== 'string') return undefined;
   const value = raw.trim().toLowerCase();
@@ -372,6 +379,7 @@ function mapChannelResponseSettingsInput(input: unknown): unknown {
       (typeof row.autoRespond === 'boolean'
         ? (row.autoRespond ? 'all' : 'off')
         : undefined);
+    const mirrorToTalk = normalizeMirrorToTalkInput(row.mirrorToTalk);
     const autoRespond =
       typeof row.autoRespond === 'boolean' ? row.autoRespond : undefined;
     const deliveryMode = normalizeDeliveryModeInput(row.deliveryMode);
@@ -390,6 +398,7 @@ function mapChannelResponseSettingsInput(input: unknown): unknown {
       ...(responderAgent ? { agentName: responderAgent } : {}),
       ...(responseInstruction ? { onMessagePrompt: responseInstruction } : {}),
       ...(responseMode !== undefined ? { responseMode } : {}),
+      ...(mirrorToTalk !== undefined ? { mirrorToTalk } : {}),
       ...(autoRespond !== undefined ? { autoRespond } : {}),
       ...(deliveryMode !== undefined ? { deliveryMode } : {}),
       ...(
@@ -999,6 +1008,7 @@ export function normalizeAndValidatePlatformBehaviorsInput(
     const responseMode =
       normalizeResponseModeInput(row.responseMode) ??
       (autoRespond === false ? 'off' : autoRespond === true ? 'all' : undefined);
+    const mirrorToTalk = normalizeMirrorToTalkInput(row.mirrorToTalk);
     const deliveryMode = normalizeDeliveryModeInput(row.deliveryMode);
     const responsePolicyRaw =
       row.responsePolicy && typeof row.responsePolicy === 'object'
@@ -1023,6 +1033,7 @@ export function normalizeAndValidatePlatformBehaviorsInput(
       !agentName &&
       !onMessagePrompt &&
       responseMode === undefined &&
+      mirrorToTalk === undefined &&
       deliveryMode === undefined &&
       triggerPolicy === undefined &&
       allowedSenders === undefined &&
@@ -1032,7 +1043,7 @@ export function normalizeAndValidatePlatformBehaviorsInput(
         ok: false,
         error:
           `platformBehaviors[${i + 1}] must define at least one behavior field ` +
-          '(agentName, onMessagePrompt, responseMode, deliveryMode, or responsePolicy).',
+          '(agentName, onMessagePrompt, responseMode, mirrorToTalk, deliveryMode, or responsePolicy).',
       };
     }
 
@@ -1044,6 +1055,7 @@ export function normalizeAndValidatePlatformBehaviorsInput(
       id,
       platformBindingId,
       ...(responseMode !== undefined ? { responseMode } : {}),
+      ...(mirrorToTalk !== undefined ? { mirrorToTalk } : {}),
       ...(agentName ? { agentName } : {}),
       ...(onMessagePrompt ? { onMessagePrompt } : {}),
       ...(deliveryMode !== undefined ? { deliveryMode } : {}),
