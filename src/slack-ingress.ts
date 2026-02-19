@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import type { TalkStore } from './talk-store.js';
+import type { ToolExecutor } from './tool-executor.js';
+import type { ToolRegistry, ToolInfo } from './tool-registry.js';
 import type {
   HandlerContext,
   Logger,
@@ -14,6 +16,16 @@ import { readJsonBody, sendJson } from './http.js';
 import { composeSystemPrompt } from './system-prompt.js';
 import { scheduleContextUpdate } from './context-updater.js';
 import { collectRoutingDiagnostics } from './model-routing-diagnostics.js';
+import { runToolLoopNonStreaming } from './tool-loop.js';
+import { getToolCatalog } from './tool-catalog.js';
+import { googleDocsAuthStatusForProfile } from './google-docs.js';
+import {
+  evaluateToolAvailability,
+  resolveExecutionMode,
+  resolveOpenClawNativeGoogleToolsEnabled,
+  resolveProxyGatewayToolsEnabled,
+} from './talk-policy.js';
+import { isOpenClawNativeGoogleTool } from './openclaw-native-tools.js';
 
 const MAX_CONTEXT_MESSAGES = 50;
 const MAX_CONTEXT_BUDGET_BYTES = 60 * 1024;
@@ -130,6 +142,9 @@ export type SlackIngressTalkRuntimeSnapshot = {
 
 type SlackIngressDeps = {
   store: TalkStore;
+  registry: ToolRegistry;
+  executor: ToolExecutor;
+  dataDir?: string;
   gatewayOrigin: string;
   authToken: string | undefined;
   logger: Logger;
@@ -877,6 +892,33 @@ function buildSlackSessionKey(params: {
   return `agent:${agentId}:clawtalk:talk:${talkId}:slack:channel:${channelId}:thread:${threadId}`;
 }
 
+function buildFullControlSlackSessionKey(params: {
+  talkId: string;
+  event: SlackIngressEvent;
+}): string {
+  const talkId = sanitizeSessionPart(params.talkId) || 'talk';
+  const channelId = sanitizeSessionPart(params.event.channelId) || 'channel';
+  const threadId = sanitizeSessionPart(
+    params.event.threadTs ?? params.event.messageTs ?? params.event.eventId,
+  ) || 'event';
+  return `talk:clawtalk:talk:${talkId}:slack:channel:${channelId}:thread:${threadId}`;
+}
+
+function filterToolInfos(
+  tools: ToolInfo[],
+  allow?: string[],
+  deny?: string[],
+): ToolInfo[] {
+  const allowSet = new Set((allow ?? []).map((name) => name.trim().toLowerCase()).filter(Boolean));
+  const denySet = new Set((deny ?? []).map((name) => name.trim().toLowerCase()).filter(Boolean));
+  return tools.filter((tool) => {
+    const key = tool.name.trim().toLowerCase();
+    if (allowSet.size > 0 && !allowSet.has(key)) return false;
+    if (denySet.has(key)) return false;
+    return true;
+  });
+}
+
 function buildInboundMessage(event: SlackIngressEvent): string {
   const sender = event.userName ?? event.userId ?? 'unknown';
   const channelLabel = event.channelName ? `#${event.channelName.replace(/^#/, '')}` : `#${event.channelId}`;
@@ -966,6 +1008,45 @@ async function callLlmForEvent(params: {
   if (deps.authToken) {
     headers.Authorization = `Bearer ${deps.authToken}`;
   }
+  const talkExecutionMode = resolveExecutionMode(meta);
+  const talkToolMode = meta.toolMode ?? 'auto';
+  const catalog = getToolCatalog(deps.dataDir, deps.logger);
+  const proxyGatewayToolsEnabled = resolveProxyGatewayToolsEnabled(
+    process.env.CLAWTALK_PROXY_GATEWAY_TOOLS_ENABLED,
+  );
+  const openClawNativeToolsEnabled = resolveOpenClawNativeGoogleToolsEnabled(
+    process.env.CLAWTALK_OPENCLAW_NATIVE_GOOGLE_TOOLS_ENABLED,
+  );
+  const globallyEnabledTools = catalog.filterEnabledTools(deps.registry.listTools());
+  const prePolicyToolInfos = filterToolInfos(globallyEnabledTools, meta.toolsAllow, meta.toolsDeny);
+  const needsGoogleOAuth = prePolicyToolInfos.some((tool) =>
+    catalog.getToolRequiredAuth(tool.name).includes('google_oauth'),
+  );
+  const googleAuthStatus = needsGoogleOAuth
+    ? await googleDocsAuthStatusForProfile(meta.googleAuthProfile)
+    : undefined;
+  const policyStatesWithAuth = evaluateToolAvailability(prePolicyToolInfos, meta, {
+    isInstalled: (toolName) => catalog.isToolEnabled(toolName),
+    isAuthReady: (toolName) => {
+      const required = catalog.getToolRequiredAuth(toolName);
+      if (!required.includes('google_oauth')) return { ready: true };
+      const ready = Boolean(googleAuthStatus?.accessTokenReady ?? true);
+      return ready
+        ? { ready: true }
+        : { ready: false, reason: 'Blocked by OAuth readiness: connect required account first.' };
+    },
+    isManagedTool: (toolName) => catalog.isManagedTool(toolName),
+    proxyGatewayToolsEnabled,
+    isOpenClawNativeTool: (toolName) => isOpenClawNativeGoogleTool(toolName),
+    openClawNativeToolsEnabled,
+  });
+  const enabledToolNames = new Set(
+    policyStatesWithAuth.filter((tool) => tool.enabled).map((tool) => tool.name.trim().toLowerCase()),
+  );
+  const enableToolsForTurn = talkToolMode === 'auto' && enabledToolNames.size > 0;
+  const tools = enableToolsForTurn
+    ? deps.registry.getToolSchemas().filter((tool) => enabledToolNames.has(tool.function.name.toLowerCase()))
+    : [];
   const routeDiag = await collectRoutingDiagnostics({
     requestedModel: model,
     headerAgentId: selectedAgent?.openClawAgentId?.trim(),
@@ -976,18 +1057,21 @@ async function callLlmForEvent(params: {
         ? routeDiag.matchedRequestedModelAgentId
         : undefined
     );
-  const sessionKey = buildSlackSessionKey({
-    talkId,
-    event,
-    agentId: resolvedHeaderAgentId ?? 'main',
-  });
+  const sessionKey = talkExecutionMode === 'full_control'
+    ? buildFullControlSlackSessionKey({ talkId, event })
+    : buildSlackSessionKey({
+        talkId,
+        event,
+        agentId: resolvedHeaderAgentId ?? 'main',
+      });
   headers['x-openclaw-trace-id'] = traceId;
   headers['x-openclaw-session-key'] = sessionKey;
-  if (resolvedHeaderAgentId?.trim()) {
+  if (talkExecutionMode === 'openclaw' && resolvedHeaderAgentId?.trim()) {
     headers['x-openclaw-agent-id'] = resolvedHeaderAgentId.trim();
   }
   deps.logger.info(
     `ModelRoute trace=${traceId} flow=slack-ingress talkId=${talkId} eventId=${event.eventId} requestedModel=${routeDiag.requestedModel} `
+    + `executionMode=${talkExecutionMode} toolMode=${talkToolMode} toolsEnabled=${enableToolsForTurn ? tools.length : 0} `
     + `headerAgentId=${selectedAgent?.openClawAgentId?.trim() ?? '-'} effectiveHeaderAgentId=${resolvedHeaderAgentId ?? '-'} `
     + `configuredAgentId=${routeDiag.configuredAgentId ?? '-'} `
     + `configuredAgentModel=${routeDiag.configuredAgentModel ?? '-'} defaultAgentId=${routeDiag.defaultAgentId ?? '-'} `
@@ -995,32 +1079,21 @@ async function callLlmForEvent(params: {
     + `matchedRequestedModelAgentModel=${routeDiag.matchedRequestedModelAgentModel ?? '-'} notes=${routeDiag.notes.join(',') || '-'}`,
   );
 
-  const llmResponse = await fetch(`${deps.gatewayOrigin}/v1/chat/completions`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({
-      model,
-      messages,
-      tool_choice: 'none',
-      stream: false,
-    }),
-    signal: AbortSignal.timeout(getLlmTimeoutMs()),
+  const result = await runToolLoopNonStreaming({
+    messages,
+    model,
+    tools,
+    gatewayOrigin: deps.gatewayOrigin,
+    authToken: deps.authToken,
+    extraHeaders: headers,
+    executor: deps.executor,
+    logger: deps.logger,
+    timeoutMs: getLlmTimeoutMs(),
+    toolChoice: enableToolsForTurn ? 'auto' : 'none',
+    defaultGoogleAuthProfile: meta.googleAuthProfile,
+    talkId,
   });
-
-  if (!llmResponse.ok) {
-    const errBody = await llmResponse.text().catch(() => '');
-    deps.logger.warn(
-      `ModelRoute trace=${traceId} flow=slack-ingress-error talkId=${talkId} eventId=${event.eventId} `
-      + `status=${llmResponse.status} body=${errBody.slice(0, 120)}`,
-    );
-    throw new Error(`llm call failed (${llmResponse.status}): ${errBody.slice(0, 200)}`);
-  }
-
-  const json = await llmResponse.json() as {
-    model?: string;
-    choices?: Array<{ message?: { content?: string } }>;
-  };
-  const reply = json.choices?.[0]?.message?.content?.trim() ?? '';
+  const reply = result.fullContent.trim();
   if (!reply) {
     deps.logger.warn(
       `ModelRoute trace=${traceId} flow=slack-ingress-error talkId=${talkId} eventId=${event.eventId} `
@@ -1030,12 +1103,12 @@ async function callLlmForEvent(params: {
   }
   deps.logger.info(
     `ModelRoute trace=${traceId} flow=slack-ingress-complete talkId=${talkId} eventId=${event.eventId} `
-    + `responseModel=${json.model?.trim() || '-'} chars=${reply.length}`,
+    + `responseModel=${result.responseModel?.trim() || '-'} chars=${reply.length}`,
   );
 
   return {
     reply,
-    model: json.model?.trim() || model,
+    model: result.responseModel?.trim() || model,
     sessionKey,
     agentName: selectedAgent?.name,
     agentRole: selectedAgent?.role,

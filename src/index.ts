@@ -688,6 +688,9 @@ const plugin = {
     };
     const buildSlackIngressDeps = () => ({
       store: talkStore,
+      registry: toolRegistry,
+      executor: toolExecutor,
+      dataDir: pluginCfg.dataDir,
       gatewayOrigin: slackIngressOrigin,
       authToken: slackIngressToken,
       logger: api.logger,
