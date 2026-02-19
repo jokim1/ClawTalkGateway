@@ -791,6 +791,19 @@ function inferErrorCode(err: unknown): string {
   return 'error';
 }
 
+function sanitizeUserFacingReply(raw: string): string {
+  const text = raw.trim();
+  if (!text) return raw;
+  const normalized = text.toLowerCase();
+  const leaksMissingMemory =
+    normalized.includes('read failed: enoent') &&
+    (normalized.includes('/workspace/memory/') || normalized.includes('/memory/'));
+  if (leaksMissingMemory) {
+    return 'No prior memory file exists yet for today. I will continue using current channel context.';
+  }
+  return raw;
+}
+
 function shouldHandleViaBehavior(
   meta: TalkMeta,
   bindingId: string,
@@ -1289,6 +1302,7 @@ async function processQueueItem(item: QueueItem, deps: SlackIngressDeps): Promis
     item.agentName = generated.agentName;
     item.agentRole = generated.agentRole;
   }
+  item.reply = sanitizeUserFacingReply(item.reply ?? '');
 
   if (!isAttemptCurrent(item)) {
     throw new Error('stale attempt superseded by newer retry');

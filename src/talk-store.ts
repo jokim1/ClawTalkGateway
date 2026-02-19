@@ -28,6 +28,33 @@ import type {
   Logger,
 } from './types.js';
 
+type TalkMutationType =
+  | 'created'
+  | 'updated'
+  | 'deleted'
+  | 'message_appended'
+  | 'messages_deleted'
+  | 'pin_added'
+  | 'pin_removed'
+  | 'job_added'
+  | 'job_updated'
+  | 'job_deleted'
+  | 'agent_added'
+  | 'agent_removed'
+  | 'agents_set'
+  | 'directives_set'
+  | 'bindings_set'
+  | 'behaviors_set';
+
+export type TalkStoreChangeEvent = {
+  type: TalkMutationType;
+  talkId: string;
+  talkVersion: number;
+  changeId: string;
+  timestamp: number;
+  lastModifiedBy?: string;
+};
+
 const DEFAULT_DATA_DIR = path.join(
   process.env.HOME || '~',
   '.openclaw',
@@ -345,10 +372,53 @@ export class TalkStore {
   private readonly talksDir: string;
   private readonly talks: Map<string, TalkMeta> = new Map();
   private readonly logger: Logger;
+  private readonly changeListeners = new Set<(event: TalkStoreChangeEvent) => void>();
 
   // Caches
   private listTalksCache: TalkMeta[] | null = null;
   private contextCache = new Map<string, { content: string; expiresAt: number }>();
+
+  onChange(listener: (event: TalkStoreChangeEvent) => void): () => void {
+    this.changeListeners.add(listener);
+    return () => {
+      this.changeListeners.delete(listener);
+    };
+  }
+
+  private emitChange(event: TalkStoreChangeEvent): void {
+    for (const listener of this.changeListeners) {
+      try {
+        listener(event);
+      } catch (err) {
+        this.logger.warn(`TalkStore: change listener failed: ${String(err)}`);
+      }
+    }
+  }
+
+  private touchMeta(
+    meta: TalkMeta,
+    type: TalkMutationType,
+    options?: { modifiedBy?: string; skipVersionBump?: boolean },
+  ): void {
+    const now = Date.now();
+    if (!options?.skipVersionBump) {
+      meta.talkVersion = Math.max(1, Math.floor(meta.talkVersion || 0) + 1);
+      meta.changeId = randomUUID();
+      meta.lastModifiedAt = now;
+      meta.lastModifiedBy = options?.modifiedBy || 'gateway';
+    }
+    meta.updatedAt = now;
+    this.invalidateListCache();
+    this.persistMeta(meta);
+    this.emitChange({
+      type,
+      talkId: meta.id,
+      talkVersion: meta.talkVersion,
+      changeId: meta.changeId,
+      timestamp: now,
+      ...(meta.lastModifiedBy ? { lastModifiedBy: meta.lastModifiedBy } : {}),
+    });
+  }
 
   constructor(dataDir: string | undefined, logger: Logger) {
     this.talksDir = path.join(dataDir || DEFAULT_DATA_DIR, 'talks');
@@ -390,6 +460,21 @@ export class TalkStore {
           meta.toolsAllow = normalizeToolNames(meta.toolsAllow);
           meta.toolsDeny = normalizeToolNames(meta.toolsDeny);
           meta.googleAuthProfile = normalizeGoogleAuthProfile(meta.googleAuthProfile);
+          meta.talkVersion =
+            typeof meta.talkVersion === 'number' && Number.isFinite(meta.talkVersion)
+              ? Math.max(1, Math.floor(meta.talkVersion))
+              : 1;
+          meta.changeId =
+            typeof meta.changeId === 'string' && meta.changeId.trim()
+              ? meta.changeId
+              : randomUUID();
+          meta.lastModifiedAt =
+            typeof meta.lastModifiedAt === 'number' && Number.isFinite(meta.lastModifiedAt)
+              ? meta.lastModifiedAt
+              : meta.updatedAt;
+          if (meta.lastModifiedBy !== undefined && typeof meta.lastModifiedBy !== 'string') {
+            delete meta.lastModifiedBy;
+          }
           if (meta.processing === undefined) {
             meta.processing = false;
           }
@@ -421,6 +506,10 @@ export class TalkStore {
     const now = Date.now();
     const meta: TalkMeta = {
       id,
+      talkVersion: 1,
+      changeId: randomUUID(),
+      lastModifiedBy: 'gateway',
+      lastModifiedAt: now,
       model,
       pinnedMessageIds: [],
       jobs: [],
@@ -438,13 +527,17 @@ export class TalkStore {
       updatedAt: now,
     };
     this.talks.set(id, meta);
-    this.invalidateListCache();
-    this.persistMeta(meta);
+    this.touchMeta(meta, 'created', { modifiedBy: 'gateway', skipVersionBump: true });
     return meta;
   }
 
   getTalk(id: string): TalkMeta | null {
     return this.talks.get(id) ?? null;
+  }
+
+  getTalkVersion(id: string): number | null {
+    const meta = this.talks.get(id);
+    return meta ? meta.talkVersion : null;
   }
 
   listTalks(): TalkMeta[] {
@@ -460,9 +553,10 @@ export class TalkStore {
     updates: Partial<
       Pick<
         TalkMeta,
-        'topicTitle' | 'objective' | 'model' | 'directives' | 'platformBindings' | 'platformBehaviors' | 'toolMode' | 'executionMode' | 'filesystemAccess' | 'networkAccess' | 'toolsAllow' | 'toolsDeny' | 'googleAuthProfile'
+        'topicTitle' | 'objective' | 'model' | 'agents' | 'directives' | 'platformBindings' | 'platformBehaviors' | 'toolMode' | 'executionMode' | 'filesystemAccess' | 'networkAccess' | 'toolsAllow' | 'toolsDeny' | 'googleAuthProfile'
       >
     >,
+    options?: { modifiedBy?: string },
   ): TalkMeta | null {
     const meta = this.talks.get(id);
     if (!meta) return null;
@@ -470,6 +564,7 @@ export class TalkStore {
     if (updates.topicTitle !== undefined) meta.topicTitle = updates.topicTitle;
     if (updates.objective !== undefined) meta.objective = updates.objective;
     if (updates.model !== undefined) meta.model = updates.model;
+    if (updates.agents !== undefined) meta.agents = updates.agents;
     if (updates.directives !== undefined) meta.directives = normalizeDirectives(updates.directives);
     if (updates.platformBindings !== undefined) {
       meta.platformBindings = normalizePlatformBindings(updates.platformBindings);
@@ -502,18 +597,25 @@ export class TalkStore {
     if (updates.googleAuthProfile !== undefined) {
       meta.googleAuthProfile = normalizeGoogleAuthProfile(updates.googleAuthProfile);
     }
-    meta.updatedAt = Date.now();
-
-    this.invalidateListCache();
-    this.persistMeta(meta);
+    this.touchMeta(meta, 'updated', { modifiedBy: options?.modifiedBy });
     return meta;
   }
 
-  deleteTalk(id: string): boolean {
-    if (!this.talks.has(id)) return false;
+  deleteTalk(id: string, options?: { modifiedBy?: string }): boolean {
+    const existing = this.talks.get(id);
+    if (!existing) return false;
     this.talks.delete(id);
     this.invalidateListCache();
     this.contextCache.delete(id);
+    const now = Date.now();
+    this.emitChange({
+      type: 'deleted',
+      talkId: id,
+      talkVersion: existing.talkVersion + 1,
+      changeId: randomUUID(),
+      timestamp: now,
+      ...(options?.modifiedBy ? { lastModifiedBy: options.modifiedBy } : {}),
+    });
     if (isValidId(id)) {
       const talkDir = path.join(this.talksDir, id);
       fsp.rm(talkDir, { recursive: true, force: true }).catch((err) => {
@@ -553,7 +655,7 @@ export class TalkStore {
   // -------------------------------------------------------------------------
 
   /** Append a message to the Talk's history file. */
-  async appendMessage(talkId: string, msg: TalkMessage): Promise<void> {
+  async appendMessage(talkId: string, msg: TalkMessage, options?: { modifiedBy?: string }): Promise<void> {
     if (!isValidId(talkId)) return;
     const dir = path.join(this.talksDir, talkId);
     await fsp.mkdir(dir, { recursive: true });
@@ -563,9 +665,7 @@ export class TalkStore {
     // Touch the talk
     const meta = this.talks.get(talkId);
     if (meta) {
-      meta.updatedAt = Date.now();
-      this.invalidateListCache();
-      this.persistMeta(meta);
+      this.touchMeta(meta, 'message_appended', { modifiedBy: options?.modifiedBy });
     }
   }
 
@@ -696,7 +796,11 @@ export class TalkStore {
    * Delete messages by ID from a Talk's history.
    * Rewrites history.jsonl with surviving messages and cleans dangling pins.
    */
-  async deleteMessages(talkId: string, messageIds: string[]): Promise<{ deleted: number; remaining: number }> {
+  async deleteMessages(
+    talkId: string,
+    messageIds: string[],
+    options?: { modifiedBy?: string },
+  ): Promise<{ deleted: number; remaining: number }> {
     if (!isValidId(talkId)) return { deleted: 0, remaining: 0 };
     if (!Array.isArray(messageIds) || messageIds.length === 0) {
       const existing = await this.getMessages(talkId);
@@ -723,9 +827,7 @@ export class TalkStore {
       const beforePins = meta.pinnedMessageIds.length;
       meta.pinnedMessageIds = meta.pinnedMessageIds.filter((id) => !idSet.has(id));
       if (deleted > 0 || meta.pinnedMessageIds.length !== beforePins) {
-        meta.updatedAt = Date.now();
-        this.invalidateListCache();
-        this.persistMeta(meta);
+        this.touchMeta(meta, 'messages_deleted', { modifiedBy: options?.modifiedBy });
       }
     }
 
@@ -736,26 +838,22 @@ export class TalkStore {
   // Pin management
   // -------------------------------------------------------------------------
 
-  addPin(talkId: string, messageId: string): boolean {
+  addPin(talkId: string, messageId: string, options?: { modifiedBy?: string }): boolean {
     const meta = this.talks.get(talkId);
     if (!meta) return false;
     if (meta.pinnedMessageIds.includes(messageId)) return false;
     meta.pinnedMessageIds.push(messageId);
-    meta.updatedAt = Date.now();
-    this.invalidateListCache();
-    this.persistMeta(meta);
+    this.touchMeta(meta, 'pin_added', { modifiedBy: options?.modifiedBy });
     return true;
   }
 
-  removePin(talkId: string, messageId: string): boolean {
+  removePin(talkId: string, messageId: string, options?: { modifiedBy?: string }): boolean {
     const meta = this.talks.get(talkId);
     if (!meta) return false;
     const idx = meta.pinnedMessageIds.indexOf(messageId);
     if (idx === -1) return false;
     meta.pinnedMessageIds.splice(idx, 1);
-    meta.updatedAt = Date.now();
-    this.invalidateListCache();
-    this.persistMeta(meta);
+    this.touchMeta(meta, 'pin_removed', { modifiedBy: options?.modifiedBy });
     return true;
   }
 
@@ -807,6 +905,7 @@ export class TalkStore {
     prompt: string,
     type?: 'once' | 'recurring' | 'event',
     output?: JobOutputDestination,
+    options?: { modifiedBy?: string },
   ): TalkJob | null {
     const meta = this.talks.get(talkId);
     if (!meta) return null;
@@ -822,9 +921,7 @@ export class TalkStore {
     };
 
     meta.jobs.push(job);
-    meta.updatedAt = Date.now();
-    this.invalidateListCache();
-    this.persistMeta(meta);
+    this.touchMeta(meta, 'job_added', { modifiedBy: options?.modifiedBy });
     return job;
   }
 
@@ -839,7 +936,12 @@ export class TalkStore {
     return meta?.jobs ?? [];
   }
 
-  updateJob(talkId: string, jobId: string, updates: Partial<Pick<TalkJob, 'active' | 'type' | 'schedule' | 'prompt' | 'output' | 'lastRunAt' | 'lastStatus'>>): TalkJob | null {
+  updateJob(
+    talkId: string,
+    jobId: string,
+    updates: Partial<Pick<TalkJob, 'active' | 'type' | 'schedule' | 'prompt' | 'output' | 'lastRunAt' | 'lastStatus'>>,
+    options?: { modifiedBy?: string },
+  ): TalkJob | null {
     const meta = this.talks.get(talkId);
     if (!meta) return null;
     const job = meta.jobs.find(j => j.id === jobId);
@@ -852,21 +954,17 @@ export class TalkStore {
     if (updates.output !== undefined) job.output = normalizeJobOutput(updates.output);
     if (updates.lastRunAt !== undefined) job.lastRunAt = updates.lastRunAt;
     if (updates.lastStatus !== undefined) job.lastStatus = updates.lastStatus;
-    meta.updatedAt = Date.now();
-    this.invalidateListCache();
-    this.persistMeta(meta);
+    this.touchMeta(meta, 'job_updated', { modifiedBy: options?.modifiedBy });
     return job;
   }
 
-  deleteJob(talkId: string, jobId: string): boolean {
+  deleteJob(talkId: string, jobId: string, options?: { modifiedBy?: string }): boolean {
     const meta = this.talks.get(talkId);
     if (!meta) return false;
     const idx = meta.jobs.findIndex(j => j.id === jobId);
     if (idx === -1) return false;
     meta.jobs.splice(idx, 1);
-    meta.updatedAt = Date.now();
-    this.invalidateListCache();
-    this.persistMeta(meta);
+    this.touchMeta(meta, 'job_deleted', { modifiedBy: options?.modifiedBy });
     return true;
   }
 
@@ -885,26 +983,22 @@ export class TalkStore {
   // Agent management
   // -------------------------------------------------------------------------
 
-  async addAgent(talkId: string, agent: TalkAgent): Promise<TalkAgent> {
+  async addAgent(talkId: string, agent: TalkAgent, options?: { modifiedBy?: string }): Promise<TalkAgent> {
     const meta = this.talks.get(talkId);
     if (!meta) throw new Error('Talk not found');
     if (!meta.agents) meta.agents = [];
     meta.agents.push(agent);
-    meta.updatedAt = Date.now();
-    this.invalidateListCache();
-    this.persistMeta(meta);
+    this.touchMeta(meta, 'agent_added', { modifiedBy: options?.modifiedBy });
     return agent;
   }
 
-  async removeAgent(talkId: string, agentName: string): Promise<void> {
+  async removeAgent(talkId: string, agentName: string, options?: { modifiedBy?: string }): Promise<void> {
     const meta = this.talks.get(talkId);
     if (!meta) throw new Error('Talk not found');
     const idx = (meta.agents ?? []).findIndex(a => a.name === agentName);
     if (idx === -1) throw new Error('Agent not found');
     meta.agents!.splice(idx, 1);
-    meta.updatedAt = Date.now();
-    this.invalidateListCache();
-    this.persistMeta(meta);
+    this.touchMeta(meta, 'agent_removed', { modifiedBy: options?.modifiedBy });
   }
 
   listAgents(talkId: string): TalkAgent[] {
@@ -912,49 +1006,49 @@ export class TalkStore {
     return meta?.agents ?? [];
   }
 
-  async setAgents(talkId: string, agents: TalkAgent[]): Promise<void> {
+  async setAgents(talkId: string, agents: TalkAgent[], options?: { modifiedBy?: string }): Promise<void> {
     const meta = this.talks.get(talkId);
     if (!meta) throw new Error('Talk not found');
     meta.agents = agents;
-    meta.updatedAt = Date.now();
-    this.invalidateListCache();
-    this.persistMeta(meta);
+    this.touchMeta(meta, 'agents_set', { modifiedBy: options?.modifiedBy });
   }
 
   // -------------------------------------------------------------------------
   // Directive management
   // -------------------------------------------------------------------------
 
-  async setDirectives(talkId: string, directives: TalkDirective[]): Promise<void> {
+  async setDirectives(talkId: string, directives: TalkDirective[], options?: { modifiedBy?: string }): Promise<void> {
     const meta = this.talks.get(talkId);
     if (!meta) throw new Error('Talk not found');
     meta.directives = directives;
-    meta.updatedAt = Date.now();
-    this.invalidateListCache();
-    this.persistMeta(meta);
+    this.touchMeta(meta, 'directives_set', { modifiedBy: options?.modifiedBy });
   }
 
   // -------------------------------------------------------------------------
   // Platform binding management
   // -------------------------------------------------------------------------
 
-  async setPlatformBindings(talkId: string, bindings: TalkPlatformBinding[]): Promise<void> {
+  async setPlatformBindings(
+    talkId: string,
+    bindings: TalkPlatformBinding[],
+    options?: { modifiedBy?: string },
+  ): Promise<void> {
     const meta = this.talks.get(talkId);
     if (!meta) throw new Error('Talk not found');
     meta.platformBindings = normalizePlatformBindings(bindings);
     meta.platformBehaviors = normalizePlatformBehaviors(meta.platformBehaviors, meta.platformBindings);
-    meta.updatedAt = Date.now();
-    this.invalidateListCache();
-    this.persistMeta(meta);
+    this.touchMeta(meta, 'bindings_set', { modifiedBy: options?.modifiedBy });
   }
 
-  async setPlatformBehaviors(talkId: string, behaviors: TalkPlatformBehavior[]): Promise<void> {
+  async setPlatformBehaviors(
+    talkId: string,
+    behaviors: TalkPlatformBehavior[],
+    options?: { modifiedBy?: string },
+  ): Promise<void> {
     const meta = this.talks.get(talkId);
     if (!meta) throw new Error('Talk not found');
     meta.platformBehaviors = normalizePlatformBehaviors(behaviors, meta.platformBindings);
-    meta.updatedAt = Date.now();
-    this.invalidateListCache();
-    this.persistMeta(meta);
+    this.touchMeta(meta, 'behaviors_set', { modifiedBy: options?.modifiedBy });
   }
 
   // -------------------------------------------------------------------------

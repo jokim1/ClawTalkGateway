@@ -10,6 +10,9 @@ function makeTalkBinding(params: {
   const now = Date.now();
   return {
     id: randomUUID(),
+    talkVersion: 1,
+    changeId: randomUUID(),
+    lastModifiedAt: now,
     pinnedMessageIds: [],
     jobs: [],
     directives: [],

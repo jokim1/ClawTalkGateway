@@ -95,6 +95,53 @@ const TALK_AGENT_ROLES = new Set(['analyst', 'critic', 'strategist', 'devils-adv
 const slackChannelNameByIdCache = new Map<string, { name: string; expiresAt: number }>();
 const slackChannelIdByNameCache = new Map<string, { id: string; name: string; expiresAt: number }>();
 
+function extractClientIdHeader(ctx: HandlerContext): string | undefined {
+  const raw = ctx.req.headers['x-clawtalk-client-id'];
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed || undefined;
+}
+
+function parseIfMatchVersionHeader(ctx: HandlerContext): number | undefined {
+  const raw = ctx.req.headers['if-match'];
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim().replace(/^W\//i, '').replace(/^"|"$/g, '');
+  if (!/^\d+$/.test(trimmed)) return undefined;
+  const parsed = Number.parseInt(trimmed, 10);
+  if (!Number.isFinite(parsed) || parsed < 1) return undefined;
+  return parsed;
+}
+
+function requireTalkPreconditionVersion(
+  ctx: HandlerContext,
+  talk: TalkMeta,
+): { ok: true; version: number } | { ok: false } {
+  const expected = parseIfMatchVersionHeader(ctx);
+  if (expected === undefined) {
+    sendJson(ctx.res, 428, {
+      error: 'Precondition required: send If-Match with current talkVersion.',
+      code: 'TALK_PRECONDITION_REQUIRED',
+      talkId: talk.id,
+      currentVersion: talk.talkVersion,
+    });
+    return { ok: false };
+  }
+  if (expected !== talk.talkVersion) {
+    sendJson(ctx.res, 409, {
+      error: 'Talk has changed on the gateway. Re-fetch and retry.',
+      code: 'TALK_VERSION_CONFLICT',
+      talkId: talk.id,
+      expectedVersion: talk.talkVersion,
+      receivedVersion: expected,
+      latestTalk: talk,
+    });
+    return { ok: false };
+  }
+  return { ok: true, version: expected };
+}
+
 function normalizeJobOutputInput(raw: unknown): { ok: true; output: JobOutputDestination } | { ok: false; error: string } {
   if (raw === undefined || raw === null) {
     return { ok: true, output: { type: 'report_only' } };
@@ -1420,6 +1467,7 @@ async function handleGetTalk(ctx: HandlerContext, store: TalkStore, talkId: stri
     openClawNativeToolsEnabled,
     proxyGatewayToolsEnabled,
   });
+  ctx.res.setHeader('ETag', `"${talk.talkVersion}"`);
   sendJson(ctx.res, 200, {
     ...talk,
     executionMode,
@@ -1541,6 +1589,9 @@ async function handleUpdateTalkTools(
     sendJson(ctx.res, 404, { error: 'Talk not found' });
     return;
   }
+  const precondition = requireTalkPreconditionVersion(ctx, talk);
+  if (!precondition.ok) return;
+  const modifiedBy = extractClientIdHeader(ctx);
 
   const toolMode = normalizeToolModeInput(body.toolMode);
   if (body.toolMode !== undefined && toolMode === undefined) {
@@ -1578,7 +1629,7 @@ async function handleUpdateTalkTools(
     ...(toolsAllow !== undefined ? { toolsAllow } : {}),
     ...(toolsDeny !== undefined ? { toolsDeny } : {}),
     ...(googleAuthProfile !== undefined ? { googleAuthProfile: googleAuthProfile || undefined } : {}),
-  });
+  }, { modifiedBy });
   if (!updated) {
     sendJson(ctx.res, 404, { error: 'Talk not found' });
     return;
@@ -1679,6 +1730,9 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
     sendJson(ctx.res, 404, { error: 'Talk not found' });
     return;
   }
+  const precondition = requireTalkPreconditionVersion(ctx, talk);
+  if (!precondition.ok) return;
+  const modifiedBy = extractClientIdHeader(ctx);
 
   if (body.objective === undefined && body.objectives !== undefined) {
     body.objective = normalizeObjectiveAlias(body.objectives);
@@ -1805,23 +1859,11 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
     body.platformBehaviors = behaviorParse.behaviors;
   }
 
-  if (normalizedAgentsForUpdate !== undefined) {
-    await store.setAgents(talkId, normalizedAgentsForUpdate);
-  }
-  if (body.directives !== undefined) {
-    await store.setDirectives(talkId, body.directives);
-  }
-  if (body.platformBindings !== undefined) {
-    await store.setPlatformBindings(talkId, body.platformBindings);
-  }
-  if (body.platformBehaviors !== undefined) {
-    await store.setPlatformBehaviors(talkId, body.platformBehaviors);
-  }
-
   const updated = store.updateTalk(talkId, {
     topicTitle: body.topicTitle,
     objective: body.objective,
     model: body.model,
+    agents: normalizedAgentsForUpdate,
     directives: body.directives,
     platformBindings: body.platformBindings,
     platformBehaviors: body.platformBehaviors,
@@ -1832,7 +1874,7 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
     toolsAllow,
     toolsDeny,
     ...(googleAuthProfile !== undefined ? { googleAuthProfile: googleAuthProfile || undefined } : {}),
-  });
+  }, { modifiedBy });
   if (!updated) {
     sendJson(ctx.res, 404, { error: 'Talk not found' });
     return;
@@ -1842,7 +1884,15 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
 }
 
 async function handleDeleteTalk(ctx: HandlerContext, store: TalkStore, talkId: string): Promise<void> {
-  const success = store.deleteTalk(talkId);
+  const talk = store.getTalk(talkId);
+  if (!talk) {
+    sendJson(ctx.res, 404, { error: 'Talk not found' });
+    return;
+  }
+  const precondition = requireTalkPreconditionVersion(ctx, talk);
+  if (!precondition.ok) return;
+  const modifiedBy = extractClientIdHeader(ctx);
+  const success = store.deleteTalk(talkId, { modifiedBy });
   if (!success) {
     sendJson(ctx.res, 404, { error: 'Talk not found' });
     return;
@@ -1941,6 +1991,9 @@ async function handleCreateJob(ctx: HandlerContext, store: TalkStore, talkId: st
     sendJson(ctx.res, 404, { error: 'Talk not found' });
     return;
   }
+  const precondition = requireTalkPreconditionVersion(ctx, talk);
+  if (!precondition.ok) return;
+  const modifiedBy = extractClientIdHeader(ctx);
 
   let body: { schedule?: string; prompt?: string; output?: unknown };
   try {
@@ -2006,7 +2059,7 @@ async function handleCreateJob(ctx: HandlerContext, store: TalkStore, talkId: st
     jobType = 'event';
   }
 
-  const job = store.addJob(talkId, body.schedule, body.prompt, jobType, outputResult.output);
+  const job = store.addJob(talkId, body.schedule, body.prompt, jobType, outputResult.output, { modifiedBy });
   if (!job) {
     sendJson(ctx.res, 500, { error: 'Failed to create job' });
     return;
@@ -2031,6 +2084,9 @@ async function handleUpdateJob(ctx: HandlerContext, store: TalkStore, talkId: st
     sendJson(ctx.res, 404, { error: 'Talk not found' });
     return;
   }
+  const precondition = requireTalkPreconditionVersion(ctx, talk);
+  if (!precondition.ok) return;
+  const modifiedBy = extractClientIdHeader(ctx);
 
   let body: { active?: boolean; schedule?: string; prompt?: string; output?: unknown };
   try {
@@ -2100,7 +2156,7 @@ async function handleUpdateJob(ctx: HandlerContext, store: TalkStore, talkId: st
     ...(body.prompt !== undefined ? { prompt: body.prompt } : {}),
     ...(nextOutput ? { output: nextOutput } : {}),
     ...(nextType ? { type: nextType } : {}),
-  });
+  }, { modifiedBy });
   if (!updated) {
     sendJson(ctx.res, 404, { error: 'Job not found' });
     return;
@@ -2109,7 +2165,15 @@ async function handleUpdateJob(ctx: HandlerContext, store: TalkStore, talkId: st
 }
 
 async function handleDeleteJob(ctx: HandlerContext, store: TalkStore, talkId: string, jobId: string): Promise<void> {
-  const success = store.deleteJob(talkId, jobId);
+  const talk = store.getTalk(talkId);
+  if (!talk) {
+    sendJson(ctx.res, 404, { error: 'Talk not found' });
+    return;
+  }
+  const precondition = requireTalkPreconditionVersion(ctx, talk);
+  if (!precondition.ok) return;
+  const modifiedBy = extractClientIdHeader(ctx);
+  const success = store.deleteJob(talkId, jobId, { modifiedBy });
   if (!success) {
     sendJson(ctx.res, 404, { error: 'Job not found' });
     return;
@@ -2141,6 +2205,9 @@ async function handleAddAgent(ctx: HandlerContext, store: TalkStore, talkId: str
     sendJson(ctx.res, 404, { error: 'Talk not found' });
     return;
   }
+  const precondition = requireTalkPreconditionVersion(ctx, talk);
+  if (!precondition.ok) return;
+  const modifiedBy = extractClientIdHeader(ctx);
 
   let body: { name?: string; model?: string; role?: string; isPrimary?: boolean };
   try {
@@ -2160,7 +2227,7 @@ async function handleAddAgent(ctx: HandlerContext, store: TalkStore, talkId: str
     model: body.model,
     role: body.role as any,
     isPrimary: body.isPrimary ?? false,
-  });
+  }, { modifiedBy });
   sendJson(ctx.res, 201, agent);
 }
 
@@ -2181,9 +2248,12 @@ async function handleDeleteAgent(ctx: HandlerContext, store: TalkStore, talkId: 
     sendJson(ctx.res, 404, { error: 'Talk not found' });
     return;
   }
+  const precondition = requireTalkPreconditionVersion(ctx, talk);
+  if (!precondition.ok) return;
+  const modifiedBy = extractClientIdHeader(ctx);
 
   try {
-    await store.removeAgent(talkId, agentName);
+    await store.removeAgent(talkId, agentName, { modifiedBy });
   } catch {
     sendJson(ctx.res, 404, { error: 'Agent not found' });
     return;

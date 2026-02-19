@@ -2,12 +2,16 @@ import { composeSystemPrompt } from '../system-prompt';
 import type { TalkMeta, TalkMessage } from '../types';
 
 function makeMeta(overrides: Partial<TalkMeta> = {}): TalkMeta {
+  const now = Date.now();
   return {
     id: 'test-talk-1',
+    talkVersion: 1,
+    changeId: 'change-1',
+    lastModifiedAt: now,
     pinnedMessageIds: [],
     jobs: [],
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
+    createdAt: now,
+    updatedAt: now,
     ...overrides,
   };
 }

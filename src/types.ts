@@ -297,6 +297,14 @@ export interface JobReport {
 
 export interface TalkMeta {
   id: string;
+  /** Monotonic gateway-authoritative metadata version for optimistic concurrency control. */
+  talkVersion: number;
+  /** Unique identifier for the latest metadata mutation. */
+  changeId: string;
+  /** Optional client/device identifier that initiated the latest metadata change. */
+  lastModifiedBy?: string;
+  /** Timestamp of the latest metadata mutation. */
+  lastModifiedAt: number;
   topicTitle?: string;
   objective?: string;
   model?: string;

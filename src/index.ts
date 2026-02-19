@@ -80,9 +80,11 @@ const ROUTES = new Set([
   '/api/events/slack/doctor',
   '/api/events/slack/status',
   '/api/debug/slack/recent',
+  '/api/status/clawtalk',
+  '/api/sync/stream',
 ]);
 
-type SlackDebugPath = 'slack-ingress' | 'event-reply';
+type SlackDebugPath = 'slack-ingress' | 'event-reply' | 'openclaw-message';
 type SlackDebugEntry = {
   ts: number;
   instanceTag: string;
@@ -575,10 +577,72 @@ const plugin = {
     warmUsageLoader(api.logger);
 
     // Initialize Talk store (async)
+    type ReadyPhase = 'booting' | 'loading_talks' | 'reconciling_routes' | 'ready' | 'failed';
+    let readyPhase: ReadyPhase = 'booting';
+    let readyError: string | undefined;
+    const readySinceMs = Date.now();
+    const isGatewayReady = (): boolean => readyPhase === 'ready';
+
     const talkStore = new TalkStore(pluginCfg.dataDir, api.logger);
-    talkStore.init()
-      .then(() => reconcileSlackRoutingForTalks(talkStore.listTalks(), api.logger))
-      .catch(err => api.logger.error(`TalkStore init failed: ${err}`));
+
+    type SyncStreamEvent = {
+      id: number;
+      type: string;
+      ts: number;
+      payload: Record<string, unknown>;
+    };
+    const syncClients = new Set<ServerResponse>();
+    const syncHistory: SyncStreamEvent[] = [];
+    let syncEventId = 0;
+    const SYNC_HISTORY_MAX = 500;
+    const appendSyncEvent = (type: string, payload: Record<string, unknown>) => {
+      const event: SyncStreamEvent = {
+        id: ++syncEventId,
+        type,
+        ts: Date.now(),
+        payload,
+      };
+      syncHistory.push(event);
+      if (syncHistory.length > SYNC_HISTORY_MAX) {
+        syncHistory.splice(0, syncHistory.length - SYNC_HISTORY_MAX);
+      }
+      const chunk = `id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify({ ...payload, ts: event.ts })}\n\n`;
+      for (const res of syncClients) {
+        try {
+          res.write(chunk);
+        } catch {
+          syncClients.delete(res);
+        }
+      }
+    };
+    const removeSyncClient = (res: ServerResponse) => {
+      syncClients.delete(res);
+    };
+    const unsubscribeTalkStoreChange = talkStore.onChange((evt) => {
+      appendSyncEvent('talk_changed', {
+        talkId: evt.talkId,
+        mutationType: evt.type,
+        talkVersion: evt.talkVersion,
+        changeId: evt.changeId,
+        ...(evt.lastModifiedBy ? { lastModifiedBy: evt.lastModifiedBy } : {}),
+      });
+    });
+    readyPhase = 'loading_talks';
+    appendSyncEvent('gateway_phase', { phase: readyPhase });
+    const readyBarrier = talkStore.init()
+      .then(async () => {
+        readyPhase = 'reconciling_routes';
+        appendSyncEvent('gateway_phase', { phase: readyPhase });
+        await reconcileSlackRoutingForTalks(talkStore.listTalks(), api.logger);
+        readyPhase = 'ready';
+        appendSyncEvent('gateway_phase', { phase: readyPhase });
+      })
+      .catch(err => {
+        readyPhase = 'failed';
+        readyError = err instanceof Error ? err.message : String(err);
+        appendSyncEvent('gateway_phase', { phase: readyPhase, error: readyError });
+        api.logger.error(`TalkStore init failed: ${readyError}`);
+      });
 
     const logSlackOwnershipConflicts = () => {
       const cfg0 = api.runtime.config.loadConfig();
@@ -677,34 +741,37 @@ const plugin = {
     api.registerService({
       id: 'clawtalk-job-scheduler',
       start: () => {
-        const cfg0 = api.runtime.config.loadConfig();
-        const gatewayToken0 = resolveGatewayToken(cfg0);
-        const schedulerOrigin = resolveGatewayOrigin(cfg0, api.logger);
-        stopScheduler = startJobScheduler({
-          store: talkStore,
-          gatewayOrigin: schedulerOrigin,
-          authToken: gatewayToken0,
-          logger: api.logger,
-          registry: toolRegistry,
-          executor: toolExecutor,
-          dataDir: pluginCfg.dataDir,
-          jobTimeoutMs: pluginCfg.jobTimeoutMs,
-          sendSlackMessage: async (params: {
-            accountId?: string;
-            channelId: string;
-            threadTs?: string;
-            message: string;
-          }) =>
-            replyHandler(
-              {
-                platform: 'slack',
-                accountId: params.accountId,
-                platformChannelId: params.channelId,
-                threadId: params.threadTs,
-              },
-              params.message,
-            ),
-        });
+        void readyBarrier.then(() => {
+          if (!isGatewayReady()) return;
+          const cfg0 = api.runtime.config.loadConfig();
+          const gatewayToken0 = resolveGatewayToken(cfg0);
+          const schedulerOrigin = resolveGatewayOrigin(cfg0, api.logger);
+          stopScheduler = startJobScheduler({
+            store: talkStore,
+            gatewayOrigin: schedulerOrigin,
+            authToken: gatewayToken0,
+            logger: api.logger,
+            registry: toolRegistry,
+            executor: toolExecutor,
+            dataDir: pluginCfg.dataDir,
+            jobTimeoutMs: pluginCfg.jobTimeoutMs,
+            sendSlackMessage: async (params: {
+              accountId?: string;
+              channelId: string;
+              threadTs?: string;
+              message: string;
+            }) =>
+              replyHandler(
+                {
+                  platform: 'slack',
+                  accountId: params.accountId,
+                  platformChannelId: params.channelId,
+                  threadId: params.threadTs,
+                },
+                params.message,
+              ),
+          });
+        }).catch(() => {});
       },
       stop: () => {
         if (stopScheduler) {
@@ -719,19 +786,22 @@ const plugin = {
     api.registerService({
       id: 'clawtalk-event-dispatcher',
       start: () => {
-        refreshSlackIngressRoute();
-        eventDispatcher = new EventDispatcher({
-          store: talkStore,
-          gatewayOrigin: slackIngressOrigin,
-          authToken: slackIngressToken,
-          logger: api.logger,
-          registry: toolRegistry,
-          executor: toolExecutor,
-          dataDir: pluginCfg.dataDir,
-          jobTimeoutMs: pluginCfg.jobTimeoutMs,
-          replyToEvent: replyHandler,
-        });
-        api.logger.info('ClawTalk: event dispatcher started');
+        void readyBarrier.then(() => {
+          if (!isGatewayReady()) return;
+          refreshSlackIngressRoute();
+          eventDispatcher = new EventDispatcher({
+            store: talkStore,
+            gatewayOrigin: slackIngressOrigin,
+            authToken: slackIngressToken,
+            logger: api.logger,
+            registry: toolRegistry,
+            executor: toolExecutor,
+            dataDir: pluginCfg.dataDir,
+            jobTimeoutMs: pluginCfg.jobTimeoutMs,
+            replyToEvent: replyHandler,
+          });
+          api.logger.info('ClawTalk: event dispatcher started');
+        }).catch(() => {});
       },
       stop: () => {
         if (eventDispatcher) {
@@ -744,6 +814,9 @@ const plugin = {
 
     // Listen for incoming platform messages (Slack, Telegram, etc.)
     api.on('message_received', async (event: any, ctx: any) => {
+      if (!isGatewayReady()) {
+        return undefined;
+      }
       if (eventDispatcher) {
         eventDispatcher.handleMessageReceived(event, ctx).catch(err => {
           api.logger.warn(`ClawTalk: event dispatch error: ${err}`);
@@ -755,8 +828,84 @@ const plugin = {
       });
     });
 
+    const emitOpenClawMessageDebug = (
+      phase: string,
+      event: any,
+      ctx: any,
+      extra?: Pick<SlackDebugEntry, 'errorCode' | 'errorMessage'>,
+    ) => {
+      if (!isSlackDebugEnabled()) return;
+      const metadata = event && typeof event === 'object' && event.metadata && typeof event.metadata === 'object'
+        ? (event.metadata as Record<string, unknown>)
+        : undefined;
+      const rawTo =
+        (typeof event?.to === 'string' ? event.to : undefined) ??
+        (typeof metadata?.to === 'string' ? metadata.to : undefined) ??
+        (typeof ctx?.conversationId === 'string' ? ctx.conversationId : undefined);
+      const rawReplyTo =
+        (typeof metadata?.replyTo === 'string' ? metadata.replyTo : undefined) ??
+        (typeof event?.replyTo === 'string' ? event.replyTo : undefined);
+      const accountId =
+        (typeof metadata?.accountId === 'string' ? metadata.accountId : undefined) ??
+        (typeof ctx?.accountId === 'string' ? ctx.accountId : undefined);
+      const talkId =
+        (typeof metadata?.talkId === 'string' ? metadata.talkId : undefined) ??
+        (typeof event?.talkId === 'string' ? event.talkId : undefined);
+      const channelIdRaw = typeof rawTo === 'string' ? rawTo.trim() : undefined;
+      const channelIdResolved = (() => {
+        if (!channelIdRaw) return undefined;
+        const trimmed = channelIdRaw.trim();
+        if (trimmed.toLowerCase().startsWith('slack:')) {
+          return trimmed.slice(6);
+        }
+        return trimmed;
+      })();
+      recordSlackDebug(
+        {
+          path: 'openclaw-message',
+          phase,
+          ...(talkId ? { talkId } : {}),
+          ...(accountId ? { accountId } : {}),
+          ...(channelIdRaw ? { channelIdRaw } : {}),
+          ...(channelIdResolved ? { channelIdResolved } : {}),
+          ...(rawReplyTo ? { threadTs: rawReplyTo } : {}),
+          ...(extra?.errorCode ? { errorCode: extra.errorCode } : {}),
+          ...(extra?.errorMessage ? { errorMessage: extra.errorMessage } : {}),
+        },
+        slackDebugInstanceTag,
+      );
+    };
+
     api.on('message_sending', (event: any, ctx: any) => {
-      return handleSlackMessageSendingHook(event, ctx, api.logger);
+      if (!isGatewayReady()) {
+        return undefined;
+      }
+      emitOpenClawMessageDebug('send_start', event, ctx);
+      const suppression = handleSlackMessageSendingHook(event, ctx, api.logger);
+      if (suppression) {
+        emitOpenClawMessageDebug('suppressed', event, ctx);
+      }
+      return suppression;
+    });
+    api.on('message_sent', (event: any, ctx: any) => {
+      emitOpenClawMessageDebug('send_ok', event, ctx);
+      return undefined;
+    });
+    api.on('message_send_failed', (event: any, ctx: any) => {
+      const errorText =
+        (typeof event?.error === 'string' ? event.error : undefined) ??
+        (typeof event?.message === 'string' ? event.message : undefined) ??
+        (typeof event?.reason === 'string' ? event.reason : undefined) ??
+        'send failed';
+      const lower = errorText.toLowerCase();
+      const errorCode =
+        lower.includes('unknown channel') ? 'unknown_channel'
+          : lower.includes('not_in_channel') ? 'not_in_channel'
+            : lower.includes('timeout') || lower.includes('timed out') ? 'timeout'
+              : lower.includes('unauthorized') || lower.includes('forbidden') ? 'auth_error'
+                : 'error';
+      emitOpenClawMessageDebug('send_fail', event, ctx, { errorCode, errorMessage: errorText });
+      return undefined;
     });
 
     // Register lifecycle hooks
@@ -769,6 +918,15 @@ const plugin = {
 
     api.on('gateway_stop', () => {
       api.logger.info('ClawTalk: gateway_stop event received — cleaning up');
+      unsubscribeTalkStoreChange();
+      for (const client of syncClients) {
+        try {
+          client.end();
+        } catch {
+          // ignore
+        }
+      }
+      syncClients.clear();
       if (stopScheduler) {
         stopScheduler();
         stopScheduler = null;
@@ -919,6 +1077,25 @@ const plugin = {
         }
 
         const ctx = { req, res, url, cfg, pluginCfg, logger: api.logger };
+        const readinessGated =
+          isTalkRoute
+          || url.pathname === '/api/events/slack'
+          || url.pathname === '/api/events/slack/resolve'
+          || url.pathname === '/api/events/slack/doctor'
+          || url.pathname === '/api/events/slack/status';
+        if (readinessGated && !isGatewayReady()) {
+          const retryAfterSec = 2;
+          res.setHeader('Retry-After', String(retryAfterSec));
+          sendJson(res, 503, {
+            error: 'Gateway is initializing. Retry shortly.',
+            code: 'CLAWTALK_NOT_READY',
+            phase: readyPhase,
+            retryAfterMs: retryAfterSec * 1000,
+            sinceMs: readySinceMs,
+            ...(readyError ? { details: readyError } : {}),
+          });
+          return true;
+        }
 
         // Talk routes (dynamic path segments)
         if (isTalkRoute) {
@@ -957,6 +1134,75 @@ const plugin = {
         }
 
         switch (url.pathname) {
+          case '/api/status/clawtalk': {
+            if (req.method !== 'GET') {
+              sendJson(res, 405, { error: 'Method not allowed' });
+              break;
+            }
+            sendJson(res, 200, {
+              ready: isGatewayReady(),
+              phase: readyPhase,
+              sinceMs: readySinceMs,
+              talkCount: talkStore.listTalks().length,
+              sync: {
+                connectedClients: syncClients.size,
+                lastEventId: syncEventId,
+              },
+              ...(readyError ? { error: readyError } : {}),
+            });
+            break;
+          }
+          case '/api/sync/stream': {
+            if (req.method !== 'GET') {
+              sendJson(res, 405, { error: 'Method not allowed' });
+              break;
+            }
+            res.statusCode = 200;
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache, no-transform');
+            res.setHeader('Connection', 'keep-alive');
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.flushHeaders?.();
+
+            const lastEventIdRaw = req.headers['last-event-id'];
+            const lastEventIdText = Array.isArray(lastEventIdRaw) ? lastEventIdRaw[0] : lastEventIdRaw;
+            const lastEventId = typeof lastEventIdText === 'string' ? Number.parseInt(lastEventIdText, 10) : NaN;
+            const replayFromId = Number.isFinite(lastEventId) ? Math.max(0, lastEventId) : 0;
+            const backlog = replayFromId > 0
+              ? syncHistory.filter((entry) => entry.id > replayFromId)
+              : [];
+            for (const entry of backlog) {
+              res.write(
+                `id: ${entry.id}\nevent: ${entry.type}\ndata: ${JSON.stringify({ ...entry.payload, ts: entry.ts })}\n\n`,
+              );
+            }
+            res.write(
+              `id: ${syncEventId}\nevent: sync_ready\ndata: ${JSON.stringify({
+                ready: isGatewayReady(),
+                phase: readyPhase,
+                talkCount: talkStore.listTalks().length,
+                ts: Date.now(),
+              })}\n\n`,
+            );
+            syncClients.add(res);
+            const heartbeat = setInterval(() => {
+              try {
+                res.write(`event: ping\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`);
+              } catch {
+                removeSyncClient(res);
+              }
+            }, 15000);
+            heartbeat.unref?.();
+            req.on('close', () => {
+              clearInterval(heartbeat);
+              removeSyncClient(res);
+            });
+            req.on('aborted', () => {
+              clearInterval(heartbeat);
+              removeSyncClient(res);
+            });
+            return true;
+          }
           case '/api/events/slack/options': {
             if (req.method !== 'GET') {
               sendJson(res, 405, { error: 'Method not allowed' });
@@ -1098,7 +1344,7 @@ const plugin = {
             const limit = Number.isFinite(limitRaw) ? Math.min(200, Math.max(1, limitRaw)) : 50;
             const talkIdFilter = url.searchParams.get('talkId')?.trim();
             const pathFilter = url.searchParams.get('path')?.trim() as SlackDebugPath | undefined;
-            const validPath = pathFilter === 'slack-ingress' || pathFilter === 'event-reply'
+            const validPath = pathFilter === 'slack-ingress' || pathFilter === 'event-reply' || pathFilter === 'openclaw-message'
               ? pathFilter
               : undefined;
             const entries = slackDebugRing
