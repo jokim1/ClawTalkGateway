@@ -909,6 +909,15 @@ async function callLlmForEvent(params: {
     }
     messages.push({ role: msg.role, content });
   }
+  // Ensure provider-compatible payloads always include a fresh user turn for this inbound event.
+  const inboundUserContent = buildInboundMessage(event);
+  const lastHistory = history.length > 0 ? history[history.length - 1] : undefined;
+  const hasInboundMirroredInHistory =
+    lastHistory?.role === 'user' &&
+    (lastHistory.content ?? '').trim() === inboundUserContent.trim();
+  if (!hasInboundMirroredInHistory) {
+    messages.push({ role: 'user', content: inboundUserContent });
+  }
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',

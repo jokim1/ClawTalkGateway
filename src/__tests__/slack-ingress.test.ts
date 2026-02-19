@@ -815,4 +815,73 @@ describe('slack ingress ownership hooks', () => {
       fetchSpy.mockRestore();
     }
   });
+
+  it('includes a user message for llm calls when mirrorToTalk is off', async () => {
+    const talk = store.createTalk('test-model');
+    const bindingId = 'binding-user-turn-required';
+    store.updateTalk(talk.id, {
+      platformBindings: [{
+        id: bindingId,
+        platform: 'slack',
+        accountId: 'kimfamily',
+        scope: 'channel:c892',
+        permission: 'read+write',
+        createdAt: Date.now(),
+      }],
+      platformBehaviors: [{
+        id: 'behavior-user-turn-required',
+        platformBindingId: bindingId,
+        responseMode: 'all',
+        mirrorToTalk: 'off',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      }],
+    });
+
+    const sendSlackMessage = jest.fn(async (_params: { accountId?: string; channelId: string; threadTs?: string; message: string }) => true);
+    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: 'ack' } }],
+      }),
+    } as unknown as Response);
+    try {
+      const deps = {
+        ...buildDeps(),
+        autoProcessQueue: true,
+        sendSlackMessage,
+      };
+
+      await handleSlackMessageReceivedHook(
+        {
+          from: 'slack:channel:C892',
+          content: 'please summarize study time',
+          metadata: {
+            to: 'channel:C892',
+            messageId: '1700000104.100',
+            senderId: 'U892',
+            senderName: 'Big Bad Daddy',
+          },
+        },
+        {
+          channelId: 'slack',
+          accountId: 'kimfamily',
+        },
+        deps,
+      );
+
+      for (let i = 0; i < 40 && sendSlackMessage.mock.calls.length < 1; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      expect(fetchSpy).toHaveBeenCalled();
+      const firstReq = fetchSpy.mock.calls[0]?.[1] as { body?: string } | undefined;
+      const payload = firstReq?.body ? JSON.parse(firstReq.body) as { messages?: Array<{ role?: string; content?: string }> } : {};
+      const userTurn = payload.messages?.find((m) => m.role === 'user');
+      expect(userTurn).toBeDefined();
+      expect(userTurn?.content).toContain('please summarize study time');
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
 });
