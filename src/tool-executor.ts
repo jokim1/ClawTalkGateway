@@ -58,6 +58,23 @@ export class ToolExecutor {
     this.logger = logger;
   }
 
+  private resolveStateStreamOrError(
+    talkId: string,
+    streamArg: unknown,
+  ): { ok: true; stream: string } | { ok: false; content: string } {
+    const resolved = this.store.resolveStateStream(
+      talkId,
+      streamArg === undefined ? undefined : String(streamArg ?? ''),
+    );
+    if (!resolved.ok) {
+      return {
+        ok: false,
+        content: `STATE_STREAM_REQUIRED: ${resolved.message}`,
+      };
+    }
+    return resolved;
+  }
+
   /**
    * Execute a tool call by name with the given arguments JSON string.
    */
@@ -718,7 +735,6 @@ export class ToolExecutor {
 
   private async execStateAppendEvent(args: Record<string, unknown>): Promise<ToolExecResult> {
     const talkId = String(args.talk_id ?? '').trim();
-    const stream = args.stream === undefined ? 'kids_study' : String(args.stream ?? '').trim();
     const eventType = String(args.event_type ?? '').trim();
     const payload = args.payload;
     if (!talkId || !eventType || !payload || typeof payload !== 'object' || Array.isArray(payload)) {
@@ -728,9 +744,13 @@ export class ToolExecutor {
         durationMs: 0,
       };
     }
+    const streamResolved = this.resolveStateStreamOrError(talkId, args.stream);
+    if (!streamResolved.ok) {
+      return { success: false, content: streamResolved.content, durationMs: 0 };
+    }
     const outcome = await this.store.appendStateEvent(
       talkId,
-      stream,
+      streamResolved.stream,
       {
         type: eventType,
         payload: payload as Record<string, unknown>,
@@ -760,13 +780,16 @@ export class ToolExecutor {
 
   private async execStateReadSummary(args: Record<string, unknown>): Promise<ToolExecResult> {
     const talkId = String(args.talk_id ?? '').trim();
-    const stream = args.stream === undefined ? 'kids_study' : String(args.stream ?? '').trim();
     if (!talkId) {
       return { success: false, content: 'Missing required field: talk_id', durationMs: 0 };
     }
+    const streamResolved = this.resolveStateStreamOrError(talkId, args.stream);
+    if (!streamResolved.ok) {
+      return { success: false, content: streamResolved.content, durationMs: 0 };
+    }
     const summary = await this.store.getStateSnapshot(
       talkId,
-      stream,
+      streamResolved.stream,
       args.as_of === undefined ? undefined : Number(args.as_of),
     );
     if (!summary) {
@@ -781,13 +804,16 @@ export class ToolExecutor {
 
   private async execStateConfigurePolicy(args: Record<string, unknown>): Promise<ToolExecResult> {
     const talkId = String(args.talk_id ?? '').trim();
-    const stream = args.stream === undefined ? 'kids_study' : String(args.stream ?? '').trim();
     if (!talkId) {
       return { success: false, content: 'Missing required field: talk_id', durationMs: 0 };
     }
+    const streamResolved = this.resolveStateStreamOrError(talkId, args.stream);
+    if (!streamResolved.ok) {
+      return { success: false, content: streamResolved.content, durationMs: 0 };
+    }
     const policy = await this.store.configureStatePolicy(
       talkId,
-      stream,
+      streamResolved.stream,
       {
         timezone: args.timezone === undefined ? undefined : String(args.timezone),
         weekStartDay: args.week_start_day === undefined ? undefined : Number(args.week_start_day),
@@ -810,14 +836,17 @@ export class ToolExecutor {
 
   private async execStateAuditEvents(args: Record<string, unknown>): Promise<ToolExecResult> {
     const talkId = String(args.talk_id ?? '').trim();
-    const stream = args.stream === undefined ? 'kids_study' : String(args.stream ?? '').trim();
     if (!talkId) {
       return { success: false, content: 'Missing required field: talk_id', durationMs: 0 };
     }
     if (!this.store.getTalk(talkId)) {
       return { success: false, content: `Talk not found: ${talkId}`, durationMs: 0 };
     }
-    const events = await this.store.getStateEvents(talkId, stream, {
+    const streamResolved = this.resolveStateStreamOrError(talkId, args.stream);
+    if (!streamResolved.ok) {
+      return { success: false, content: streamResolved.content, durationMs: 0 };
+    }
+    const events = await this.store.getStateEvents(talkId, streamResolved.stream, {
       limit: args.limit === undefined ? 50 : Number(args.limit),
       sinceSequence: args.since_sequence === undefined ? undefined : Number(args.since_sequence),
     });

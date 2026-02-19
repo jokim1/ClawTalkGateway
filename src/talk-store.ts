@@ -72,7 +72,7 @@ const SMALL_FILE_BYTES = 64 * 1024; // 64KB
 
 /** TTL for context.md cache entries. */
 const CONTEXT_CACHE_TTL_MS = 30_000;
-const DEFAULT_STATE_STREAM = 'kids_study';
+const DEFAULT_STATE_STREAM = 'default';
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_STATE_POLICY_BASE = {
   timezone: 'America/Los_Angeles',
@@ -195,6 +195,14 @@ function normalizeStateStream(raw: unknown): string {
   if (!value) return DEFAULT_STATE_STREAM;
   const normalized = value.replace(/[^a-z0-9_.-]+/g, '_').replace(/^_+|_+$/g, '');
   return normalized || DEFAULT_STATE_STREAM;
+}
+
+function normalizeOptionalStateStream(raw: unknown): string | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  return normalizeStateStream(trimmed);
 }
 
 function normalizeCarryOverMode(raw: unknown): TalkStateCarryOverMode {
@@ -578,6 +586,7 @@ export class TalkStore {
           meta.toolsAllow = normalizeToolNames(meta.toolsAllow);
           meta.toolsDeny = normalizeToolNames(meta.toolsDeny);
           meta.googleAuthProfile = normalizeGoogleAuthProfile(meta.googleAuthProfile);
+          meta.defaultStateStream = normalizeOptionalStateStream(meta.defaultStateStream);
           meta.talkVersion =
             typeof meta.talkVersion === 'number' && Number.isFinite(meta.talkVersion)
               ? Math.max(1, Math.floor(meta.talkVersion))
@@ -671,7 +680,7 @@ export class TalkStore {
     updates: Partial<
       Pick<
         TalkMeta,
-        'topicTitle' | 'objective' | 'model' | 'agents' | 'directives' | 'platformBindings' | 'platformBehaviors' | 'toolMode' | 'executionMode' | 'filesystemAccess' | 'networkAccess' | 'toolsAllow' | 'toolsDeny' | 'googleAuthProfile'
+        'topicTitle' | 'objective' | 'model' | 'agents' | 'directives' | 'platformBindings' | 'platformBehaviors' | 'toolMode' | 'executionMode' | 'filesystemAccess' | 'networkAccess' | 'toolsAllow' | 'toolsDeny' | 'googleAuthProfile' | 'defaultStateStream'
       >
     >,
     options?: { modifiedBy?: string },
@@ -715,8 +724,34 @@ export class TalkStore {
     if (updates.googleAuthProfile !== undefined) {
       meta.googleAuthProfile = normalizeGoogleAuthProfile(updates.googleAuthProfile);
     }
+    if (updates.defaultStateStream !== undefined) {
+      meta.defaultStateStream = normalizeOptionalStateStream(updates.defaultStateStream);
+    }
     this.touchMeta(meta, 'updated', { modifiedBy: options?.modifiedBy });
     return meta;
+  }
+
+  resolveStateStream(
+    talkId: string,
+    explicitStream?: string,
+  ): { ok: true; stream: string } | { ok: false; code: 'STATE_STREAM_REQUIRED'; message: string } {
+    const talk = this.talks.get(talkId);
+    if (!talk) {
+      return {
+        ok: false,
+        code: 'STATE_STREAM_REQUIRED',
+        message: 'Talk not found',
+      };
+    }
+    const explicit = normalizeOptionalStateStream(explicitStream);
+    if (explicit) return { ok: true, stream: explicit };
+    const talkDefault = normalizeOptionalStateStream(talk.defaultStateStream);
+    if (talkDefault) return { ok: true, stream: talkDefault };
+    return {
+      ok: false,
+      code: 'STATE_STREAM_REQUIRED',
+      message: 'State stream is required. Pass `stream` or configure talk.defaultStateStream.',
+    };
   }
 
   deleteTalk(id: string, options?: { modifiedBy?: string }): boolean {

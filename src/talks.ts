@@ -396,6 +396,15 @@ function normalizeGoogleAuthProfileInput(raw: unknown): string | undefined {
   return normalized || '';
 }
 
+function normalizeStateStreamInput(raw: unknown): string | undefined {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim().toLowerCase();
+  if (!trimmed) return '';
+  const normalized = trimmed.replace(/[^a-z0-9_.-]+/g, '_').replace(/^_+|_+$/g, '');
+  return normalized || '';
+}
+
 function executionModeValidationError(): string {
   return 'executionMode must be one of: openclaw, full_control, openclaw_agent, clawtalk_proxy';
 }
@@ -1323,6 +1332,7 @@ async function handleCreateTalk(ctx: HandlerContext, store: TalkStore): Promise<
     toolsAllow?: string[];
     toolsDeny?: string[];
     googleAuthProfile?: string;
+    defaultStateStream?: string;
     toolPolicy?: {
       mode?: string;
       executionMode?: string;
@@ -1331,6 +1341,7 @@ async function handleCreateTalk(ctx: HandlerContext, store: TalkStore): Promise<
       allow?: string[];
       deny?: string[];
       googleAuthProfile?: string;
+      defaultStateStream?: string;
     };
   } = {};
   try {
@@ -1372,6 +1383,9 @@ async function handleCreateTalk(ctx: HandlerContext, store: TalkStore): Promise<
   if (body.googleAuthProfile === undefined && body.toolPolicy?.googleAuthProfile !== undefined) {
     body.googleAuthProfile = body.toolPolicy.googleAuthProfile;
   }
+  if (body.defaultStateStream === undefined && body.toolPolicy?.defaultStateStream !== undefined) {
+    body.defaultStateStream = body.toolPolicy.defaultStateStream;
+  }
 
   const toolMode = normalizeToolModeInput(body.toolMode);
   if (body.toolMode !== undefined && toolMode === undefined) {
@@ -1398,6 +1412,11 @@ async function handleCreateTalk(ctx: HandlerContext, store: TalkStore): Promise<
   const googleAuthProfile = normalizeGoogleAuthProfileInput(body.googleAuthProfile);
   if (body.googleAuthProfile !== undefined && googleAuthProfile === undefined) {
     sendJson(ctx.res, 400, { error: 'googleAuthProfile must be a string' });
+    return;
+  }
+  const defaultStateStream = normalizeStateStreamInput(body.defaultStateStream);
+  if (body.defaultStateStream !== undefined && defaultStateStream === undefined) {
+    sendJson(ctx.res, 400, { error: 'defaultStateStream must be a string' });
     return;
   }
 
@@ -1456,6 +1475,7 @@ async function handleCreateTalk(ctx: HandlerContext, store: TalkStore): Promise<
     ...(toolsAllow !== undefined ? { toolsAllow } : {}),
     ...(toolsDeny !== undefined ? { toolsDeny } : {}),
     ...(googleAuthProfile !== undefined ? { googleAuthProfile: googleAuthProfile || undefined } : {}),
+    ...(defaultStateStream !== undefined ? { defaultStateStream: defaultStateStream || undefined } : {}),
   });
 
   void reconcileSlackRoutingForTalks(store.listTalks(), ctx.logger);
@@ -1584,6 +1604,7 @@ async function handleGetTalkTools(
     toolsAllow: talk.toolsAllow ?? [],
     toolsDeny: talk.toolsDeny ?? [],
     googleAuthProfile: talk.googleAuthProfile,
+    defaultStateStream: talk.defaultStateStream,
     availableTools: allTools,
     enabledTools,
     effectiveTools: effectiveToolStates,
@@ -1605,6 +1626,7 @@ async function handleUpdateTalkTools(
     toolsAllow?: string[];
     toolsDeny?: string[];
     googleAuthProfile?: string;
+    defaultStateStream?: string;
   };
   try {
     body = (await readJsonBody(ctx.req)) as typeof body;
@@ -1649,6 +1671,11 @@ async function handleUpdateTalkTools(
     sendJson(ctx.res, 400, { error: 'googleAuthProfile must be a string' });
     return;
   }
+  const defaultStateStream = normalizeStateStreamInput(body.defaultStateStream);
+  if (body.defaultStateStream !== undefined && defaultStateStream === undefined) {
+    sendJson(ctx.res, 400, { error: 'defaultStateStream must be a string' });
+    return;
+  }
 
   const updated = store.updateTalk(talkId, {
     ...(toolMode !== undefined ? { toolMode } : {}),
@@ -1658,6 +1685,7 @@ async function handleUpdateTalkTools(
     ...(toolsAllow !== undefined ? { toolsAllow } : {}),
     ...(toolsDeny !== undefined ? { toolsDeny } : {}),
     ...(googleAuthProfile !== undefined ? { googleAuthProfile: googleAuthProfile || undefined } : {}),
+    ...(defaultStateStream !== undefined ? { defaultStateStream: defaultStateStream || undefined } : {}),
   }, { modifiedBy });
   if (!updated) {
     sendJson(ctx.res, 404, { error: 'Talk not found' });
@@ -1709,6 +1737,7 @@ async function handleUpdateTalkTools(
     toolsAllow: updated.toolsAllow ?? [],
     toolsDeny: updated.toolsDeny ?? [],
     googleAuthProfile: updated.googleAuthProfile,
+    defaultStateStream: updated.defaultStateStream,
     availableTools: allTools,
     enabledTools,
     effectiveTools: effectiveToolStates,
@@ -1737,6 +1766,7 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
     toolsAllow?: string[];
     toolsDeny?: string[];
     googleAuthProfile?: string;
+    defaultStateStream?: string;
     toolPolicy?: {
       mode?: string;
       executionMode?: string;
@@ -1745,6 +1775,7 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
       allow?: string[];
       deny?: string[];
       googleAuthProfile?: string;
+      defaultStateStream?: string;
     };
   };
   try {
@@ -1796,6 +1827,9 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
   if (body.googleAuthProfile === undefined && body.toolPolicy?.googleAuthProfile !== undefined) {
     body.googleAuthProfile = body.toolPolicy.googleAuthProfile;
   }
+  if (body.defaultStateStream === undefined && body.toolPolicy?.defaultStateStream !== undefined) {
+    body.defaultStateStream = body.toolPolicy.defaultStateStream;
+  }
 
   const toolMode = normalizeToolModeInput(body.toolMode);
   if (body.toolMode !== undefined && toolMode === undefined) {
@@ -1822,6 +1856,11 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
   const googleAuthProfile = normalizeGoogleAuthProfileInput(body.googleAuthProfile);
   if (body.googleAuthProfile !== undefined && googleAuthProfile === undefined) {
     sendJson(ctx.res, 400, { error: 'googleAuthProfile must be a string' });
+    return;
+  }
+  const defaultStateStream = normalizeStateStreamInput(body.defaultStateStream);
+  if (body.defaultStateStream !== undefined && defaultStateStream === undefined) {
+    sendJson(ctx.res, 400, { error: 'defaultStateStream must be a string' });
     return;
   }
 
@@ -1903,6 +1942,7 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
     toolsAllow,
     toolsDeny,
     ...(googleAuthProfile !== undefined ? { googleAuthProfile: googleAuthProfile || undefined } : {}),
+    ...(defaultStateStream !== undefined ? { defaultStateStream: defaultStateStream || undefined } : {}),
   }, { modifiedBy });
   if (!updated) {
     sendJson(ctx.res, 404, { error: 'Talk not found' });

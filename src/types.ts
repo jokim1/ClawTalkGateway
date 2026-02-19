@@ -361,6 +361,8 @@ export interface TalkMeta {
   toolsDeny?: string[];
   /** Optional Google OAuth profile name for Google Docs/Drive tool calls in this talk. */
   googleAuthProfile?: string;
+  /** Optional default stream name used by state_* tools when stream is omitted. */
+  defaultStateStream?: string;
   pinnedMessageIds: string[];
   jobs: TalkJob[];
   agents?: TalkAgent[];

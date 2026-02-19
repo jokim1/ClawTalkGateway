@@ -23,6 +23,13 @@ import type { ToolExecutor } from './tool-executor.js';
 import { composeSystemPrompt } from './system-prompt.js';
 import { runToolLoopNonStreaming } from './tool-loop.js';
 import { getToolCatalog } from './tool-catalog.js';
+import { googleDocsAuthStatusForProfile } from './google-docs.js';
+import {
+  evaluateToolAvailability,
+  resolveOpenClawNativeGoogleToolsEnabled,
+  resolveProxyGatewayToolsEnabled,
+} from './talk-policy.js';
+import { isOpenClawNativeGoogleTool } from './openclaw-native-tools.js';
 
 /** How often the scheduler checks for due jobs. */
 const CHECK_INTERVAL_MS = 60_000; // 1 minute
@@ -92,6 +99,29 @@ function filterToolInfos(
     if (allowSet.size > 0 && !allowSet.has(key)) return false;
     return true;
   });
+}
+
+function buildTalkAuthReadyResolver(params: {
+  googleOAuthReady: boolean;
+  googleAuthProfile?: string;
+  getToolRequiredAuth: (toolName: string) => string[];
+}): (toolName: string) => { ready: boolean; reason?: string } {
+  return (toolName: string) => {
+    const required = params.getToolRequiredAuth(toolName);
+    if (!required.includes('google_oauth')) {
+      return { ready: true };
+    }
+    if (params.googleOAuthReady) {
+      return { ready: true };
+    }
+    const profileLabel = params.googleAuthProfile?.trim() || 'default';
+    return {
+      ready: false,
+      reason:
+        `Blocked by Google OAuth readiness: profile "${profileLabel}" is not connected. ` +
+        `Connect Google via Tools > Google OAuth (Gateway) for this talk profile.`,
+    };
+  };
 }
 
 /**
@@ -740,18 +770,56 @@ export async function executeJob(
     );
 
     const catalog = getToolCatalog(dataDir, logger);
+    const proxyGatewayToolsEnabled = resolveProxyGatewayToolsEnabled(
+      process.env.CLAWTALK_PROXY_GATEWAY_TOOLS_ENABLED,
+    );
+    const openClawNativeToolsEnabled = resolveOpenClawNativeGoogleToolsEnabled(
+      process.env.CLAWTALK_OPENCLAW_NATIVE_GOOGLE_TOOLS_ENABLED,
+    );
     const globallyEnabledTools = catalog.filterEnabledTools(registry.listTools());
-    const availableToolInfos = filterToolInfos(
+    const prePolicyToolInfos = filterToolInfos(
       globallyEnabledTools,
       meta.toolsAllow,
       meta.toolsDeny,
     );
+    const needsGoogleOAuth = prePolicyToolInfos.some((tool) =>
+      catalog.getToolRequiredAuth(tool.name).includes('google_oauth'),
+    );
+    const googleAuthStatus = needsGoogleOAuth
+      ? await googleDocsAuthStatusForProfile(meta.googleAuthProfile)
+      : undefined;
+    const isAuthReady = buildTalkAuthReadyResolver({
+      googleOAuthReady: Boolean(googleAuthStatus?.accessTokenReady ?? true),
+      googleAuthProfile: meta.googleAuthProfile,
+      getToolRequiredAuth: (toolName) => catalog.getToolRequiredAuth(toolName),
+    });
+    const effectiveToolMode = meta.toolMode === 'off' ? 'off' : 'auto';
+    const effectiveToolStates = evaluateToolAvailability(prePolicyToolInfos, {
+      ...meta,
+      toolMode: effectiveToolMode,
+    }, {
+      isInstalled: (toolName) => catalog.isToolEnabled(toolName),
+      isAuthReady,
+      isManagedTool: (toolName) => catalog.isManagedTool(toolName),
+      proxyGatewayToolsEnabled,
+      isOpenClawNativeTool: (toolName) => isOpenClawNativeGoogleTool(toolName),
+      openClawNativeToolsEnabled,
+    });
+    const availableToolInfos = effectiveToolStates
+      .filter((tool) => tool.enabled)
+      .map(({ name, description, builtin }) => ({ name, description, builtin }));
     const enabledToolNames = new Set(availableToolInfos.map((tool) => tool.name.toLowerCase()));
     const tools = registry.getToolSchemas().filter(
       (tool) => enabledToolNames.has(tool.function.name.toLowerCase()),
     );
+    const blockedReasonCounts: Record<string, number> = {};
+    for (const state of effectiveToolStates) {
+      if (state.enabled || !state.reasonCode) continue;
+      blockedReasonCounts[state.reasonCode] = (blockedReasonCounts[state.reasonCode] ?? 0) + 1;
+    }
     logger.info(
-      `JobScheduler: tool availability talkId=${talkId} jobId=${job.id} count=${tools.length} names=${tools.map((t) => t.function.name).join(',') || '-'}`,
+      `JobScheduler: tool availability talkId=${talkId} jobId=${job.id} executionMode=${meta.executionMode ?? 'openclaw'} toolMode=${meta.toolMode ?? 'auto'} effectiveToolMode=${effectiveToolMode} `
+      + `count=${tools.length} names=${tools.map((t) => t.function.name).join(',') || '-'} blocked=${JSON.stringify(blockedReasonCounts)}`,
     );
 
     const systemPrompt = composeSystemPrompt({

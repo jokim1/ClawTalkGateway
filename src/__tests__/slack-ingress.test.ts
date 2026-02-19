@@ -9,6 +9,8 @@ import {
   inspectSlackOwnership,
 } from '../slack-ingress';
 import { TalkStore } from '../talk-store';
+import { ToolRegistry } from '../tool-registry';
+import { ToolExecutor } from '../tool-executor';
 import type { Logger } from '../types';
 
 const mockLogger: Logger = {
@@ -20,11 +22,15 @@ const mockLogger: Logger = {
 
 let tmpDir: string;
 let store: TalkStore;
+let registry: ToolRegistry;
+let executor: ToolExecutor;
 
 beforeEach(async () => {
   tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'slack-ingress-test-'));
   store = new TalkStore(tmpDir, mockLogger);
   await store.init();
+  registry = new ToolRegistry(tmpDir, mockLogger);
+  executor = new ToolExecutor(registry, store, mockLogger);
   __resetSlackIngressStateForTests();
   jest.clearAllMocks();
   delete process.env.CLAWTALK_INGRESS_SUPPRESS_MAX_CANCELS;
@@ -39,6 +45,9 @@ afterEach(async () => {
 function buildDeps() {
   return {
     store,
+    registry,
+    executor,
+    dataDir: tmpDir,
     gatewayOrigin: 'http://127.0.0.1:18789',
     authToken: 'test-token',
     logger: mockLogger,
@@ -875,8 +884,9 @@ describe('slack ingress ownership hooks', () => {
       }
 
       expect(fetchSpy).toHaveBeenCalled();
-      const firstReq = fetchSpy.mock.calls[0]?.[1] as { body?: string } | undefined;
-      const payload = firstReq?.body ? JSON.parse(firstReq.body) as { messages?: Array<{ role?: string; content?: string }> } : {};
+      const llmCall = fetchSpy.mock.calls.find((call) => String(call[0]).includes('/v1/chat/completions'));
+      const llmReq = llmCall?.[1] as { body?: string } | undefined;
+      const payload = llmReq?.body ? JSON.parse(llmReq.body) as { messages?: Array<{ role?: string; content?: string }> } : {};
       const userTurn = payload.messages?.find((m) => m.role === 'user');
       expect(userTurn).toBeDefined();
       expect(userTurn?.content).toContain('please summarize study time');

@@ -442,7 +442,7 @@ const STATE_APPEND_EVENT_TOOL: ToolDefinition = {
   function: {
     name: 'state_append_event',
     description:
-      'Append an immutable state event to a talk stream (for example kids_study). ' +
+      'Append an immutable state event to a talk stream (for example study_tracker). ' +
       'Use this to persist tracker updates such as logged minutes.',
     parameters: {
       type: 'object',
@@ -453,7 +453,7 @@ const STATE_APPEND_EVENT_TOOL: ToolDefinition = {
         },
         stream: {
           type: 'string',
-          description: 'Optional state stream name (default: kids_study).',
+          description: 'Optional state stream name. If omitted, talk.defaultStateStream is used.',
         },
         event_type: {
           type: 'string',
@@ -491,7 +491,7 @@ const STATE_READ_SUMMARY_TOOL: ToolDefinition = {
         },
         stream: {
           type: 'string',
-          description: 'Optional state stream name (default: kids_study).',
+          description: 'Optional state stream name. If omitted, talk.defaultStateStream is used.',
         },
         as_of: {
           type: 'number',
@@ -518,7 +518,7 @@ const STATE_CONFIGURE_POLICY_TOOL: ToolDefinition = {
         },
         stream: {
           type: 'string',
-          description: 'Optional state stream name (default: kids_study).',
+          description: 'Optional state stream name. If omitted, talk.defaultStateStream is used.',
         },
         timezone: {
           type: 'string',
@@ -565,7 +565,7 @@ const STATE_AUDIT_EVENTS_TOOL: ToolDefinition = {
         },
         stream: {
           type: 'string',
-          description: 'Optional state stream name (default: kids_study).',
+          description: 'Optional state stream name. If omitted, talk.defaultStateStream is used.',
         },
         limit: {
           type: 'number',

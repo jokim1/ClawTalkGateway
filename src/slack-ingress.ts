@@ -1010,6 +1010,8 @@ async function callLlmForEvent(params: {
   }
   const talkExecutionMode = resolveExecutionMode(meta);
   const talkToolMode = meta.toolMode ?? 'auto';
+  const effectiveToolMode = talkToolMode === 'off' ? 'off' : 'auto';
+  const confirmFallback = talkToolMode === 'confirm';
   const catalog = getToolCatalog(deps.dataDir, deps.logger);
   const proxyGatewayToolsEnabled = resolveProxyGatewayToolsEnabled(
     process.env.CLAWTALK_PROXY_GATEWAY_TOOLS_ENABLED,
@@ -1025,7 +1027,10 @@ async function callLlmForEvent(params: {
   const googleAuthStatus = needsGoogleOAuth
     ? await googleDocsAuthStatusForProfile(meta.googleAuthProfile)
     : undefined;
-  const policyStatesWithAuth = evaluateToolAvailability(prePolicyToolInfos, meta, {
+  const policyStatesWithAuth = evaluateToolAvailability(prePolicyToolInfos, {
+    ...meta,
+    toolMode: effectiveToolMode,
+  }, {
     isInstalled: (toolName) => catalog.isToolEnabled(toolName),
     isAuthReady: (toolName) => {
       const required = catalog.getToolRequiredAuth(toolName);
@@ -1043,7 +1048,7 @@ async function callLlmForEvent(params: {
   const enabledToolNames = new Set(
     policyStatesWithAuth.filter((tool) => tool.enabled).map((tool) => tool.name.trim().toLowerCase()),
   );
-  const enableToolsForTurn = talkToolMode === 'auto' && enabledToolNames.size > 0;
+  const enableToolsForTurn = effectiveToolMode !== 'off' && enabledToolNames.size > 0;
   const tools = enableToolsForTurn
     ? deps.registry.getToolSchemas().filter((tool) => enabledToolNames.has(tool.function.name.toLowerCase()))
     : [];
@@ -1071,7 +1076,7 @@ async function callLlmForEvent(params: {
   }
   deps.logger.info(
     `ModelRoute trace=${traceId} flow=slack-ingress talkId=${talkId} eventId=${event.eventId} requestedModel=${routeDiag.requestedModel} `
-    + `executionMode=${talkExecutionMode} toolMode=${talkToolMode} toolsEnabled=${enableToolsForTurn ? tools.length : 0} `
+    + `executionMode=${talkExecutionMode} toolMode=${talkToolMode} effectiveToolMode=${effectiveToolMode} confirmFallback=${confirmFallback} toolsEnabled=${enableToolsForTurn ? tools.length : 0} `
     + `headerAgentId=${selectedAgent?.openClawAgentId?.trim() ?? '-'} effectiveHeaderAgentId=${resolvedHeaderAgentId ?? '-'} `
     + `configuredAgentId=${routeDiag.configuredAgentId ?? '-'} `
     + `configuredAgentModel=${routeDiag.configuredAgentModel ?? '-'} defaultAgentId=${routeDiag.defaultAgentId ?? '-'} `
@@ -1340,11 +1345,17 @@ async function sendFailureNotice(params: {
     ? ` [dbg path=slack-ingress inst=${params.deps.instanceTag ?? '-'} talk=${params.item.talkId.slice(0, 8)} event=${params.item.event.eventId.slice(0, 16)} err=${inferErrorCode(params.failureError ?? 'error')}]`
     : '';
   const message = `${baseMessage}${compactDebug}`;
-  const fallbackSessionKey = buildSlackSessionKey({
-    talkId: params.item.talkId,
-    event: params.item.event,
-    agentId: 'main',
-  });
+  const talk = params.deps.store.getTalk(params.item.talkId);
+  const fallbackSessionKey = talk && resolveExecutionMode(talk) === 'full_control'
+    ? buildFullControlSlackSessionKey({
+        talkId: params.item.talkId,
+        event: params.item.event,
+      })
+    : buildSlackSessionKey({
+        talkId: params.item.talkId,
+        event: params.item.event,
+        agentId: 'main',
+      });
   await sendSlackReply({
     deps: params.deps,
     event: params.item.event,

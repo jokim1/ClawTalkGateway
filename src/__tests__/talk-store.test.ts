@@ -709,4 +709,26 @@ describe('Structured talk state', () => {
     expect(reloaded).not.toBeNull();
     expect(reloaded!.timezone).toBe('Asia/Kolkata');
   });
+
+  it('resolveStateStream requires explicit or talk default stream', () => {
+    const talk = store.createTalk();
+    const missing = store.resolveStateStream(talk.id);
+    expect(missing.ok).toBe(false);
+    if (!missing.ok) {
+      expect(missing.code).toBe('STATE_STREAM_REQUIRED');
+    }
+
+    store.updateTalk(talk.id, { defaultStateStream: 'study_tracker' });
+    const fallback = store.resolveStateStream(talk.id);
+    expect(fallback.ok).toBe(true);
+    if (fallback.ok) {
+      expect(fallback.stream).toBe('study_tracker');
+    }
+
+    const explicit = store.resolveStateStream(talk.id, 'd1_retention');
+    expect(explicit.ok).toBe(true);
+    if (explicit.ok) {
+      expect(explicit.stream).toBe('d1_retention');
+    }
+  });
 });
