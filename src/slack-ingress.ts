@@ -27,6 +27,7 @@ import {
   resolveProxyGatewayToolsEnabled,
 } from './talk-policy.js';
 import { isOpenClawNativeGoogleTool } from './openclaw-native-tools.js';
+import { assertRoutingHeaders, RoutingGuardError } from './routing-headers.js';
 
 const MAX_CONTEXT_MESSAGES = 50;
 const MAX_CONTEXT_BUDGET_BYTES = 60 * 1024;
@@ -830,6 +831,35 @@ function mapFailureToDiagnostic(err: unknown): {
 } {
   const errorCode = inferErrorCode(err);
   const errorText = (err instanceof Error ? err.message : String(err)).trim();
+  if (err instanceof RoutingGuardError) {
+    return {
+      code: err.code,
+      category: 'routing',
+      title: 'Routing guard blocked execution',
+      message:
+        'Execution Mode is ClawTalk Proxy, but disallowed OpenClaw routing headers were present. ' +
+        'The run was blocked to prevent proxy-to-agent misrouting.',
+      assumptionKey: `routing:${err.code.toLowerCase()}:${err.executionMode}`,
+    };
+  }
+  if (errorText.toLowerCase().includes('routing_guard_forbidden_agent_header')) {
+    return {
+      code: 'ROUTING_GUARD_FORBIDDEN_AGENT_HEADER',
+      category: 'routing',
+      title: 'Routing guard blocked agent header',
+      message: 'A disallowed OpenClaw agent header was present in ClawTalk Proxy mode.',
+      assumptionKey: 'routing:forbidden_agent_header',
+    };
+  }
+  if (errorText.toLowerCase().includes('routing_guard_forbidden_session_key')) {
+    return {
+      code: 'ROUTING_GUARD_FORBIDDEN_SESSION_KEY',
+      category: 'routing',
+      title: 'Routing guard blocked session key',
+      message: 'A disallowed OpenClaw session key was present in ClawTalk Proxy mode.',
+      assumptionKey: 'routing:forbidden_session_key',
+    };
+  }
   if (errorText.toLowerCase().includes('state_stream_required')) {
     return {
       code: 'STATE_STREAM_REQUIRED',
@@ -1221,6 +1251,11 @@ async function callLlmForEvent(params: {
   if (talkExecutionMode === 'openclaw' && resolvedHeaderAgentId?.trim()) {
     headers['x-openclaw-agent-id'] = resolvedHeaderAgentId.trim();
   }
+  assertRoutingHeaders({
+    flow: 'slack-ingress',
+    executionMode: talkExecutionMode,
+    headers,
+  });
   deps.logger.info(
     `ModelRoute trace=${traceId} flow=slack-ingress talkId=${talkId} eventId=${event.eventId} requestedModel=${routeDiag.requestedModel} `
     + `executionMode=${talkExecutionMode} toolMode=${talkToolMode} effectiveToolMode=${effectiveToolMode} confirmFallback=${confirmFallback} toolsEnabled=${enableToolsForTurn ? tools.length : 0} `

@@ -150,6 +150,8 @@ function normalizeAllowedSenders(raw: unknown): string[] | undefined {
 function normalizeExecutionMode(raw: unknown): 'openclaw' | 'full_control' {
   const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
   if (value === 'openclaw' || value === 'full_control') return value;
+  if (value === 'openclaw_agent') return 'openclaw';
+  if (value === 'clawtalk_proxy' || value === 'raw_proxy') return 'full_control';
   // Migrate old values
   if (value === 'unsandboxed') return 'full_control';
   if (value === 'inherit' || value === 'sandboxed') return 'openclaw';
@@ -659,6 +661,9 @@ export class TalkStore {
         try {
           const raw = await fsp.readFile(metaPath, 'utf-8');
           const meta = JSON.parse(raw) as TalkMeta;
+          const rawExecutionMode = typeof meta.executionMode === 'string'
+            ? meta.executionMode.trim().toLowerCase()
+            : '';
           // Ensure arrays exist (for older files)
           meta.pinnedMessageIds ??= [];
           meta.jobs = normalizeJobs(meta.jobs);
@@ -696,6 +701,12 @@ export class TalkStore {
           }
           this.talks.set(meta.id, meta);
           this.invalidateListCache();
+          if (rawExecutionMode && rawExecutionMode !== meta.executionMode) {
+            this.logger.info(
+              `TalkStore: normalized executionMode for talk ${meta.id} from "${rawExecutionMode}" to "${meta.executionMode}"`,
+            );
+            await fsp.writeFile(metaPath, JSON.stringify(meta, null, 2));
+          }
         } catch (err) {
           // File may not exist or be corrupted — skip it
           if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {

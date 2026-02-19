@@ -202,6 +202,20 @@ describe('Talk CRUD', () => {
     const store3 = new TalkStore(tmpDir, mockLogger);
     await store3.init();
     expect(store3.getTalk(talk.id)!.executionMode).toBe('openclaw');
+
+    // Also test clawtalk_proxy -> full_control
+    const meta3 = { ...store3.getTalk(talk.id)!, executionMode: 'clawtalk_proxy' };
+    await fsp.writeFile(path.join(talkDir, 'talk.json'), JSON.stringify(meta3, null, 2));
+    const store4 = new TalkStore(tmpDir, mockLogger);
+    await store4.init();
+    expect(store4.getTalk(talk.id)!.executionMode).toBe('full_control');
+
+    // Also test openclaw_agent -> openclaw
+    const meta4 = { ...store4.getTalk(talk.id)!, executionMode: 'openclaw_agent' };
+    await fsp.writeFile(path.join(talkDir, 'talk.json'), JSON.stringify(meta4, null, 2));
+    const store5 = new TalkStore(tmpDir, mockLogger);
+    await store5.init();
+    expect(store5.getTalk(talk.id)!.executionMode).toBe('openclaw');
   });
 });
 

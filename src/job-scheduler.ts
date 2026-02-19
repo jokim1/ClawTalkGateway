@@ -26,10 +26,12 @@ import { getToolCatalog } from './tool-catalog.js';
 import { googleDocsAuthStatusForProfile } from './google-docs.js';
 import {
   evaluateToolAvailability,
+  resolveExecutionMode,
   resolveOpenClawNativeGoogleToolsEnabled,
   resolveProxyGatewayToolsEnabled,
 } from './talk-policy.js';
 import { isOpenClawNativeGoogleTool } from './openclaw-native-tools.js';
+import { assertRoutingHeaders, RoutingGuardError } from './routing-headers.js';
 
 /** How often the scheduler checks for due jobs. */
 const CHECK_INTERVAL_MS = 60_000; // 1 minute
@@ -857,15 +859,20 @@ Provide a concise report of your findings or actions. Start with a one-line summ
     // Run the tool loop (non-streaming for background jobs)
     const model = meta.model ?? 'openclaw';
     const traceId = randomUUID();
-    const talkExecutionMode = meta.executionMode ?? 'openclaw';
-    // Use `job:` prefixed session keys (see buildTalkJobSessionKey comment).
-    // Both modes use the same key format — the `job:` prefix keeps the
-    // request in transparent LLM-proxy mode regardless of execution mode.
-    const sessionKey = buildTalkJobSessionKey(talkId, job.id);
+    const talkExecutionMode = resolveExecutionMode(meta);
     const extraHeaders: Record<string, string> = {
-      'x-openclaw-session-key': sessionKey,
       'x-openclaw-trace-id': traceId,
     };
+    if (talkExecutionMode === 'openclaw') {
+      // Use `job:` prefix to avoid OpenClaw embedded-agent session takeover.
+      const sessionKey = buildTalkJobSessionKey(talkId, job.id);
+      extraHeaders['x-openclaw-session-key'] = sessionKey;
+    }
+    assertRoutingHeaders({
+      flow: 'job-scheduler',
+      executionMode: talkExecutionMode,
+      headers: extraHeaders,
+    });
 
     const result = await runToolLoopNonStreaming({
       messages,
@@ -919,6 +926,22 @@ Provide a concise report of your findings or actions. Start with a one-line summ
   } catch (err) {
     const cause = err instanceof Error && (err as any).cause ? ` (cause: ${(err as any).cause})` : '';
     const errorMsg = err instanceof Error ? err.message : String(err);
+    if (err instanceof RoutingGuardError) {
+      store.openDiagnostic(talkId, {
+        code: err.code,
+        category: 'routing',
+        title: 'Routing guard blocked job execution',
+        message:
+          'Execution Mode is ClawTalk Proxy, but disallowed OpenClaw routing headers were present. ' +
+          'The job run was blocked to prevent proxy-to-agent misrouting.',
+        assumptionKey: `routing:${err.code.toLowerCase()}:${err.executionMode}`,
+        details: {
+          flow: err.flow,
+          executionMode: err.executionMode,
+          jobId: job.id,
+        },
+      }, { modifiedBy: 'job_scheduler' });
+    }
     logger.warn(`JobScheduler: job ${job.id} failed: ${errorMsg}${cause}`);
 
     const report: JobReport = {

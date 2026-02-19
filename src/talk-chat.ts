@@ -32,6 +32,7 @@ import {
 } from './talk-policy.js';
 import { isTransientError } from './tool-loop.js';
 import { isOpenClawNativeGoogleTool } from './openclaw-native-tools.js';
+import { assertRoutingHeaders, RoutingGuardError } from './routing-headers.js';
 
 /** Maximum number of history messages to include in LLM context. */
 const MAX_CONTEXT_MESSAGES = 50;
@@ -51,6 +52,7 @@ const DEFAULT_TALK_INACTIVITY_TIMEOUT_MS = 300_000;
 type TalkErrorCode =
   | 'FIRST_TOKEN_TIMEOUT'
   | 'MODE_BLOCKED_BROWSER'
+  | 'ROUTING_GUARD'
   | 'TOOL_BLOCKED_POLICY'
   | 'PROVIDER_AUTH'
   | 'PROVIDER_ERROR'
@@ -1376,6 +1378,50 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
   // its embedded agent. Model routing happens via the `model` param instead.
   if (talkExecutionMode !== 'full_control' && resolvedHeaderAgentId?.trim()) {
     extraHeaders['x-openclaw-agent-id'] = resolvedHeaderAgentId.trim();
+  }
+  try {
+    assertRoutingHeaders({
+      flow: 'talk-chat',
+      executionMode: talkExecutionMode,
+      headers: extraHeaders,
+    });
+  } catch (err) {
+    if (err instanceof RoutingGuardError) {
+      store.openDiagnostic(talkId, {
+        code: err.code,
+        category: 'routing',
+        title: 'Routing guard blocked execution',
+        message:
+          'Execution Mode is ClawTalk Proxy, but disallowed OpenClaw routing headers were present. ' +
+          'The request was blocked to prevent proxy-to-agent misrouting.',
+        assumptionKey: `routing:${err.code.toLowerCase()}:${talkExecutionMode}`,
+        details: {
+          flow: err.flow,
+          executionMode: err.executionMode,
+        },
+      }, { modifiedBy: 'talk_chat' });
+      const errPayload: TalkErrorPayload = {
+        code: 'ROUTING_GUARD',
+        message: 'Routing guard blocked this run due to conflicting mode/header configuration.',
+        hint: 'Retry this turn. If it repeats, re-save Execution Mode and retry.',
+        transient: false,
+        retryable: true,
+      };
+      emitStatusEvent(res, {
+        code: err.code,
+        message: errPayload.message,
+        level: 'error',
+        meta: { flow: err.flow, executionMode: err.executionMode },
+      });
+      emitErrorEvent(res, errPayload);
+      store.setProcessing(talkId, false);
+      if (!res.writableEnded) {
+        res.write('data: [DONE]\n\n');
+        res.end();
+      }
+      return;
+    }
+    throw err;
   }
   logger.info(
     `ModelRoute trace=${traceId} flow=talk-chat talkId=${talkId} requestedModel=${routeDiag.requestedModel} `
