@@ -295,6 +295,45 @@ export interface JobReport {
   tokenUsage?: { input: number; output: number };
 }
 
+export type TalkStateCarryOverMode = 'none' | 'excess_only' | 'all';
+
+export interface TalkStatePolicy {
+  stream: string;
+  timezone: string;
+  weekStartDay: number; // 0=Sunday .. 6=Saturday
+  rolloverHour: number; // 0..23
+  rolloverMinute: number; // 0..59
+  carryOverMode: TalkStateCarryOverMode;
+  targetMinutes: number;
+  updatedAt: number;
+}
+
+export interface TalkStateEvent {
+  id: string;
+  stream: string;
+  sequence: number;
+  type: string;
+  payload: Record<string, unknown>;
+  occurredAt: number;
+  recordedAt: number;
+  idempotencyKey?: string;
+  actor?: string;
+}
+
+export interface TalkStateSnapshot {
+  stream: string;
+  weekKey: string;
+  weekStartAt: number;
+  weekEndAt: number;
+  totals: Record<string, number>;
+  carryOver: Record<string, number>;
+  completionTarget: number;
+  completed: Record<string, boolean>;
+  lastEventSequence: number;
+  updatedAt: number;
+  policy: TalkStatePolicy;
+}
+
 export interface TalkMeta {
   id: string;
   /** Monotonic gateway-authoritative metadata version for optimistic concurrency control. */

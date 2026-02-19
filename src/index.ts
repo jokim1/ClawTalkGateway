@@ -729,7 +729,7 @@ const plugin = {
 
     // Initialize tool registry and executor
     const toolRegistry = new ToolRegistry(pluginCfg.dataDir, api.logger);
-    const toolExecutor = new ToolExecutor(toolRegistry, api.logger);
+    const toolExecutor = new ToolExecutor(toolRegistry, talkStore, api.logger);
     registerOpenClawNativeGoogleTools({
       api,
       executor: toolExecutor,

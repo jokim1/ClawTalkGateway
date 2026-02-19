@@ -25,6 +25,10 @@ import type {
   PlatformBinding,
   PlatformBehavior,
   PlatformPermission,
+  TalkStateCarryOverMode,
+  TalkStateEvent,
+  TalkStatePolicy,
+  TalkStateSnapshot,
   Logger,
 } from './types.js';
 
@@ -44,7 +48,8 @@ type TalkMutationType =
   | 'agents_set'
   | 'directives_set'
   | 'bindings_set'
-  | 'behaviors_set';
+  | 'behaviors_set'
+  | 'state_updated';
 
 export type TalkStoreChangeEvent = {
   type: TalkMutationType;
@@ -67,6 +72,16 @@ const SMALL_FILE_BYTES = 64 * 1024; // 64KB
 
 /** TTL for context.md cache entries. */
 const CONTEXT_CACHE_TTL_MS = 30_000;
+const DEFAULT_STATE_STREAM = 'kids_study';
+const DAY_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_STATE_POLICY_BASE = {
+  timezone: 'America/Los_Angeles',
+  weekStartDay: 1,
+  rolloverHour: 0,
+  rolloverMinute: 0,
+  carryOverMode: 'excess_only' as TalkStateCarryOverMode,
+  targetMinutes: 300,
+};
 
 /** Validate that a talk ID is safe for use as a directory name. */
 function isValidId(id: string): boolean {
@@ -173,6 +188,108 @@ function normalizeGoogleAuthProfile(raw: unknown): string | undefined {
   if (!trimmed) return undefined;
   const normalized = trimmed.replace(/[^a-z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '');
   return normalized || undefined;
+}
+
+function normalizeStateStream(raw: unknown): string {
+  const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (!value) return DEFAULT_STATE_STREAM;
+  const normalized = value.replace(/[^a-z0-9_.-]+/g, '_').replace(/^_+|_+$/g, '');
+  return normalized || DEFAULT_STATE_STREAM;
+}
+
+function normalizeCarryOverMode(raw: unknown): TalkStateCarryOverMode {
+  const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (value === 'none' || value === 'excess_only' || value === 'all') return value;
+  return DEFAULT_STATE_POLICY_BASE.carryOverMode;
+}
+
+function normalizeStatePolicy(
+  stream: string,
+  raw: Partial<TalkStatePolicy> | undefined,
+  now = Date.now(),
+): TalkStatePolicy {
+  return {
+    stream: normalizeStateStream(stream),
+    timezone:
+      typeof raw?.timezone === 'string' && raw.timezone.trim()
+        ? raw.timezone.trim()
+        : DEFAULT_STATE_POLICY_BASE.timezone,
+    weekStartDay:
+      typeof raw?.weekStartDay === 'number' && Number.isInteger(raw.weekStartDay)
+        ? Math.max(0, Math.min(6, raw.weekStartDay))
+        : DEFAULT_STATE_POLICY_BASE.weekStartDay,
+    rolloverHour:
+      typeof raw?.rolloverHour === 'number' && Number.isInteger(raw.rolloverHour)
+        ? Math.max(0, Math.min(23, raw.rolloverHour))
+        : DEFAULT_STATE_POLICY_BASE.rolloverHour,
+    rolloverMinute:
+      typeof raw?.rolloverMinute === 'number' && Number.isInteger(raw.rolloverMinute)
+        ? Math.max(0, Math.min(59, raw.rolloverMinute))
+        : DEFAULT_STATE_POLICY_BASE.rolloverMinute,
+    carryOverMode: normalizeCarryOverMode(raw?.carryOverMode),
+    targetMinutes:
+      typeof raw?.targetMinutes === 'number' && Number.isFinite(raw.targetMinutes) && raw.targetMinutes > 0
+        ? Math.floor(raw.targetMinutes)
+        : DEFAULT_STATE_POLICY_BASE.targetMinutes,
+    updatedAt: typeof raw?.updatedAt === 'number' && Number.isFinite(raw.updatedAt) ? raw.updatedAt : now,
+  };
+}
+
+function formatWeekKeyFromPseudoUtc(startAt: number): string {
+  const d = new Date(startAt);
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function resolveWeekWindow(ts: number, policy: TalkStatePolicy): { weekKey: string; weekStartAt: number; weekEndAt: number } {
+  const date = new Date(ts);
+  const fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: policy.timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  });
+  const parts = fmt.formatToParts(date);
+  const partMap = new Map(parts.map((part) => [part.type, part.value]));
+  const year = Number(partMap.get('year') ?? '0');
+  const month = Number(partMap.get('month') ?? '1');
+  const day = Number(partMap.get('day') ?? '1');
+  const hour = Number(partMap.get('hour') ?? '0');
+  const minute = Number(partMap.get('minute') ?? '0');
+  const second = Number(partMap.get('second') ?? '0');
+
+  let pseudoNow = Date.UTC(year, month - 1, day, hour, minute, second);
+  if (hour < policy.rolloverHour || (hour === policy.rolloverHour && minute < policy.rolloverMinute)) {
+    pseudoNow -= DAY_MS;
+  }
+  const pseudoDate = new Date(pseudoNow);
+  const pseudoWeekday = pseudoDate.getUTCDay();
+  const daysSinceStart = (pseudoWeekday - policy.weekStartDay + 7) % 7;
+  const weekStartDayAtMidnight = Date.UTC(
+    pseudoDate.getUTCFullYear(),
+    pseudoDate.getUTCMonth(),
+    pseudoDate.getUTCDate(),
+  ) - daysSinceStart * DAY_MS;
+  const weekStartAt = weekStartDayAtMidnight + policy.rolloverHour * 60 * 60 * 1000 + policy.rolloverMinute * 60 * 1000;
+  const weekEndAt = weekStartAt + 7 * DAY_MS;
+  return {
+    weekKey: formatWeekKeyFromPseudoUtc(weekStartAt),
+    weekStartAt,
+    weekEndAt,
+  };
+}
+
+function normalizeKidKey(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const value = raw.trim();
+  if (!value) return null;
+  return value;
 }
 
 function normalizeDirectives(input: unknown): Directive[] {
@@ -373,6 +490,7 @@ export class TalkStore {
   private readonly talks: Map<string, TalkMeta> = new Map();
   private readonly logger: Logger;
   private readonly changeListeners = new Set<(event: TalkStoreChangeEvent) => void>();
+  private readonly stateLocks = new Map<string, Promise<unknown>>();
 
   // Caches
   private listTalksCache: TalkMeta[] | null = null;
@@ -1092,6 +1210,295 @@ export class TalkStore {
       all = all.filter(r => r.runAt > since);
     }
     return all.slice(-limit);
+  }
+
+  // -------------------------------------------------------------------------
+  // Structured talk state (event ledger + snapshot)
+  // -------------------------------------------------------------------------
+
+  private getStateBaseDir(talkId: string, stream: string): string {
+    return path.join(this.talksDir, talkId, 'state', normalizeStateStream(stream));
+  }
+
+  private getStateEventsPath(talkId: string, stream: string): string {
+    return path.join(this.getStateBaseDir(talkId, stream), 'events.jsonl');
+  }
+
+  private getStatePolicyPath(talkId: string, stream: string): string {
+    return path.join(this.getStateBaseDir(talkId, stream), 'policy.json');
+  }
+
+  private getStateSnapshotPath(talkId: string, stream: string): string {
+    return path.join(this.getStateBaseDir(talkId, stream), 'snapshot.json');
+  }
+
+  private async withStateLock<T>(talkId: string, stream: string, op: () => Promise<T>): Promise<T> {
+    const key = `${talkId}:${normalizeStateStream(stream)}`;
+    const previous = this.stateLocks.get(key) ?? Promise.resolve();
+    const next = previous.then(op, op);
+    const marker = next.then(() => undefined, () => undefined);
+    this.stateLocks.set(key, marker);
+    try {
+      return await next;
+    } finally {
+      if (this.stateLocks.get(key) === marker) {
+        this.stateLocks.delete(key);
+      }
+    }
+  }
+
+  private async readStateEvents(talkId: string, stream: string): Promise<TalkStateEvent[]> {
+    const eventsPath = this.getStateEventsPath(talkId, stream);
+    if (!fs.existsSync(eventsPath)) return [];
+    const text = await fsp.readFile(eventsPath, 'utf-8');
+    if (!text.trim()) return [];
+    const events: TalkStateEvent[] = [];
+    for (const line of text.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const parsed = JSON.parse(trimmed) as TalkStateEvent;
+        if (!parsed || typeof parsed !== 'object') continue;
+        if (typeof parsed.sequence !== 'number' || typeof parsed.type !== 'string') continue;
+        events.push(parsed);
+      } catch {
+        // skip malformed lines
+      }
+    }
+    events.sort((a, b) => a.sequence - b.sequence);
+    return events;
+  }
+
+  private async readStatePolicy(talkId: string, stream: string): Promise<TalkStatePolicy> {
+    const policyPath = this.getStatePolicyPath(talkId, stream);
+    try {
+      const raw = JSON.parse(await fsp.readFile(policyPath, 'utf-8')) as Partial<TalkStatePolicy>;
+      return normalizeStatePolicy(stream, raw);
+    } catch {
+      return normalizeStatePolicy(stream, undefined);
+    }
+  }
+
+  private computeCarryOver(
+    totals: Record<string, number>,
+    policy: TalkStatePolicy,
+  ): Record<string, number> {
+    const carry: Record<string, number> = {};
+    for (const [kid, total] of Object.entries(totals)) {
+      if (!Number.isFinite(total) || total <= 0) continue;
+      if (policy.carryOverMode === 'all') {
+        carry[kid] = total;
+      } else if (policy.carryOverMode === 'excess_only') {
+        carry[kid] = Math.max(0, total - policy.targetMinutes);
+      }
+    }
+    return carry;
+  }
+
+  private applyStateEventToTotals(
+    totals: Record<string, number>,
+    event: TalkStateEvent,
+  ): Record<string, number> {
+    const next = { ...totals };
+    const payload = event.payload ?? {};
+    if (event.type === 'minutes_logged' || event.type === 'manual_adjustment') {
+      const kid = normalizeKidKey((payload as Record<string, unknown>).kid);
+      const minutesRaw = Number((payload as Record<string, unknown>).minutes);
+      if (!kid || !Number.isFinite(minutesRaw)) return next;
+      next[kid] = Math.max(0, (next[kid] ?? 0) + minutesRaw);
+      return next;
+    }
+    if (event.type === 'set_total') {
+      const kid = normalizeKidKey((payload as Record<string, unknown>).kid);
+      const totalRaw = Number((payload as Record<string, unknown>).total);
+      if (!kid || !Number.isFinite(totalRaw)) return next;
+      next[kid] = Math.max(0, totalRaw);
+      return next;
+    }
+    return next;
+  }
+
+  private buildStateSnapshot(
+    stream: string,
+    policy: TalkStatePolicy,
+    events: TalkStateEvent[],
+    asOf: number = Date.now(),
+  ): TalkStateSnapshot {
+    const normalizedStream = normalizeStateStream(stream);
+    const baseWindow = resolveWeekWindow(asOf, policy);
+    let currentWeek = baseWindow;
+    let totals: Record<string, number> = {};
+    let carryOver: Record<string, number> = {};
+
+    for (const event of events) {
+      const eventWeek = resolveWeekWindow(event.occurredAt || event.recordedAt || asOf, policy);
+      if (eventWeek.weekStartAt > currentWeek.weekStartAt) {
+        while (currentWeek.weekStartAt < eventWeek.weekStartAt) {
+          carryOver = this.computeCarryOver(totals, policy);
+          totals = { ...carryOver };
+          currentWeek = {
+            weekStartAt: currentWeek.weekStartAt + 7 * DAY_MS,
+            weekEndAt: currentWeek.weekEndAt + 7 * DAY_MS,
+            weekKey: formatWeekKeyFromPseudoUtc(currentWeek.weekStartAt + 7 * DAY_MS),
+          };
+        }
+      } else if (eventWeek.weekStartAt < currentWeek.weekStartAt) {
+        currentWeek = eventWeek;
+        totals = {};
+        carryOver = {};
+      }
+      totals = this.applyStateEventToTotals(totals, event);
+    }
+
+    const finalWindow = resolveWeekWindow(asOf, policy);
+    if (finalWindow.weekStartAt > currentWeek.weekStartAt) {
+      while (currentWeek.weekStartAt < finalWindow.weekStartAt) {
+        carryOver = this.computeCarryOver(totals, policy);
+        totals = { ...carryOver };
+        currentWeek = {
+          weekStartAt: currentWeek.weekStartAt + 7 * DAY_MS,
+          weekEndAt: currentWeek.weekEndAt + 7 * DAY_MS,
+          weekKey: formatWeekKeyFromPseudoUtc(currentWeek.weekStartAt + 7 * DAY_MS),
+        };
+      }
+    } else {
+      currentWeek = finalWindow;
+    }
+
+    const completed: Record<string, boolean> = {};
+    for (const [kid, total] of Object.entries(totals)) {
+      completed[kid] = total >= policy.targetMinutes;
+    }
+
+    return {
+      stream: normalizedStream,
+      weekKey: currentWeek.weekKey,
+      weekStartAt: currentWeek.weekStartAt,
+      weekEndAt: currentWeek.weekEndAt,
+      totals,
+      carryOver,
+      completionTarget: policy.targetMinutes,
+      completed,
+      lastEventSequence: events.length ? events[events.length - 1].sequence : 0,
+      updatedAt: Date.now(),
+      policy,
+    };
+  }
+
+  async configureStatePolicy(
+    talkId: string,
+    streamRaw: string,
+    updates: Partial<TalkStatePolicy>,
+    options?: { modifiedBy?: string },
+  ): Promise<TalkStatePolicy | null> {
+    if (!isValidId(talkId)) return null;
+    const talk = this.talks.get(talkId);
+    if (!talk) return null;
+    const stream = normalizeStateStream(streamRaw);
+    return this.withStateLock(talkId, stream, async () => {
+      const current = await this.readStatePolicy(talkId, stream);
+      const next = normalizeStatePolicy(stream, { ...current, ...updates, updatedAt: Date.now() });
+      const baseDir = this.getStateBaseDir(talkId, stream);
+      await fsp.mkdir(baseDir, { recursive: true });
+      await fsp.writeFile(this.getStatePolicyPath(talkId, stream), JSON.stringify(next, null, 2), 'utf-8');
+      this.touchMeta(talk, 'state_updated', { modifiedBy: options?.modifiedBy });
+      return next;
+    });
+  }
+
+  async getStatePolicy(talkId: string, streamRaw: string): Promise<TalkStatePolicy | null> {
+    if (!isValidId(talkId)) return null;
+    if (!this.talks.has(talkId)) return null;
+    const stream = normalizeStateStream(streamRaw);
+    return this.readStatePolicy(talkId, stream);
+  }
+
+  async appendStateEvent(
+    talkId: string,
+    streamRaw: string,
+    input: {
+      type: string;
+      payload?: Record<string, unknown>;
+      occurredAt?: number;
+      idempotencyKey?: string;
+      actor?: string;
+    },
+    options?: { modifiedBy?: string },
+  ): Promise<{ applied: boolean; event: TalkStateEvent; snapshot: TalkStateSnapshot } | null> {
+    if (!isValidId(talkId)) return null;
+    const talk = this.talks.get(talkId);
+    if (!talk) return null;
+    const stream = normalizeStateStream(streamRaw);
+
+    return this.withStateLock(talkId, stream, async () => {
+      const baseDir = this.getStateBaseDir(talkId, stream);
+      await fsp.mkdir(baseDir, { recursive: true });
+      const events = await this.readStateEvents(talkId, stream);
+      const policy = await this.readStatePolicy(talkId, stream);
+      const idempotencyKey = input.idempotencyKey?.trim();
+      const existing = idempotencyKey
+        ? events.find((event) => event.idempotencyKey === idempotencyKey)
+        : undefined;
+      if (existing) {
+        const snapshot = this.buildStateSnapshot(stream, policy, events);
+        await fsp.writeFile(this.getStateSnapshotPath(talkId, stream), JSON.stringify(snapshot, null, 2), 'utf-8');
+        return { applied: false, event: existing, snapshot };
+      }
+
+      const event: TalkStateEvent = {
+        id: randomUUID(),
+        stream,
+        sequence: (events[events.length - 1]?.sequence ?? 0) + 1,
+        type: input.type.trim(),
+        payload: input.payload ?? {},
+        occurredAt: typeof input.occurredAt === 'number' && Number.isFinite(input.occurredAt)
+          ? input.occurredAt
+          : Date.now(),
+        recordedAt: Date.now(),
+        ...(idempotencyKey ? { idempotencyKey } : {}),
+        ...(input.actor?.trim() ? { actor: input.actor.trim() } : {}),
+      };
+      await fsp.appendFile(this.getStateEventsPath(talkId, stream), `${JSON.stringify(event)}\n`, 'utf-8');
+      const nextEvents = [...events, event];
+      const snapshot = this.buildStateSnapshot(stream, policy, nextEvents);
+      await fsp.writeFile(this.getStateSnapshotPath(talkId, stream), JSON.stringify(snapshot, null, 2), 'utf-8');
+      this.touchMeta(talk, 'state_updated', { modifiedBy: options?.modifiedBy });
+      return { applied: true, event, snapshot };
+    });
+  }
+
+  async getStateSnapshot(talkId: string, streamRaw: string, asOf?: number): Promise<TalkStateSnapshot | null> {
+    if (!isValidId(talkId)) return null;
+    if (!this.talks.has(talkId)) return null;
+    const stream = normalizeStateStream(streamRaw);
+    return this.withStateLock(talkId, stream, async () => {
+      const events = await this.readStateEvents(talkId, stream);
+      const policy = await this.readStatePolicy(talkId, stream);
+      const snapshot = this.buildStateSnapshot(stream, policy, events, asOf);
+      await fsp.mkdir(this.getStateBaseDir(talkId, stream), { recursive: true });
+      await fsp.writeFile(this.getStateSnapshotPath(talkId, stream), JSON.stringify(snapshot, null, 2), 'utf-8');
+      return snapshot;
+    });
+  }
+
+  async getStateEvents(
+    talkId: string,
+    streamRaw: string,
+    opts?: { limit?: number; sinceSequence?: number },
+  ): Promise<TalkStateEvent[]> {
+    if (!isValidId(talkId)) return [];
+    if (!this.talks.has(talkId)) return [];
+    const stream = normalizeStateStream(streamRaw);
+    const events = await this.readStateEvents(talkId, stream);
+    const sinceSequence =
+      typeof opts?.sinceSequence === 'number' && Number.isFinite(opts.sinceSequence)
+        ? Math.max(0, Math.floor(opts.sinceSequence))
+        : 0;
+    let filtered = sinceSequence > 0 ? events.filter((event) => event.sequence > sinceSequence) : events;
+    if (typeof opts?.limit === 'number' && Number.isFinite(opts.limit) && opts.limit > 0) {
+      filtered = filtered.slice(-Math.floor(opts.limit));
+    }
+    return filtered;
   }
 
   // -------------------------------------------------------------------------

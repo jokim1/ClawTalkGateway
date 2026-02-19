@@ -11,6 +11,7 @@ import { access } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { extname, isAbsolute, join, resolve } from 'node:path';
 import type { Logger } from './types.js';
+import type { TalkStore } from './talk-store.js';
 import type { ToolRegistry } from './tool-registry.js';
 import {
   googleDocsAddTab,
@@ -48,10 +49,12 @@ export interface ToolExecResult {
 
 export class ToolExecutor {
   private registry: ToolRegistry;
+  private store: TalkStore;
   private logger: Logger;
 
-  constructor(registry: ToolRegistry, logger: Logger) {
+  constructor(registry: ToolRegistry, store: TalkStore, logger: Logger) {
     this.registry = registry;
+    this.store = store;
     this.logger = logger;
   }
 
@@ -124,6 +127,18 @@ export class ToolExecutor {
           break;
         case 'pdf_extract_text':
           result = await this.execPdfExtractText(args);
+          break;
+        case 'state_append_event':
+          result = await this.execStateAppendEvent(args);
+          break;
+        case 'state_read_summary':
+          result = await this.execStateReadSummary(args);
+          break;
+        case 'state_configure_policy':
+          result = await this.execStateConfigurePolicy(args);
+          break;
+        case 'state_audit_events':
+          result = await this.execStateAuditEvents(args);
           break;
         default:
           // Dynamic tools — execute via shell_exec with the tool's command template
@@ -695,6 +710,122 @@ export class ToolExecutor {
         durationMs: 0,
       };
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Talk state tools
+  // -------------------------------------------------------------------------
+
+  private async execStateAppendEvent(args: Record<string, unknown>): Promise<ToolExecResult> {
+    const talkId = String(args.talk_id ?? '').trim();
+    const stream = args.stream === undefined ? 'kids_study' : String(args.stream ?? '').trim();
+    const eventType = String(args.event_type ?? '').trim();
+    const payload = args.payload;
+    if (!talkId || !eventType || !payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return {
+        success: false,
+        content: 'Missing/invalid required fields: talk_id, event_type, payload(object).',
+        durationMs: 0,
+      };
+    }
+    const outcome = await this.store.appendStateEvent(
+      talkId,
+      stream,
+      {
+        type: eventType,
+        payload: payload as Record<string, unknown>,
+        occurredAt: args.occurred_at === undefined ? undefined : Number(args.occurred_at),
+        idempotencyKey: args.idempotency_key === undefined ? undefined : String(args.idempotency_key),
+        actor: 'tool:state_append_event',
+      },
+      { modifiedBy: 'tool:state_append_event' },
+    );
+    if (!outcome) {
+      return { success: false, content: `Talk not found: ${talkId}`, durationMs: 0 };
+    }
+    return {
+      success: true,
+      content: JSON.stringify(
+        {
+          applied: outcome.applied,
+          event: outcome.event,
+          summary: outcome.snapshot,
+        },
+        null,
+        2,
+      ),
+      durationMs: 0,
+    };
+  }
+
+  private async execStateReadSummary(args: Record<string, unknown>): Promise<ToolExecResult> {
+    const talkId = String(args.talk_id ?? '').trim();
+    const stream = args.stream === undefined ? 'kids_study' : String(args.stream ?? '').trim();
+    if (!talkId) {
+      return { success: false, content: 'Missing required field: talk_id', durationMs: 0 };
+    }
+    const summary = await this.store.getStateSnapshot(
+      talkId,
+      stream,
+      args.as_of === undefined ? undefined : Number(args.as_of),
+    );
+    if (!summary) {
+      return { success: false, content: `Talk not found: ${talkId}`, durationMs: 0 };
+    }
+    return {
+      success: true,
+      content: JSON.stringify(summary, null, 2),
+      durationMs: 0,
+    };
+  }
+
+  private async execStateConfigurePolicy(args: Record<string, unknown>): Promise<ToolExecResult> {
+    const talkId = String(args.talk_id ?? '').trim();
+    const stream = args.stream === undefined ? 'kids_study' : String(args.stream ?? '').trim();
+    if (!talkId) {
+      return { success: false, content: 'Missing required field: talk_id', durationMs: 0 };
+    }
+    const policy = await this.store.configureStatePolicy(
+      talkId,
+      stream,
+      {
+        timezone: args.timezone === undefined ? undefined : String(args.timezone),
+        weekStartDay: args.week_start_day === undefined ? undefined : Number(args.week_start_day),
+        rolloverHour: args.rollover_hour === undefined ? undefined : Number(args.rollover_hour),
+        rolloverMinute: args.rollover_minute === undefined ? undefined : Number(args.rollover_minute),
+        carryOverMode: args.carry_over_mode === undefined ? undefined : String(args.carry_over_mode) as any,
+        targetMinutes: args.target_minutes === undefined ? undefined : Number(args.target_minutes),
+      },
+      { modifiedBy: 'tool:state_configure_policy' },
+    );
+    if (!policy) {
+      return { success: false, content: `Talk not found: ${talkId}`, durationMs: 0 };
+    }
+    return {
+      success: true,
+      content: JSON.stringify(policy, null, 2),
+      durationMs: 0,
+    };
+  }
+
+  private async execStateAuditEvents(args: Record<string, unknown>): Promise<ToolExecResult> {
+    const talkId = String(args.talk_id ?? '').trim();
+    const stream = args.stream === undefined ? 'kids_study' : String(args.stream ?? '').trim();
+    if (!talkId) {
+      return { success: false, content: 'Missing required field: talk_id', durationMs: 0 };
+    }
+    if (!this.store.getTalk(talkId)) {
+      return { success: false, content: `Talk not found: ${talkId}`, durationMs: 0 };
+    }
+    const events = await this.store.getStateEvents(talkId, stream, {
+      limit: args.limit === undefined ? 50 : Number(args.limit),
+      sinceSequence: args.since_sequence === undefined ? undefined : Number(args.since_sequence),
+    });
+    return {
+      success: true,
+      content: JSON.stringify({ count: events.length, events }, null, 2),
+      durationMs: 0,
+    };
   }
 
   // -------------------------------------------------------------------------

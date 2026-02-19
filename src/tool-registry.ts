@@ -437,6 +437,150 @@ const PDF_EXTRACT_TEXT_TOOL: ToolDefinition = {
   },
 };
 
+const STATE_APPEND_EVENT_TOOL: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'state_append_event',
+    description:
+      'Append an immutable state event to a talk stream (for example kids_study). ' +
+      'Use this to persist tracker updates such as logged minutes.',
+    parameters: {
+      type: 'object',
+      properties: {
+        talk_id: {
+          type: 'string',
+          description: 'Talk ID to update.',
+        },
+        stream: {
+          type: 'string',
+          description: 'Optional state stream name (default: kids_study).',
+        },
+        event_type: {
+          type: 'string',
+          description: 'Event type (e.g., minutes_logged, manual_adjustment, set_total).',
+        },
+        payload: {
+          type: 'object',
+          description: 'Event payload object. For minutes_logged include {kid, minutes}.',
+        },
+        idempotency_key: {
+          type: 'string',
+          description: 'Optional idempotency key to prevent duplicate writes.',
+        },
+        occurred_at: {
+          type: 'number',
+          description: 'Optional event timestamp in ms since epoch.',
+        },
+      },
+      required: ['talk_id', 'event_type', 'payload'],
+    },
+  },
+};
+
+const STATE_READ_SUMMARY_TOOL: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'state_read_summary',
+    description: 'Read current derived state summary for a talk stream.',
+    parameters: {
+      type: 'object',
+      properties: {
+        talk_id: {
+          type: 'string',
+          description: 'Talk ID to read.',
+        },
+        stream: {
+          type: 'string',
+          description: 'Optional state stream name (default: kids_study).',
+        },
+        as_of: {
+          type: 'number',
+          description: 'Optional snapshot timestamp in ms since epoch.',
+        },
+      },
+      required: ['talk_id'],
+    },
+  },
+};
+
+const STATE_CONFIGURE_POLICY_TOOL: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'state_configure_policy',
+    description:
+      'Configure weekly tracking policy for a talk stream (timezone/reset/carry-over/target).',
+    parameters: {
+      type: 'object',
+      properties: {
+        talk_id: {
+          type: 'string',
+          description: 'Talk ID to configure.',
+        },
+        stream: {
+          type: 'string',
+          description: 'Optional state stream name (default: kids_study).',
+        },
+        timezone: {
+          type: 'string',
+          description: 'IANA timezone, e.g., America/Los_Angeles.',
+        },
+        week_start_day: {
+          type: 'number',
+          description: '0=Sunday..6=Saturday.',
+        },
+        rollover_hour: {
+          type: 'number',
+          description: '0..23 hour in local timezone.',
+        },
+        rollover_minute: {
+          type: 'number',
+          description: '0..59 minute in local timezone.',
+        },
+        carry_over_mode: {
+          type: 'string',
+          enum: ['none', 'excess_only', 'all'],
+          description: 'Carry-over policy at weekly rollover.',
+        },
+        target_minutes: {
+          type: 'number',
+          description: 'Completion target minutes per week.',
+        },
+      },
+      required: ['talk_id'],
+    },
+  },
+};
+
+const STATE_AUDIT_EVENTS_TOOL: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'state_audit_events',
+    description: 'List recent state events from the talk stream for debugging/audit.',
+    parameters: {
+      type: 'object',
+      properties: {
+        talk_id: {
+          type: 'string',
+          description: 'Talk ID to inspect.',
+        },
+        stream: {
+          type: 'string',
+          description: 'Optional state stream name (default: kids_study).',
+        },
+        limit: {
+          type: 'number',
+          description: 'Optional max events to return (default 50).',
+        },
+        since_sequence: {
+          type: 'number',
+          description: 'Optional lower-bound sequence (exclusive).',
+        },
+      },
+      required: ['talk_id'],
+    },
+  },
+};
+
 const BUILTIN_TOOLS = new Map<string, ToolDefinition>([
   ['shell_exec', SHELL_EXEC_TOOL],
   ['manage_tools', MANAGE_TOOLS_TOOL],
@@ -451,6 +595,10 @@ const BUILTIN_TOOLS = new Map<string, ToolDefinition>([
   ['google_drive_files', GOOGLE_DRIVE_FILES_TOOL],
   ['web_fetch_extract', WEB_FETCH_EXTRACT_TOOL],
   ['pdf_extract_text', PDF_EXTRACT_TEXT_TOOL],
+  ['state_append_event', STATE_APPEND_EVENT_TOOL],
+  ['state_read_summary', STATE_READ_SUMMARY_TOOL],
+  ['state_configure_policy', STATE_CONFIGURE_POLICY_TOOL],
+  ['state_audit_events', STATE_AUDIT_EVENTS_TOOL],
 ]);
 
 // ---------------------------------------------------------------------------

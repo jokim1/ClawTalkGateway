@@ -811,6 +811,7 @@ Provide a concise report of your findings or actions. Start with a one-line summ
       logger,
       timeoutMs: opts.jobTimeoutMs ?? JOB_TIMEOUT_MS,
       defaultGoogleAuthProfile: meta.googleAuthProfile,
+      talkId,
     });
 
     const fullOutput = result.fullContent.trim();

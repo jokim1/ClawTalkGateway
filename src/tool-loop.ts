@@ -125,6 +125,7 @@ function routeToolCallForExecution(
   toolName: string,
   argsJson: string,
   defaultGoogleAuthProfile: string | undefined,
+  talkId?: string,
 ): { executeName: string; executeArgsJson: string } {
   let executeName = toolName;
   let executeArgsJson = argsJson;
@@ -147,6 +148,16 @@ function routeToolCallForExecution(
   }
 
   executeArgsJson = withDefaultGoogleProfile(executeName, executeArgsJson, defaultGoogleAuthProfile);
+  if (talkId && /^state_(append_event|read_summary|configure_policy|audit_events)$/i.test(executeName)) {
+    try {
+      const parsed = JSON.parse(executeArgsJson) as Record<string, unknown>;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && parsed.talk_id === undefined) {
+        executeArgsJson = JSON.stringify({ talk_id: talkId, ...parsed });
+      }
+    } catch {
+      // Keep original args; executor will surface parse issues.
+    }
+  }
   return { executeName, executeArgsJson };
 }
 
@@ -191,6 +202,8 @@ export interface ToolLoopStreamOptions {
   onStatus?: (payload: { code: string; message: string; level?: 'info' | 'warn' | 'error'; meta?: Record<string, unknown> }) => void;
   /** Transport for upstream OpenClaw call. */
   transport?: 'chat_completions' | 'responses';
+  /** Current talk id for talk-scoped state tools. */
+  talkId?: string;
 }
 
 export interface ToolLoopStreamResult {
@@ -530,6 +543,7 @@ export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoop
             tc.function.name,
             tc.function.arguments,
             opts.defaultGoogleAuthProfile,
+            opts.talkId,
           );
           const result = await executor.execute(routed.executeName, routed.executeArgsJson);
 
@@ -821,6 +835,8 @@ export interface ToolLoopNonStreamOptions {
   toolChoice?: 'auto' | 'none';
   /** Optional default Google auth profile for this run. */
   defaultGoogleAuthProfile?: string;
+  /** Current talk id for talk-scoped state tools. */
+  talkId?: string;
 }
 
 export interface ToolLoopNonStreamResult {
@@ -906,6 +922,7 @@ export async function runToolLoopNonStreaming(opts: ToolLoopNonStreamOptions): P
           tc.function.name,
           tc.function.arguments,
           opts.defaultGoogleAuthProfile,
+          opts.talkId,
         );
         const result = await executor.execute(routed.executeName, routed.executeArgsJson);
         messages.push({

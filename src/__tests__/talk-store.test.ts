@@ -642,3 +642,71 @@ describe('Job reports', () => {
     expect(reports[0].tokenUsage).toEqual({ input: 100, output: 200 });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Structured talk state
+// ---------------------------------------------------------------------------
+
+describe('Structured talk state', () => {
+  it('appends state events and derives weekly totals snapshot', async () => {
+    const talk = store.createTalk();
+    const appended = await store.appendStateEvent(talk.id, 'kids_study', {
+      type: 'minutes_logged',
+      payload: { kid: 'Asher', minutes: 180 },
+      occurredAt: Date.now(),
+      idempotencyKey: 'event-1',
+    });
+    expect(appended).not.toBeNull();
+    expect(appended!.applied).toBe(true);
+    expect(appended!.event.sequence).toBe(1);
+    expect(appended!.snapshot.totals.Asher).toBe(180);
+
+    await store.appendStateEvent(talk.id, 'kids_study', {
+      type: 'minutes_logged',
+      payload: { kid: 'Asher', minutes: 120 },
+    });
+    const snapshot = await store.getStateSnapshot(talk.id, 'kids_study');
+    expect(snapshot).not.toBeNull();
+    expect(snapshot!.totals.Asher).toBe(300);
+    expect(snapshot!.completed.Asher).toBe(true);
+  });
+
+  it('deduplicates state events by idempotency key', async () => {
+    const talk = store.createTalk();
+    const first = await store.appendStateEvent(talk.id, 'kids_study', {
+      type: 'minutes_logged',
+      payload: { kid: 'Jaxon', minutes: 30 },
+      idempotencyKey: 'dup-1',
+    });
+    const second = await store.appendStateEvent(talk.id, 'kids_study', {
+      type: 'minutes_logged',
+      payload: { kid: 'Jaxon', minutes: 30 },
+      idempotencyKey: 'dup-1',
+    });
+    expect(first).not.toBeNull();
+    expect(second).not.toBeNull();
+    expect(first!.applied).toBe(true);
+    expect(second!.applied).toBe(false);
+    const events = await store.getStateEvents(talk.id, 'kids_study');
+    expect(events).toHaveLength(1);
+    expect(events[0].sequence).toBe(1);
+  });
+
+  it('updates and reads policy', async () => {
+    const talk = store.createTalk();
+    const updated = await store.configureStatePolicy(talk.id, 'kids_study', {
+      timezone: 'Asia/Kolkata',
+      weekStartDay: 1,
+      carryOverMode: 'all',
+      targetMinutes: 240,
+    });
+    expect(updated).not.toBeNull();
+    expect(updated!.timezone).toBe('Asia/Kolkata');
+    expect(updated!.carryOverMode).toBe('all');
+    expect(updated!.targetMinutes).toBe(240);
+
+    const reloaded = await store.getStatePolicy(talk.id, 'kids_study');
+    expect(reloaded).not.toBeNull();
+    expect(reloaded!.timezone).toBe('Asia/Kolkata');
+  });
+});

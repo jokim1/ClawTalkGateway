@@ -1457,6 +1457,7 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
       // explicit function-calling tool schema behavior.
       transport: 'chat_completions',
       onStatus: (status) => emitStatusEvent(res, status),
+      talkId,
     });
 
     fullContent = result.fullContent;
