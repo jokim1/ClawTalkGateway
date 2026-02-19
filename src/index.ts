@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { execSync } from 'node:child_process';
+import { hostname } from 'node:os';
 import type { PluginApi, ClawTalkPluginConfig, Logger } from './types.js';
 import type { EventReplyTarget } from './event-dispatcher.js';
 import { sendJson, readJsonBody, handleCors } from './http.js';
@@ -78,7 +79,53 @@ const ROUTES = new Set([
   '/api/events/slack/resolve',
   '/api/events/slack/doctor',
   '/api/events/slack/status',
+  '/api/debug/slack/recent',
 ]);
+
+type SlackDebugPath = 'slack-ingress' | 'event-reply';
+type SlackDebugEntry = {
+  ts: number;
+  instanceTag: string;
+  path: SlackDebugPath;
+  phase: string;
+  talkId?: string;
+  jobId?: string;
+  eventId?: string;
+  accountId?: string;
+  channelIdRaw?: string;
+  channelIdResolved?: string;
+  threadTs?: string;
+  errorCode?: string;
+  errorMessage?: string;
+};
+
+const SLACK_DEBUG_RING_MAX = 200;
+const slackDebugRing: SlackDebugEntry[] = [];
+
+function isSlackDebugEnabled(): boolean {
+  return process.env.CLAWTALK_SLACK_DEBUG === '1';
+}
+
+function computeSlackInstanceTag(): string {
+  const explicit = (process.env.CLAWTALK_SLACK_DEBUG_INSTANCE_TAG ?? '').trim();
+  if (explicit) return explicit.slice(0, 64);
+  const host = hostname().replace(/[^a-zA-Z0-9_.-]+/g, '').slice(0, 24) || 'host';
+  const boot = Date.now().toString(36).slice(-6);
+  return `${host}:${process.pid}:${boot}`.slice(0, 64);
+}
+
+function recordSlackDebug(entry: Omit<SlackDebugEntry, 'ts' | 'instanceTag'>, instanceTag: string): void {
+  const normalized: SlackDebugEntry = {
+    ts: Date.now(),
+    instanceTag,
+    ...entry,
+    ...(entry.errorMessage ? { errorMessage: entry.errorMessage.slice(0, 220) } : {}),
+  };
+  slackDebugRing.push(normalized);
+  if (slackDebugRing.length > SLACK_DEBUG_RING_MAX) {
+    slackDebugRing.splice(0, slackDebugRing.length - SLACK_DEBUG_RING_MAX);
+  }
+}
 
 // ============================================================================
 // Rate Limiter (for pairing endpoint)
@@ -337,7 +384,52 @@ function collectTalkSlackChannelHints(params: {
 function createEventReplyHandler(
   getConfig: () => Record<string, any>,
   logger: Logger,
+  opts?: {
+    debugEnabled?: () => boolean;
+    onDebug?: (entry: Omit<SlackDebugEntry, 'ts' | 'instanceTag'>) => void;
+  },
 ) {
+  const nameCacheByAccount = new Map<string, { expiresAt: number; byName: Map<string, string> }>();
+  const normalizeChannelName = (value: string): string =>
+    value.trim().toLowerCase().replace(/^#/, '').replace(/^channel:/, '').trim();
+  const isCanonicalChannelId = (value: string): boolean => /^[CDGU][A-Z0-9]+$/.test(value.trim().toUpperCase());
+  const inferErrorCode = (message: string): string => {
+    const text = message.toLowerCase();
+    if (text.includes('unknown channel')) return 'unknown_channel';
+    if (text.includes('not_in_channel')) return 'not_in_channel';
+    if (text.includes('timeout') || text.includes('timed out')) return 'timeout';
+    if (text.includes('unauthorized') || text.includes('forbidden')) return 'auth_error';
+    return 'error';
+  };
+  const emit = (entry: Omit<SlackDebugEntry, 'ts' | 'instanceTag'>): void => {
+    if (opts?.debugEnabled && !opts.debugEnabled()) return;
+    opts?.onDebug?.(entry);
+  };
+  const resolveChannelId = async (
+    channelRaw: string,
+    accountId: string,
+    token: string,
+  ): Promise<string | undefined> => {
+    const normalizedRaw = channelRaw.trim();
+    if (!normalizedRaw) return undefined;
+    const direct = normalizedRaw.includes(':') ? normalizedRaw.slice(normalizedRaw.lastIndexOf(':') + 1) : normalizedRaw;
+    if (isCanonicalChannelId(direct)) {
+      return direct.trim().toUpperCase();
+    }
+    const cacheKey = accountId.trim().toLowerCase() || 'default';
+    const now = Date.now();
+    const cached = nameCacheByAccount.get(cacheKey);
+    if (!cached || cached.expiresAt <= now) {
+      const channels = await fetchSlackChannelsForAccount({ token, limit: 2000 });
+      const byName = new Map<string, string>();
+      for (const channel of channels) {
+        byName.set(normalizeChannelName(channel.name), channel.id);
+      }
+      nameCacheByAccount.set(cacheKey, { expiresAt: now + 5 * 60_000, byName });
+    }
+    const refreshed = nameCacheByAccount.get(cacheKey);
+    return refreshed?.byName.get(normalizeChannelName(direct));
+  };
   return async (target: EventReplyTarget, message: string): Promise<boolean> => {
     if (target.platform !== 'slack') {
       logger.warn(`EventReply: unsupported platform "${target.platform}"`);
@@ -353,12 +445,48 @@ function createEventReplyHandler(
     const botToken = resolveSlackBotTokenForAccount(cfg, target.accountId);
     if (!botToken) {
       logger.warn(`EventReply: no bot token for Slack account "${target.accountId}"`);
+      emit({
+        path: 'event-reply',
+        phase: 'send_fail',
+        accountId: target.accountId,
+        channelIdRaw: target.platformChannelId,
+        threadTs: target.threadId,
+        errorCode: 'missing_token',
+        errorMessage: `no bot token for account ${target.accountId ?? '-'}`,
+      });
       return false;
     }
 
     try {
+      const resolvedChannelId = await resolveChannelId(
+        target.platformChannelId,
+        target.accountId,
+        botToken,
+      );
+      if (!resolvedChannelId) {
+        const errorMessage = `Unknown channel: ${target.platformChannelId}`;
+        emit({
+          path: 'event-reply',
+          phase: 'send_fail',
+          accountId: target.accountId,
+          channelIdRaw: target.platformChannelId,
+          threadTs: target.threadId,
+          errorCode: 'unknown_channel_name',
+          errorMessage,
+        });
+        logger.warn(`EventReply: ${errorMessage}`);
+        return false;
+      }
+      emit({
+        path: 'event-reply',
+        phase: 'send_start',
+        accountId: target.accountId,
+        channelIdRaw: target.platformChannelId,
+        channelIdResolved: resolvedChannelId,
+        threadTs: target.threadId,
+      });
       const body: Record<string, unknown> = {
-        channel: target.platformChannelId,
+        channel: resolvedChannelId,
         text: message,
       };
       if (target.threadId) {
@@ -376,13 +504,40 @@ function createEventReplyHandler(
 
       const result = await res.json() as { ok: boolean; error?: string };
       if (!result.ok) {
+        emit({
+          path: 'event-reply',
+          phase: 'send_fail',
+          accountId: target.accountId,
+          channelIdRaw: target.platformChannelId,
+          channelIdResolved: resolvedChannelId,
+          threadTs: target.threadId,
+          errorCode: inferErrorCode(result.error ?? 'error'),
+          errorMessage: result.error ?? 'slack api error',
+        });
         logger.warn(`EventReply: Slack API error: ${result.error}`);
         return false;
       }
 
+      emit({
+        path: 'event-reply',
+        phase: 'send_ok',
+        accountId: target.accountId,
+        channelIdRaw: target.platformChannelId,
+        channelIdResolved: resolvedChannelId,
+        threadTs: target.threadId,
+      });
       return true;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      emit({
+        path: 'event-reply',
+        phase: 'send_fail',
+        accountId: target.accountId,
+        channelIdRaw: target.platformChannelId,
+        threadTs: target.threadId,
+        errorCode: inferErrorCode(msg),
+        errorMessage: msg,
+      });
       logger.warn(`EventReply: Slack post failed: ${msg}`);
       return false;
     }
@@ -447,9 +602,18 @@ const plugin = {
     };
 
     // Shared Slack reply path (direct Slack API).
+    const slackDebugInstanceTag = computeSlackInstanceTag();
+    const emitSlackDebug = (entry: Omit<SlackDebugEntry, 'ts' | 'instanceTag'>) => {
+      if (!isSlackDebugEnabled()) return;
+      recordSlackDebug(entry, slackDebugInstanceTag);
+    };
     const replyHandler = createEventReplyHandler(
       () => api.runtime.config.loadConfig(),
       api.logger,
+      {
+        debugEnabled: isSlackDebugEnabled,
+        onDebug: emitSlackDebug,
+      },
     );
     let slackIngressOrigin = 'http://127.0.0.1:18789';
     let slackIngressToken: string | undefined;
@@ -463,6 +627,20 @@ const plugin = {
       gatewayOrigin: slackIngressOrigin,
       authToken: slackIngressToken,
       logger: api.logger,
+      debugEnabled: isSlackDebugEnabled(),
+      instanceTag: slackDebugInstanceTag,
+      recordSlackDebug: (entry: {
+        path: 'slack-ingress';
+        phase: string;
+        talkId?: string;
+        eventId?: string;
+        accountId?: string;
+        channelIdRaw?: string;
+        channelIdResolved?: string;
+        threadTs?: string;
+        errorCode?: string;
+        errorMessage?: string;
+      }) => emitSlackDebug(entry),
       sendSlackMessage: async (params: {
         accountId?: string;
         channelId: string;
@@ -911,25 +1089,42 @@ const plugin = {
             });
             break;
           }
+          case '/api/debug/slack/recent': {
+            if (req.method !== 'GET') {
+              sendJson(res, 405, { error: 'Method not allowed' });
+              break;
+            }
+            const limitRaw = Number.parseInt(url.searchParams.get('limit') ?? '50', 10);
+            const limit = Number.isFinite(limitRaw) ? Math.min(200, Math.max(1, limitRaw)) : 50;
+            const talkIdFilter = url.searchParams.get('talkId')?.trim();
+            const pathFilter = url.searchParams.get('path')?.trim() as SlackDebugPath | undefined;
+            const validPath = pathFilter === 'slack-ingress' || pathFilter === 'event-reply'
+              ? pathFilter
+              : undefined;
+            const entries = slackDebugRing
+              .filter((entry) => {
+                if (talkIdFilter && entry.talkId !== talkIdFilter) return false;
+                if (validPath && entry.path !== validPath) return false;
+                return true;
+              })
+              .slice(-limit)
+              .reverse();
+            sendJson(res, 200, {
+              debugEnabled: isSlackDebugEnabled(),
+              instanceTag: slackDebugInstanceTag,
+              count: entries.length,
+              entries,
+            });
+            break;
+          }
           case '/api/events/slack': {
             const host = req.headers.host ?? 'localhost:18789';
             const gatewayOrigin = `http://${host}`;
             const gatewayToken = resolveGatewayToken(cfg);
             await handleSlackIngress(ctx, {
-              store: talkStore,
+              ...buildSlackIngressDeps(),
               gatewayOrigin,
               authToken: gatewayToken,
-              logger: api.logger,
-              sendSlackMessage: async (params) =>
-                replyHandler(
-                  {
-                    platform: 'slack',
-                    accountId: params.accountId,
-                    platformChannelId: params.channelId,
-                    threadId: params.threadTs,
-                  },
-                  params.message,
-                ),
             });
             break;
           }

@@ -146,6 +146,23 @@ type SlackIngressDeps = {
    * Set false in tests to enqueue ownership decisions without running the async queue.
    */
   autoProcessQueue?: boolean;
+  /** Enables compact debug diagnostics in failure notices. */
+  debugEnabled?: boolean;
+  /** Optional stable runtime identifier for diagnostics. */
+  instanceTag?: string;
+  /** Optional callback for Slack debug diagnostics. */
+  recordSlackDebug?: (entry: {
+    path: 'slack-ingress';
+    phase: string;
+    talkId?: string;
+    eventId?: string;
+    accountId?: string;
+    channelIdRaw?: string;
+    channelIdResolved?: string;
+    threadTs?: string;
+    errorCode?: string;
+    errorMessage?: string;
+  }) => void;
 };
 
 type OutboundSuppressionLease = {
@@ -764,6 +781,16 @@ function resolveExplicitDeliveryPreference(eventText: string): 'thread' | 'chann
   return undefined;
 }
 
+function inferErrorCode(err: unknown): string {
+  const text = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  if (text.includes('unknown channel')) return 'unknown_channel';
+  if (text.includes('timed out') || text.includes('timeout')) return 'timeout';
+  if (text.includes('missing user message')) return 'missing_user_message';
+  if (text.includes('rate limit')) return 'rate_limited';
+  if (text.includes('unauthorized') || text.includes('forbidden')) return 'auth_error';
+  return 'error';
+}
+
 function shouldHandleViaBehavior(
   meta: TalkMeta,
   bindingId: string,
@@ -1053,6 +1080,7 @@ async function persistAssistantResult(item: QueueItem, deps: SlackIngressDeps): 
 async function sendSlackReply(params: {
   deps: SlackIngressDeps;
   event: SlackIngressEvent;
+  talkId?: string;
   accountId?: string;
   message: string;
   sessionKey: string;
@@ -1081,6 +1109,16 @@ async function sendSlackReply(params: {
           )
         : false;
   const threadTs = shouldReplyInThread ? params.event.threadTs : undefined;
+  params.deps.recordSlackDebug?.({
+    path: 'slack-ingress',
+    phase: 'send_start',
+    talkId: params.talkId,
+    eventId: params.event.eventId,
+    accountId: resolvedAccountId,
+    channelIdRaw: params.event.channelId,
+    channelIdResolved: params.event.channelId,
+    threadTs,
+  });
 
   if (params.deps.sendSlackMessage) {
     const sent = await params.deps.sendSlackMessage({
@@ -1092,6 +1130,16 @@ async function sendSlackReply(params: {
     if (!sent) {
       throw new Error('slack send callback returned false');
     }
+    params.deps.recordSlackDebug?.({
+      path: 'slack-ingress',
+      phase: 'send_ok',
+      talkId: params.talkId,
+      eventId: params.event.eventId,
+      accountId: resolvedAccountId,
+      channelIdRaw: params.event.channelId,
+      channelIdResolved: params.event.channelId,
+      threadTs,
+    });
     return;
   }
 
@@ -1127,15 +1175,51 @@ async function sendSlackReply(params: {
 
   if (!response.ok) {
     const errBody = await response.text().catch(() => '');
-    throw new Error(`slack send failed (${response.status}): ${errBody.slice(0, 200)}`);
+    const err = new Error(`slack send failed (${response.status}): ${errBody.slice(0, 200)}`);
+    params.deps.recordSlackDebug?.({
+      path: 'slack-ingress',
+      phase: 'send_fail',
+      talkId: params.talkId,
+      eventId: params.event.eventId,
+      accountId: resolvedAccountId,
+      channelIdRaw: params.event.channelId,
+      channelIdResolved: params.event.channelId,
+      threadTs,
+      errorCode: inferErrorCode(err),
+      errorMessage: err.message.slice(0, 220),
+    });
+    throw err;
   }
 
   const payload = await response.json().catch(() => null) as
     | { ok?: boolean; error?: { message?: string } }
     | null;
   if (!payload || payload.ok !== true) {
-    throw new Error(payload?.error?.message ?? 'slack send returned non-ok result');
+    const err = new Error(payload?.error?.message ?? 'slack send returned non-ok result');
+    params.deps.recordSlackDebug?.({
+      path: 'slack-ingress',
+      phase: 'send_fail',
+      talkId: params.talkId,
+      eventId: params.event.eventId,
+      accountId: resolvedAccountId,
+      channelIdRaw: params.event.channelId,
+      channelIdResolved: params.event.channelId,
+      threadTs,
+      errorCode: inferErrorCode(err),
+      errorMessage: err.message.slice(0, 220),
+    });
+    throw err;
   }
+  params.deps.recordSlackDebug?.({
+    path: 'slack-ingress',
+    phase: 'send_ok',
+    talkId: params.talkId,
+    eventId: params.event.eventId,
+    accountId: resolvedAccountId,
+    channelIdRaw: params.event.channelId,
+    channelIdResolved: params.event.channelId,
+    threadTs,
+  });
 }
 
 async function writeDeadLetter(params: {
@@ -1162,9 +1246,14 @@ async function writeDeadLetter(params: {
 async function sendFailureNotice(params: {
   deps: SlackIngressDeps;
   item: QueueItem;
+  failureError?: unknown;
 }): Promise<void> {
-  const message =
+  const baseMessage =
     'ClawTalk failed to process this Slack event after multiple retries. Please retry in this thread.';
+  const compactDebug = params.deps.debugEnabled
+    ? ` [dbg path=slack-ingress inst=${params.deps.instanceTag ?? '-'} talk=${params.item.talkId.slice(0, 8)} event=${params.item.event.eventId.slice(0, 16)} err=${inferErrorCode(params.failureError ?? 'error')}]`
+    : '';
+  const message = `${baseMessage}${compactDebug}`;
   const fallbackSessionKey = buildSlackSessionKey({
     talkId: params.item.talkId,
     event: params.item.event,
@@ -1173,6 +1262,7 @@ async function sendFailureNotice(params: {
   await sendSlackReply({
     deps: params.deps,
     event: params.item.event,
+    talkId: params.item.talkId,
     accountId: params.item.replyAccountId,
     message,
     sessionKey: fallbackSessionKey,
@@ -1212,6 +1302,7 @@ async function processQueueItem(item: QueueItem, deps: SlackIngressDeps): Promis
     await sendSlackReply({
       deps,
       event: item.event,
+      talkId: item.talkId,
       accountId: item.replyAccountId,
       message: reply,
       sessionKey,
@@ -1235,9 +1326,21 @@ function scheduleRetry(item: QueueItem, deps: SlackIngressDeps, err: unknown): v
       seenEvents.delete(item.event.eventId);
     }
     void writeDeadLetter({ deps, item, error: err }).catch(() => {});
+    deps.recordSlackDebug?.({
+      path: 'slack-ingress',
+      phase: 'dead_letter',
+      talkId: item.talkId,
+      eventId: item.event.eventId,
+      accountId: item.replyAccountId ?? item.event.accountId,
+      channelIdRaw: item.event.channelId,
+      channelIdResolved: item.event.channelId,
+      threadTs: item.event.threadTs,
+      errorCode: inferErrorCode(err),
+      errorMessage: (err instanceof Error ? err.message : String(err)).slice(0, 220),
+    });
     const notifyOnFailure = process.env.CLAWTALK_INGRESS_NOTIFY_FAILURE !== '0' && !item.replySent;
     if (notifyOnFailure) {
-      void sendFailureNotice({ deps, item }).catch(() => {});
+      void sendFailureNotice({ deps, item, failureError: err }).catch(() => {});
     }
     return;
   }
@@ -1250,6 +1353,18 @@ function scheduleRetry(item: QueueItem, deps: SlackIngressDeps, err: unknown): v
     runtime.attemptToken = retryItem.attemptToken;
   }
   const timer = setTimeout(() => {
+    deps.recordSlackDebug?.({
+      path: 'slack-ingress',
+      phase: 'retry',
+      talkId: item.talkId,
+      eventId: item.event.eventId,
+      accountId: item.replyAccountId ?? item.event.accountId,
+      channelIdRaw: item.event.channelId,
+      channelIdResolved: item.event.channelId,
+      threadTs: item.event.threadTs,
+      errorCode: inferErrorCode(err),
+      errorMessage: (err instanceof Error ? err.message : String(err)).slice(0, 220),
+    });
     queue.push(retryItem);
     void processQueue(deps);
   }, delayMs);
