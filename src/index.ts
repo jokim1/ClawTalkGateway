@@ -897,6 +897,7 @@ const plugin = {
                 channelId: scopeTarget,
                 channelName: url.searchParams.get('channelName')?.trim() || undefined,
                 outboundTarget: url.searchParams.get('outboundTarget')?.trim() || undefined,
+                text: '',
               },
               talkStore,
               api.logger,

@@ -650,23 +650,34 @@ function resolveAgentForEvent(meta: TalkMeta, preferredAgentName?: string): Talk
 }
 
 function resolveBehaviorForBinding(meta: TalkMeta, bindingId: string): {
-  autoRespond?: boolean;
+  responseMode?: 'off' | 'mentions' | 'all';
   agentName?: string;
   onMessagePrompt?: string;
 } | undefined {
   const behavior = (meta.platformBehaviors ?? []).find((entry) => entry.platformBindingId === bindingId);
   if (!behavior) return undefined;
+  const responseMode =
+    behavior.responseMode ??
+    ((behavior as { autoRespond?: boolean }).autoRespond === false ? 'off' : undefined);
   return {
-    autoRespond: behavior.autoRespond,
+    ...(responseMode ? { responseMode } : {}),
     agentName: behavior.agentName?.trim() || undefined,
     onMessagePrompt: behavior.onMessagePrompt?.trim() || undefined,
   };
 }
 
-function shouldHandleViaBehavior(meta: TalkMeta, bindingId: string): {
+function messageLooksLikeMention(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  if (/<@[A-Z0-9]+>/i.test(trimmed)) return true;
+  if (/\B@[a-z0-9._-]{2,}/i.test(trimmed)) return true;
+  return false;
+}
+
+function shouldHandleViaBehavior(meta: TalkMeta, bindingId: string, eventText: string): {
   handle: boolean;
   reason?: string;
-  behavior?: { autoRespond?: boolean; agentName?: string; onMessagePrompt?: string };
+  behavior?: { responseMode?: 'off' | 'mentions' | 'all'; agentName?: string; onMessagePrompt?: string };
 } {
   const behavior = resolveBehaviorForBinding(meta, bindingId);
   if (!behavior) {
@@ -674,8 +685,12 @@ function shouldHandleViaBehavior(meta: TalkMeta, bindingId: string): {
     return { handle: true };
   }
 
-  if (behavior.autoRespond === false) {
+  const responseMode = behavior.responseMode ?? 'all';
+  if (responseMode === 'off') {
     return { handle: false, reason: 'on-message-disabled' };
+  }
+  if (responseMode === 'mentions' && !messageLooksLikeMention(eventText)) {
+    return { handle: false, reason: 'mention-required' };
   }
 
   return { handle: true, behavior };
@@ -1238,7 +1253,7 @@ function routeSlackIngressEvent(
 }
 
 export function inspectSlackOwnership(
-  event: Pick<SlackIngressEvent, 'accountId' | 'channelId' | 'channelName' | 'outboundTarget' | 'eventId'>,
+  event: Pick<SlackIngressEvent, 'accountId' | 'channelId' | 'channelName' | 'outboundTarget' | 'eventId'> & { text?: string },
   store: TalkStore,
   logger: Logger,
 ): SlackOwnershipInspection {
@@ -1263,7 +1278,7 @@ export function inspectSlackOwnership(
     };
   }
 
-  const behaviorDecision = shouldHandleViaBehavior(ownerTalk, owner.binding.id);
+  const behaviorDecision = shouldHandleViaBehavior(ownerTalk, owner.binding.id, event.text ?? '');
   if (!behaviorDecision.handle) {
     return {
       decision: 'pass',

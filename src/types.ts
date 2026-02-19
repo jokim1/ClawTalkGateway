@@ -174,9 +174,13 @@ export interface TalkPlatformBehavior {
   /** Foreign key to TalkPlatformBinding.id. */
   platformBindingId: string;
   /**
-   * Explicit on/off switch for inbound auto-response.
-   * When false, inbound handling is disabled for this binding.
+   * Inbound response mode for this binding.
+   * - off: never auto-respond
+   * - mentions: respond when bot is explicitly mentioned
+   * - all: respond to all inbound messages on this binding
    */
+  responseMode?: 'off' | 'mentions' | 'all';
+  /** Backward compatibility with older clients. Prefer responseMode. */
   autoRespond?: boolean;
   /** Optional talk agent name override for this binding. */
   agentName?: string;

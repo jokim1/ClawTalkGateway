@@ -238,6 +238,13 @@ function normalizeToolModeInput(raw: unknown): 'off' | 'confirm' | 'auto' | unde
   return undefined;
 }
 
+function normalizeResponseModeInput(raw: unknown): 'off' | 'mentions' | 'all' | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const value = raw.trim().toLowerCase();
+  if (value === 'off' || value === 'mentions' || value === 'all') return value;
+  return undefined;
+}
+
 function normalizeToolNameListInput(raw: unknown): string[] | undefined {
   if (!Array.isArray(raw)) return undefined;
   const seen = new Set<string>();
@@ -329,6 +336,11 @@ function mapChannelResponseSettingsInput(input: unknown): unknown {
       typeof row.responderAgent === 'string' ? row.responderAgent.trim() : '';
     const responseInstruction =
       typeof row.responseInstruction === 'string' ? row.responseInstruction.trim() : '';
+    const responseMode =
+      normalizeResponseModeInput(row.responseMode) ??
+      (typeof row.autoRespond === 'boolean'
+        ? (row.autoRespond ? 'all' : 'off')
+        : undefined);
     const autoRespond =
       typeof row.autoRespond === 'boolean' ? row.autoRespond : undefined;
 
@@ -337,6 +349,7 @@ function mapChannelResponseSettingsInput(input: unknown): unknown {
       ...(platformBindingId ? { platformBindingId } : {}),
       ...(responderAgent ? { agentName: responderAgent } : {}),
       ...(responseInstruction ? { onMessagePrompt: responseInstruction } : {}),
+      ...(responseMode !== undefined ? { responseMode } : {}),
       ...(autoRespond !== undefined ? { autoRespond } : {}),
     };
   });
@@ -970,11 +983,14 @@ export function normalizeAndValidatePlatformBehaviorsInput(
 
     const onMessagePrompt = typeof row.onMessagePrompt === 'string' ? row.onMessagePrompt.trim() : '';
     const autoRespond = typeof row.autoRespond === 'boolean' ? row.autoRespond : undefined;
-    if (!agentName && !onMessagePrompt && autoRespond !== false) {
+    const responseMode =
+      normalizeResponseModeInput(row.responseMode) ??
+      (autoRespond === false ? 'off' : autoRespond === true ? 'all' : undefined);
+    if (!agentName && !onMessagePrompt && responseMode === undefined) {
       return {
         ok: false,
         error:
-          `platformBehaviors[${i + 1}] must define agentName and/or onMessagePrompt, or set autoRespond=false.`,
+          `platformBehaviors[${i + 1}] must define agentName and/or onMessagePrompt, or set responseMode=off.`,
       };
     }
 
@@ -985,7 +1001,7 @@ export function normalizeAndValidatePlatformBehaviorsInput(
     normalized.push({
       id,
       platformBindingId,
-      ...(autoRespond !== undefined ? { autoRespond } : {}),
+      ...(responseMode !== undefined ? { responseMode } : {}),
       ...(agentName ? { agentName } : {}),
       ...(onMessagePrompt ? { onMessagePrompt } : {}),
       createdAt,

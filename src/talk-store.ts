@@ -60,6 +60,12 @@ function normalizeToolMode(raw: unknown): 'off' | 'confirm' | 'auto' {
   return 'auto';
 }
 
+function normalizeResponseMode(raw: unknown): 'off' | 'mentions' | 'all' | undefined {
+  const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (value === 'off' || value === 'mentions' || value === 'all') return value;
+  return undefined;
+}
+
 function normalizeExecutionMode(raw: unknown): 'openclaw' | 'full_control' {
   const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
   if (value === 'openclaw' || value === 'full_control') return value;
@@ -244,7 +250,10 @@ function normalizePlatformBehaviors(
       const agentName = typeof row.agentName === 'string' ? row.agentName.trim() : '';
       const onMessagePrompt = typeof row.onMessagePrompt === 'string' ? row.onMessagePrompt.trim() : '';
       const autoRespond = typeof row.autoRespond === 'boolean' ? row.autoRespond : undefined;
-      if (!agentName && !onMessagePrompt && autoRespond !== false) return null;
+      const responseMode =
+        normalizeResponseMode(row.responseMode) ??
+        (autoRespond === false ? 'off' : autoRespond === true ? 'all' : undefined);
+      if (!agentName && !onMessagePrompt && responseMode === undefined) return null;
 
       const id =
         typeof row.id === 'string' && row.id.trim()
@@ -254,7 +263,7 @@ function normalizePlatformBehaviors(
       return {
         id,
         platformBindingId,
-        ...(autoRespond !== undefined ? { autoRespond } : {}),
+        ...(responseMode !== undefined ? { responseMode } : {}),
         ...(agentName ? { agentName } : {}),
         ...(onMessagePrompt ? { onMessagePrompt } : {}),
         createdAt: typeof row.createdAt === 'number' ? row.createdAt : now,

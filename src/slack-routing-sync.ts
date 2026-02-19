@@ -6,7 +6,7 @@ const CLAWTALK_AGENT_ID = 'clawtalk';
 const DEFAULT_ACCOUNT_ID = 'default';
 
 type SlackPeer = { kind: 'channel' | 'user'; id: string };
-type DesiredBinding = { accountId: string; peer: SlackPeer };
+type DesiredBinding = { accountId: string; peer: SlackPeer; requireMention: boolean };
 
 function normalizeAccountId(value: unknown): string {
   if (typeof value !== 'string') return DEFAULT_ACCOUNT_ID;
@@ -37,6 +37,9 @@ function desiredSlackBindingsFromTalks(talks: TalkMeta[]): DesiredBinding[] {
   const seen = new Set<string>();
 
   for (const talk of talks) {
+    const behaviorsByBindingId = new Map(
+      (talk.platformBehaviors ?? []).map((behavior) => [behavior.platformBindingId, behavior]),
+    );
     for (const binding of talk.platformBindings ?? []) {
       if (binding.platform.trim().toLowerCase() !== 'slack') continue;
       if (!isWritePermission(binding.permission)) continue;
@@ -46,7 +49,15 @@ function desiredSlackBindingsFromTalks(talks: TalkMeta[]): DesiredBinding[] {
       const key = `${accountId}:${peer.kind}:${peer.id}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      out.push({ accountId, peer });
+      const behavior = behaviorsByBindingId.get(binding.id);
+      const responseMode =
+        behavior?.responseMode ??
+        ((behavior as { autoRespond?: boolean } | undefined)?.autoRespond === false ? 'off' : 'all');
+      out.push({
+        accountId,
+        peer,
+        requireMention: responseMode === 'mentions',
+      });
     }
   }
   return out;
@@ -167,7 +178,7 @@ export async function reconcileSlackRoutingForTalks(talks: TalkMeta[], logger: L
     const accountRoot = ensureObjectPath(accountsRoot, entry.accountId);
     const accountChannels = ensureObjectPath(accountRoot, 'channels');
     const channelRow = ensureObjectPath(accountChannels, entry.peer.id);
-    channelRow.requireMention = false;
+    channelRow.requireMention = entry.requireMention;
   }
 
   const next = `${JSON.stringify(cfg, null, 2)}\n`;
