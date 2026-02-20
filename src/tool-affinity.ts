@@ -19,22 +19,27 @@ import type { Logger } from './types.js';
 // Constants (env-overridable)
 // ---------------------------------------------------------------------------
 
-const WARMUP_THRESHOLD = envInt('CLAWTALK_AFFINITY_WARMUP', 8);
+const WARMUP_THRESHOLD = envInt('CLAWTALK_AFFINITY_WARMUP', 3);
 const SLIDING_WINDOW_SIZE = envInt('CLAWTALK_AFFINITY_WINDOW', 50);
 const EXPLORATION_RATE = envInt('CLAWTALK_AFFINITY_EXPLORATION_RATE', 20);
 const MIN_AFFINITY_THRESHOLD = envFloat('CLAWTALK_AFFINITY_MIN_THRESHOLD', 0.1);
 
 /**
- * Cold-start defaults: intents that are strongly correlated with zero tool
- * usage skip warmup entirely and start in learned phase with an empty tool
- * set. Exploration probes (5%) still fire to discover unexpected tool needs.
+ * Cold-start intents skip warmup and start in learned phase with only baseline
+ * tools. The baseline pattern keeps state tools (state_append_event,
+ * state_read_summary) so persistence always works, while pruning the other
+ * ~15 tools that cause reasoning-model slowdowns.
+ * Exploration probes (5%) still fire to discover unexpected tool needs.
  */
-const COLD_START_ZERO_TOOL_INTENTS = new Set([
+const COLD_START_INTENTS = new Set([
   'study',
   'state_tracking',
   'conversation',
   'model_meta',
 ]);
+
+/** Cold-start baseline: always include state tools so persistence works. */
+const COLD_START_BASELINE_PATTERN = /^state_/;
 
 function envInt(key: string, fallback: number): number {
   const raw = process.env[key];
@@ -252,13 +257,15 @@ export class ToolAffinityStore {
     // Learned phase: filter to tools with affinity above threshold
     const intentData = snapshot?.intents.find((i) => i.intent === intent);
     if (!intentData) {
-      // Cold-start intent with no data yet: assume zero tools needed
-      if (COLD_START_ZERO_TOOL_INTENTS.has(intent)) {
+      // Cold-start intent with no data yet: include only state tools baseline
+      if (COLD_START_INTENTS.has(intent)) {
+        const baseline = policyAllowedTools.filter(t => COLD_START_BASELINE_PATTERN.test(t));
+        const pruned = policyAllowedTools.filter(t => !COLD_START_BASELINE_PATTERN.test(t));
         return {
           phase: 'learned',
-          selectedTools: [],
-          prunedTools: policyAllowedTools,
-          reason: `cold-start: intent="${intent}" defaults to zero tools`,
+          selectedTools: baseline,
+          prunedTools: pruned,
+          reason: `cold-start: intent="${intent}" baseline=${baseline.length} state tools`,
         };
       }
       return {
@@ -297,7 +304,7 @@ export class ToolAffinityStore {
     const intentData = snapshot?.intents.find((i) => i.intent === intent);
     const hasEnoughData = intentData && intentData.totalObservations >= WARMUP_THRESHOLD;
 
-    if (!hasEnoughData && !COLD_START_ZERO_TOOL_INTENTS.has(intent)) {
+    if (!hasEnoughData && !COLD_START_INTENTS.has(intent)) {
       return 'warmup';
     }
 

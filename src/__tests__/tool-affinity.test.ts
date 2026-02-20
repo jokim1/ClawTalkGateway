@@ -223,7 +223,8 @@ describe('ToolAffinityStore', () => {
       const talkId = 'test-warmup';
 
       // Use 'web_research' intent which is NOT a cold-start intent
-      for (let i = 0; i < 3; i++) {
+      // 2 observations is below the warmup threshold of 3
+      for (let i = 0; i < 2; i++) {
         store.recordObservation(talkId, {
           timestamp: Date.now() + i,
           intent: 'web_research',
@@ -247,26 +248,52 @@ describe('ToolAffinityStore', () => {
       expect(result.prunedTools).toEqual([]);
     });
 
-    it('returns cold-start learned with zero tools for study intent', () => {
+    it('returns cold-start learned with state tools baseline for study intent', () => {
       const dataDir = makeTmpDir();
       const store = new ToolAffinityStore(dataDir, logger);
       const talkId = 'test-cold-start';
 
-      // No observations at all — cold-start intents go directly to learned
+      // No observations at all — cold-start intents go directly to learned with state tools
       const origRandom = Math.random;
       Math.random = () => 0.5; // avoid exploration
       try {
         const result = store.selectTools({
           talkId,
           intent: 'study',
-          policyAllowedTools: ['tool_a', 'tool_b', 'tool_c'],
+          policyAllowedTools: ['state_append_event', 'state_read_summary', 'google_docs_append', 'web_search'],
+          snapshot: undefined,
+        });
+
+        expect(result.phase).toBe('learned');
+        expect(result.selectedTools).toEqual(['state_append_event', 'state_read_summary']);
+        expect(result.prunedTools).toEqual(['google_docs_append', 'web_search']);
+        expect(result.reason).toContain('cold-start');
+        expect(result.reason).toContain('baseline=2');
+      } finally {
+        Math.random = origRandom;
+      }
+    });
+
+    it('returns cold-start learned with zero tools when no state tools in policy', () => {
+      const dataDir = makeTmpDir();
+      const store = new ToolAffinityStore(dataDir, logger);
+      const talkId = 'test-cold-start-no-state';
+
+      const origRandom = Math.random;
+      Math.random = () => 0.5; // avoid exploration
+      try {
+        const result = store.selectTools({
+          talkId,
+          intent: 'conversation',
+          policyAllowedTools: ['google_docs_append', 'web_search'],
           snapshot: undefined,
         });
 
         expect(result.phase).toBe('learned');
         expect(result.selectedTools).toEqual([]);
-        expect(result.prunedTools).toEqual(['tool_a', 'tool_b', 'tool_c']);
+        expect(result.prunedTools).toEqual(['google_docs_append', 'web_search']);
         expect(result.reason).toContain('cold-start');
+        expect(result.reason).toContain('baseline=0');
       } finally {
         Math.random = origRandom;
       }
@@ -355,8 +382,8 @@ describe('ToolAffinityStore', () => {
       const allTools = ['tool_a', 'tool_b', 'tool_c', 'tool_d'];
 
       // Use 'file_ops' intent — NOT a cold-start intent, so it goes through normal warmup
-      // Record 7 observations (below threshold of 8)
-      for (let i = 0; i < 7; i++) {
+      // Record 2 observations (below threshold of 3)
+      for (let i = 0; i < 2; i++) {
         store.recordObservation(talkId, {
           timestamp: Date.now() + i,
           intent: 'file_ops',
@@ -378,9 +405,9 @@ describe('ToolAffinityStore', () => {
       expect(selection.phase).toBe('warmup');
       expect(selection.selectedTools).toHaveLength(4);
 
-      // Add observation #8 to cross threshold
+      // Add observation #3 to cross threshold
       store.recordObservation(talkId, {
-        timestamp: Date.now() + 8,
+        timestamp: Date.now() + 3,
         intent: 'file_ops',
         availableTools: allTools,
         usedTools: [],
@@ -400,7 +427,7 @@ describe('ToolAffinityStore', () => {
           policyAllowedTools: allTools,
           snapshot,
         });
-        // All 8 observations used 0 tools, so learned phase with no tools
+        // All 3 observations used 0 tools, so learned phase with no tools
         expect(selection.phase).toBe('learned');
         expect(selection.selectedTools).toHaveLength(0);
         expect(selection.prunedTools).toHaveLength(4);
