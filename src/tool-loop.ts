@@ -888,9 +888,9 @@ export async function runToolLoopNonStreaming(opts: ToolLoopNonStreamOptions): P
         stream: false,
       }),
       signal: AbortSignal.timeout(timeoutMs),
-      // @ts-expect-error -- Node.js undici supports dispatcher option on fetch
+      // Node.js undici dispatcher — disables default 5-min timeout on headersTimeout/bodyTimeout
       dispatcher: longTimeoutDispatcher,
-    });
+    } as RequestInit);
 
     if (!response.ok) {
       const errBody = await response.text().catch(() => '');

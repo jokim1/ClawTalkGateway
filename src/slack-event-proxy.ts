@@ -13,7 +13,6 @@
 
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-// @ts-ignore — undici types not installed; available at runtime via Node.js
 import { request as undiciRequest } from 'undici';
 import type { TalkStore } from './talk-store.js';
 import type { Logger } from './types.js';
