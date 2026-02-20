@@ -110,6 +110,16 @@ type SlackIngressEventRuntime = {
   persisted: boolean;
   lastError?: string;
   lastErrorAt?: number;
+  phaseEvents: Array<{
+    ts: number;
+    phase: string;
+    attempt: number;
+    attemptToken: string;
+    elapsedMs?: number;
+    failurePhase?: string;
+    errorCode?: string;
+    errorMessage?: string;
+  }>;
 };
 
 type SlackIngressTalkCounters = {
@@ -139,6 +149,16 @@ export type SlackIngressTalkRuntimeSnapshot = {
     persisted: boolean;
     lastError?: string;
     lastErrorAt?: number;
+    phases: Array<{
+      ts: number;
+      phase: string;
+      attempt: number;
+      attemptToken: string;
+      elapsedMs?: number;
+      failurePhase?: string;
+      errorCode?: string;
+      errorMessage?: string;
+    }>;
   }>;
 };
 
@@ -171,6 +191,10 @@ type SlackIngressDeps = {
   recordSlackDebug?: (entry: {
     path: 'slack-ingress';
     phase: string;
+    failurePhase?: string;
+    attempt?: number;
+    attemptToken?: string;
+    elapsedMs?: number;
     talkId?: string;
     eventId?: string;
     accountId?: string;
@@ -412,6 +436,7 @@ function trackEventQueued(item: QueueItem): void {
     retries: 0,
     replySent: false,
     persisted: false,
+    phaseEvents: [],
   });
 }
 
@@ -452,6 +477,66 @@ function trackEventFailed(item: QueueItem, err: unknown): void {
   runtime.lastErrorAt = Date.now();
 }
 
+function appendRuntimePhase(params: {
+  item: QueueItem;
+  phase: string;
+  failurePhase?: string;
+  elapsedMs?: number;
+  errorCode?: string;
+  errorMessage?: string;
+}): void {
+  const runtime = runtimeByEventId.get(params.item.event.eventId);
+  if (!runtime) return;
+  runtime.phaseEvents.push({
+    ts: Date.now(),
+    phase: params.phase,
+    attempt: params.item.attempt,
+    attemptToken: params.item.attemptToken,
+    ...(params.failurePhase ? { failurePhase: params.failurePhase } : {}),
+    ...(params.elapsedMs !== undefined ? { elapsedMs: params.elapsedMs } : {}),
+    ...(params.errorCode ? { errorCode: params.errorCode } : {}),
+    ...(params.errorMessage ? { errorMessage: params.errorMessage.slice(0, 220) } : {}),
+  });
+  if (runtime.phaseEvents.length > 30) {
+    runtime.phaseEvents.splice(0, runtime.phaseEvents.length - 30);
+  }
+}
+
+function emitSlackIngressPhase(params: {
+  deps: SlackIngressDeps;
+  item: QueueItem;
+  phase: string;
+  failurePhase?: string;
+  elapsedMs?: number;
+  errorCode?: string;
+  errorMessage?: string;
+}): void {
+  appendRuntimePhase({
+    item: params.item,
+    phase: params.phase,
+    failurePhase: params.failurePhase,
+    elapsedMs: params.elapsedMs,
+    errorCode: params.errorCode,
+    errorMessage: params.errorMessage,
+  });
+  params.deps.recordSlackDebug?.({
+    path: 'slack-ingress',
+    phase: params.phase,
+    failurePhase: params.failurePhase,
+    attempt: params.item.attempt,
+    attemptToken: params.item.attemptToken,
+    elapsedMs: params.elapsedMs,
+    talkId: params.item.talkId,
+    eventId: params.item.event.eventId,
+    accountId: params.item.replyAccountId ?? params.item.event.accountId,
+    channelIdRaw: params.item.event.channelId,
+    channelIdResolved: params.item.event.channelId,
+    threadTs: params.item.event.threadTs,
+    errorCode: params.errorCode,
+    errorMessage: params.errorMessage,
+  });
+}
+
 function isAttemptCurrent(item: QueueItem): boolean {
   const runtime = runtimeByEventId.get(item.event.eventId);
   if (!runtime) return true;
@@ -461,7 +546,14 @@ function isAttemptCurrent(item: QueueItem): boolean {
 async function runWithTimeout<T>(work: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   const timeoutPromise = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    timer = setTimeout(
+      () => reject(new IngressProcessingError({
+        phase: 'process_timeout',
+        code: 'INGRESS_PROCESS_TIMEOUT',
+        message: `${label} timed out after ${timeoutMs}ms`,
+      })),
+      timeoutMs,
+    );
     timer?.unref?.();
   });
   try {
@@ -812,14 +904,85 @@ function resolveExplicitDeliveryPreference(eventText: string): 'thread' | 'chann
   return undefined;
 }
 
-function inferErrorCode(err: unknown): string {
-  const text = (err instanceof Error ? err.message : String(err)).toLowerCase();
-  if (text.includes('unknown channel')) return 'unknown_channel';
-  if (text.includes('timed out') || text.includes('timeout')) return 'timeout';
-  if (text.includes('missing user message')) return 'missing_user_message';
-  if (text.includes('rate limit')) return 'rate_limited';
-  if (text.includes('unauthorized') || text.includes('forbidden')) return 'auth_error';
-  return 'error';
+type IngressFailurePhase =
+  | 'ownership'
+  | 'queue'
+  | 'llm_request'
+  | 'llm_response'
+  | 'send'
+  | 'persist'
+  | 'process_timeout'
+  | 'other';
+
+class IngressProcessingError extends Error {
+  readonly phase: IngressFailurePhase;
+  readonly code: string;
+
+  constructor(params: {
+    phase: IngressFailurePhase;
+    code: string;
+    message: string;
+    cause?: unknown;
+  }) {
+    super(params.message);
+    this.name = 'IngressProcessingError';
+    this.phase = params.phase;
+    this.code = params.code;
+    if (params.cause !== undefined) {
+      (this as Error & { cause?: unknown }).cause = params.cause;
+    }
+  }
+}
+
+function classifyIngressFailure(err: unknown): {
+  code: string;
+  phase: IngressFailurePhase;
+  message: string;
+} {
+  if (err instanceof IngressProcessingError) {
+    return {
+      code: err.code,
+      phase: err.phase,
+      message: err.message,
+    };
+  }
+  if (err instanceof RoutingGuardError) {
+    return {
+      code: err.code,
+      phase: 'ownership',
+      message: err.message,
+    };
+  }
+  const raw = err instanceof Error ? err.message : String(err);
+  const text = raw.toLowerCase();
+  if (text.includes('unknown channel')) {
+    return { code: 'INGRESS_SEND_UNKNOWN_CHANNEL', phase: 'send', message: raw };
+  }
+  if (text.includes('slack send failed')) {
+    return { code: 'INGRESS_SEND_HTTP_ERROR', phase: 'send', message: raw };
+  }
+  if (text.includes('unauthorized') || text.includes('forbidden') || text.includes('not_authed') || text.includes('invalid_auth')) {
+    return { code: 'INGRESS_SEND_AUTH_ERROR', phase: 'send', message: raw };
+  }
+  if (text.includes('missing user message')) {
+    return { code: 'INGRESS_LLM_INVALID_REQUEST', phase: 'llm_request', message: raw };
+  }
+  if (text.includes('llm call failed')) {
+    return { code: 'INGRESS_LLM_HTTP_ERROR', phase: 'llm_request', message: raw };
+  }
+  if (text.includes('timed out') || text.includes('timeout') || text.includes('aborted')) {
+    if (text.includes('slackingress event')) {
+      return { code: 'INGRESS_PROCESS_TIMEOUT', phase: 'process_timeout', message: raw };
+    }
+    if (text.includes('slack send')) {
+      return { code: 'INGRESS_SEND_TIMEOUT', phase: 'send', message: raw };
+    }
+    return { code: 'INGRESS_LLM_TIMEOUT', phase: 'llm_request', message: raw };
+  }
+  if (text.includes('rate limit') || text.includes('(429)')) {
+    return { code: 'INGRESS_LLM_RATE_LIMITED', phase: 'llm_request', message: raw };
+  }
+  return { code: 'INGRESS_INTERNAL_ERROR', phase: 'other', message: raw };
 }
 
 function mapFailureToDiagnostic(err: unknown): {
@@ -829,8 +992,10 @@ function mapFailureToDiagnostic(err: unknown): {
   message: string;
   assumptionKey?: string;
 } {
-  const errorCode = inferErrorCode(err);
-  const errorText = (err instanceof Error ? err.message : String(err)).trim();
+  const classified = classifyIngressFailure(err);
+  const errorCode = classified.code;
+  const errorText = classified.message.trim();
+  const phaseLabel = `Failure phase: ${classified.phase}. `;
   if (err instanceof RoutingGuardError) {
     return {
       code: err.code,
@@ -880,38 +1045,38 @@ function mapFailureToDiagnostic(err: unknown): {
       assumptionKey: 'state:workspace_backend_selected',
     };
   }
-  if (errorCode === 'unknown_channel') {
+  if (errorCode === 'INGRESS_SEND_UNKNOWN_CHANNEL') {
     return {
       code: 'SLACK_UNKNOWN_CHANNEL',
       category: 'slack',
       title: 'Slack channel delivery failed',
-      message: 'Slack rejected the target channel. Verify channel binding scope and bot channel membership.',
+      message: `${phaseLabel}Slack rejected the target channel. Verify channel binding scope and bot channel membership.`,
       assumptionKey: `slack:unknown_channel:${errorText.toLowerCase()}`,
     };
   }
-  if (errorCode === 'auth_error') {
+  if (errorCode === 'INGRESS_SEND_AUTH_ERROR') {
     return {
       code: 'SLACK_AUTH_ERROR',
       category: 'slack',
       title: 'Slack authentication failed',
-      message: 'Slack auth failed for this send attempt. Reconnect account credentials and retry.',
+      message: `${phaseLabel}Slack auth failed for this send attempt. Reconnect account credentials and retry.`,
       assumptionKey: 'slack:auth_error',
     };
   }
-  if (errorCode === 'timeout') {
+  if (errorCode === 'INGRESS_PROCESS_TIMEOUT' || errorCode === 'INGRESS_LLM_TIMEOUT' || errorCode === 'INGRESS_SEND_TIMEOUT') {
     return {
       code: 'RUN_TIMEOUT',
       category: 'routing',
       title: 'Run timed out',
-      message: 'The run timed out before completion. Check model/tool latency or reduce prompt/tool workload.',
+      message: `${phaseLabel}The run timed out before completion. Check model/tool latency or reduce prompt/tool workload.`,
       assumptionKey: 'runtime:timeout',
     };
   }
   return {
-    code: 'INGRESS_PROCESSING_ERROR',
+    code: errorCode,
     category: 'other',
     title: 'Slack event processing failed',
-    message: errorText || 'Slack event failed after retries.',
+    message: `${phaseLabel}${errorText || 'Slack event failed after retries.'}`,
   };
 }
 
@@ -1360,6 +1525,8 @@ async function sendSlackReply(params: {
   sessionKey: string;
   deliveryMode?: 'thread' | 'channel' | 'adaptive';
   intent?: 'study' | 'advice' | 'other';
+  attempt?: number;
+  attemptToken?: string;
 }): Promise<void> {
   const resolvedAccountIdRaw = params.accountId ?? params.event.accountId;
   const resolvedAccountId = resolvedAccountIdRaw?.trim();
@@ -1386,6 +1553,8 @@ async function sendSlackReply(params: {
   params.deps.recordSlackDebug?.({
     path: 'slack-ingress',
     phase: 'send_start',
+    ...(params.attempt !== undefined ? { attempt: params.attempt } : {}),
+    ...(params.attemptToken ? { attemptToken: params.attemptToken } : {}),
     talkId: params.talkId,
     eventId: params.event.eventId,
     accountId: resolvedAccountId,
@@ -1407,6 +1576,8 @@ async function sendSlackReply(params: {
     params.deps.recordSlackDebug?.({
       path: 'slack-ingress',
       phase: 'send_ok',
+      ...(params.attempt !== undefined ? { attempt: params.attempt } : {}),
+      ...(params.attemptToken ? { attemptToken: params.attemptToken } : {}),
       talkId: params.talkId,
       eventId: params.event.eventId,
       accountId: resolvedAccountId,
@@ -1453,13 +1624,15 @@ async function sendSlackReply(params: {
     params.deps.recordSlackDebug?.({
       path: 'slack-ingress',
       phase: 'send_fail',
+      ...(params.attempt !== undefined ? { attempt: params.attempt } : {}),
+      ...(params.attemptToken ? { attemptToken: params.attemptToken } : {}),
       talkId: params.talkId,
       eventId: params.event.eventId,
       accountId: resolvedAccountId,
       channelIdRaw: params.event.channelId,
       channelIdResolved: params.event.channelId,
       threadTs,
-      errorCode: inferErrorCode(err),
+      errorCode: classifyIngressFailure(err).code,
       errorMessage: err.message.slice(0, 220),
     });
     throw err;
@@ -1473,13 +1646,15 @@ async function sendSlackReply(params: {
     params.deps.recordSlackDebug?.({
       path: 'slack-ingress',
       phase: 'send_fail',
+      ...(params.attempt !== undefined ? { attempt: params.attempt } : {}),
+      ...(params.attemptToken ? { attemptToken: params.attemptToken } : {}),
       talkId: params.talkId,
       eventId: params.event.eventId,
       accountId: resolvedAccountId,
       channelIdRaw: params.event.channelId,
       channelIdResolved: params.event.channelId,
       threadTs,
-      errorCode: inferErrorCode(err),
+      errorCode: classifyIngressFailure(err).code,
       errorMessage: err.message.slice(0, 220),
     });
     throw err;
@@ -1487,6 +1662,8 @@ async function sendSlackReply(params: {
   params.deps.recordSlackDebug?.({
     path: 'slack-ingress',
     phase: 'send_ok',
+    ...(params.attempt !== undefined ? { attempt: params.attempt } : {}),
+    ...(params.attemptToken ? { attemptToken: params.attemptToken } : {}),
     talkId: params.talkId,
     eventId: params.event.eventId,
     accountId: resolvedAccountId,
@@ -1565,8 +1742,9 @@ async function sendFailureNotice(params: {
 }): Promise<void> {
   const baseMessage =
     'ClawTalk failed to process this Slack event after multiple retries. Please retry in this thread.';
+  const classified = classifyIngressFailure(params.failureError ?? 'error');
   const compactDebug = params.deps.debugEnabled
-    ? ` [dbg path=slack-ingress inst=${params.deps.instanceTag ?? '-'} talk=${params.item.talkId.slice(0, 8)} event=${params.item.event.eventId.slice(0, 16)} err=${inferErrorCode(params.failureError ?? 'error')}]`
+    ? ` [dbg path=slack-ingress inst=${params.deps.instanceTag ?? '-'} talk=${params.item.talkId.slice(0, 8)} event=${params.item.event.eventId.slice(0, 16)} err=${classified.code} phase=${classified.phase}]`
     : '';
   const message = `${baseMessage}${compactDebug}`;
   const talk = params.deps.store.getTalk(params.item.talkId);
@@ -1587,6 +1765,8 @@ async function sendFailureNotice(params: {
     accountId: params.item.replyAccountId,
     message,
     sessionKey: fallbackSessionKey,
+    attempt: params.item.attempt,
+    attemptToken: params.item.attemptToken,
   });
 }
 
@@ -1594,16 +1774,63 @@ async function processQueueItem(item: QueueItem, deps: SlackIngressDeps): Promis
   if (!isAttemptCurrent(item)) {
     throw new Error('stale attempt superseded by newer retry');
   }
-  await ensureInboundMessage(item, deps);
+  try {
+    await ensureInboundMessage(item, deps);
+    emitSlackIngressPhase({ deps, item, phase: 'inbound_ready' });
+  } catch (err) {
+    const classified = classifyIngressFailure(err);
+    emitSlackIngressPhase({
+      deps,
+      item,
+      phase: 'failed',
+      failurePhase: 'persist',
+      errorCode: classified.code,
+      errorMessage: classified.message,
+    });
+    throw new IngressProcessingError({
+      phase: 'persist',
+      code: classified.code === 'INGRESS_INTERNAL_ERROR' ? 'INGRESS_PERSIST_ERROR' : classified.code,
+      message: classified.message,
+      cause: err,
+    });
+  }
 
   if (!item.reply || !item.sessionKey || !item.model) {
-    const generated = await callLlmForEvent({
-      deps,
-      talkId: item.talkId,
-      event: item.event,
-      behaviorAgentName: item.behaviorAgentName,
-      behaviorOnMessagePrompt: item.behaviorOnMessagePrompt,
-    });
+    const llmStartedAt = Date.now();
+    emitSlackIngressPhase({ deps, item, phase: 'llm_request_started' });
+    let generated: Awaited<ReturnType<typeof callLlmForEvent>>;
+    try {
+      generated = await callLlmForEvent({
+        deps,
+        talkId: item.talkId,
+        event: item.event,
+        behaviorAgentName: item.behaviorAgentName,
+        behaviorOnMessagePrompt: item.behaviorOnMessagePrompt,
+      });
+      emitSlackIngressPhase({
+        deps,
+        item,
+        phase: 'llm_completed',
+        elapsedMs: Date.now() - llmStartedAt,
+      });
+    } catch (err) {
+      const classified = classifyIngressFailure(err);
+      emitSlackIngressPhase({
+        deps,
+        item,
+        phase: 'failed',
+        failurePhase: 'llm_request',
+        elapsedMs: Date.now() - llmStartedAt,
+        errorCode: classified.code,
+        errorMessage: classified.message,
+      });
+      throw new IngressProcessingError({
+        phase: 'llm_request',
+        code: classified.code,
+        message: classified.message,
+        cause: err,
+      });
+    }
     item.reply = generated.reply;
     item.model = generated.model;
     item.sessionKey = generated.sessionKey;
@@ -1662,44 +1889,89 @@ async function processQueueItem(item: QueueItem, deps: SlackIngressDeps): Promis
     if (!reply || !sessionKey) {
       throw new Error('reply payload missing');
     }
-    await sendSlackReply({
-      deps,
-      event: item.event,
-      talkId: item.talkId,
-      accountId: item.replyAccountId,
-      message: reply,
-      sessionKey,
-      deliveryMode: item.behaviorDeliveryMode,
-      intent: item.behaviorIntent,
-    });
+    const sendStartedAt = Date.now();
+    emitSlackIngressPhase({ deps, item, phase: 'send_started' });
+    try {
+      await sendSlackReply({
+        deps,
+        event: item.event,
+        talkId: item.talkId,
+        accountId: item.replyAccountId,
+        message: reply,
+        sessionKey,
+        deliveryMode: item.behaviorDeliveryMode,
+        intent: item.behaviorIntent,
+        attempt: item.attempt,
+        attemptToken: item.attemptToken,
+      });
+      emitSlackIngressPhase({
+        deps,
+        item,
+        phase: 'send_completed',
+        elapsedMs: Date.now() - sendStartedAt,
+      });
+    } catch (err) {
+      const classified = classifyIngressFailure(err);
+      emitSlackIngressPhase({
+        deps,
+        item,
+        phase: 'failed',
+        failurePhase: 'send',
+        elapsedMs: Date.now() - sendStartedAt,
+        errorCode: classified.code,
+        errorMessage: classified.message,
+      });
+      throw new IngressProcessingError({
+        phase: 'send',
+        code: classified.code,
+        message: classified.message,
+        cause: err,
+      });
+    }
     item.replySent = true;
   }
 
   if (!isAttemptCurrent(item)) {
     throw new Error('stale attempt superseded by newer retry');
   }
-  await persistAssistantResult(item, deps);
+  try {
+    await persistAssistantResult(item, deps);
+    emitSlackIngressPhase({ deps, item, phase: 'persist_completed' });
+  } catch (err) {
+    const classified = classifyIngressFailure(err);
+    emitSlackIngressPhase({
+      deps,
+      item,
+      phase: 'failed',
+      failurePhase: 'persist',
+      errorCode: classified.code,
+      errorMessage: classified.message,
+    });
+    throw new IngressProcessingError({
+      phase: 'persist',
+      code: classified.code === 'INGRESS_INTERNAL_ERROR' ? 'INGRESS_PERSIST_ERROR' : classified.code,
+      message: classified.message,
+      cause: err,
+    });
+  }
 }
 
 function scheduleRetry(item: QueueItem, deps: SlackIngressDeps, err: unknown): void {
   const maxAttempts = parseIntegerEnv('CLAWTALK_INGRESS_RETRY_ATTEMPTS', DEFAULT_RETRY_ATTEMPTS, 1, 10);
   const nextAttempt = item.attempt + 1;
+  const classified = classifyIngressFailure(err);
   if (nextAttempt >= maxAttempts) {
     if (!item.replySent) {
       seenEvents.delete(item.event.eventId);
     }
     void writeDeadLetter({ deps, item, error: err }).catch(() => {});
-    deps.recordSlackDebug?.({
-      path: 'slack-ingress',
+    emitSlackIngressPhase({
+      deps,
+      item,
       phase: 'dead_letter',
-      talkId: item.talkId,
-      eventId: item.event.eventId,
-      accountId: item.replyAccountId ?? item.event.accountId,
-      channelIdRaw: item.event.channelId,
-      channelIdResolved: item.event.channelId,
-      threadTs: item.event.threadTs,
-      errorCode: inferErrorCode(err),
-      errorMessage: (err instanceof Error ? err.message : String(err)).slice(0, 220),
+      failurePhase: classified.phase,
+      errorCode: classified.code,
+      errorMessage: classified.message,
     });
     const notifyOnFailure = process.env.CLAWTALK_INGRESS_NOTIFY_FAILURE !== '0' && !item.replySent;
     const diagnostic = mapFailureToDiagnostic(err);
@@ -1715,7 +1987,8 @@ function scheduleRetry(item: QueueItem, deps: SlackIngressDeps, err: unknown): v
         eventId: item.event.eventId,
         channelId: item.event.channelId,
         accountId: item.replyAccountId ?? item.event.accountId ?? '',
-        errorCode: inferErrorCode(err),
+        errorCode: classified.code,
+        failurePhase: classified.phase,
       },
     }).catch(() => {});
     if (notifyOnFailure) {
@@ -1732,17 +2005,13 @@ function scheduleRetry(item: QueueItem, deps: SlackIngressDeps, err: unknown): v
     runtime.attemptToken = retryItem.attemptToken;
   }
   const timer = setTimeout(() => {
-    deps.recordSlackDebug?.({
-      path: 'slack-ingress',
-      phase: 'retry',
-      talkId: item.talkId,
-      eventId: item.event.eventId,
-      accountId: item.replyAccountId ?? item.event.accountId,
-      channelIdRaw: item.event.channelId,
-      channelIdResolved: item.event.channelId,
-      threadTs: item.event.threadTs,
-      errorCode: inferErrorCode(err),
-      errorMessage: (err instanceof Error ? err.message : String(err)).slice(0, 220),
+    emitSlackIngressPhase({
+      deps,
+      item: retryItem,
+      phase: 'retry_scheduled',
+      failurePhase: classified.phase,
+      errorCode: classified.code,
+      errorMessage: classified.message,
     });
     queue.push(retryItem);
     void processQueue(deps);
@@ -1759,15 +2028,26 @@ async function processQueue(deps: SlackIngressDeps): Promise<void> {
       if (!item) continue;
       try {
         trackEventRunning(item);
+        emitSlackIngressPhase({ deps, item, phase: 'worker_started' });
         await runWithTimeout(
           processQueueItem(item, deps),
           getProcessTimeoutMs(),
           `SlackIngress event ${item.event.eventId}`,
         );
         trackEventDelivered(item);
+        emitSlackIngressPhase({ deps, item, phase: 'worker_completed' });
         getTalkCounters(item.talkId).delivered += 1;
         deps.logger.debug(`SlackIngress: delivered reply for event ${item.event.eventId} (talk ${item.talkId})`);
       } catch (err) {
+        const classified = classifyIngressFailure(err);
+        emitSlackIngressPhase({
+          deps,
+          item,
+          phase: 'failed',
+          failurePhase: classified.phase,
+          errorCode: classified.code,
+          errorMessage: classified.message,
+        });
         const maxAttempts = parseIntegerEnv('CLAWTALK_INGRESS_RETRY_ATTEMPTS', DEFAULT_RETRY_ATTEMPTS, 1, 10);
         const nextAttempt = item.attempt + 1;
         if (nextAttempt >= maxAttempts) {
@@ -1904,6 +2184,11 @@ function routeSlackIngressEvent(
   };
   queue.push(queuedItem);
   trackEventQueued(queuedItem);
+  emitSlackIngressPhase({
+    deps,
+    item: queuedItem,
+    phase: 'queued',
+  });
   if (deps.autoProcessQueue !== false) {
     void processQueue(deps);
   }
@@ -2160,6 +2445,16 @@ export function getSlackIngressTalkRuntimeSnapshot(talkId: string): SlackIngress
       persisted: event.persisted,
       lastError: event.lastError,
       lastErrorAt: event.lastErrorAt,
+      phases: event.phaseEvents.map((phase) => ({
+        ts: phase.ts,
+        phase: phase.phase,
+        attempt: phase.attempt,
+        attemptToken: phase.attemptToken,
+        ...(phase.elapsedMs !== undefined ? { elapsedMs: phase.elapsedMs } : {}),
+        ...(phase.failurePhase ? { failurePhase: phase.failurePhase } : {}),
+        ...(phase.errorCode ? { errorCode: phase.errorCode } : {}),
+        ...(phase.errorMessage ? { errorMessage: phase.errorMessage } : {}),
+      })),
     }));
   const inflight = events.filter((event) => event.state === 'queued' || event.state === 'running' || event.state === 'retrying').length;
   return {

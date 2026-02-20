@@ -90,6 +90,10 @@ type SlackDebugEntry = {
   instanceTag: string;
   path: SlackDebugPath;
   phase: string;
+  failurePhase?: string;
+  attempt?: number;
+  attemptToken?: string;
+  elapsedMs?: number;
   talkId?: string;
   jobId?: string;
   eventId?: string;
@@ -703,6 +707,10 @@ const plugin = {
       recordSlackDebug: (entry: {
         path: 'slack-ingress';
         phase: string;
+        failurePhase?: string;
+        attempt?: number;
+        attemptToken?: string;
+        elapsedMs?: number;
         talkId?: string;
         eventId?: string;
         accountId?: string;

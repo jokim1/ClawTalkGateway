@@ -895,6 +895,80 @@ describe('slack ingress ownership hooks', () => {
     }
   });
 
+  it('captures ingress phase attribution timeline for successful delivery', async () => {
+    const talk = store.createTalk('test-model');
+    const bindingId = 'binding-phase-attribution';
+    store.updateTalk(talk.id, {
+      platformBindings: [{
+        id: bindingId,
+        platform: 'slack',
+        accountId: 'kimfamily',
+        scope: 'channel:c894',
+        permission: 'read+write',
+        createdAt: Date.now(),
+      }],
+      platformBehaviors: [{
+        id: 'behavior-phase-attribution',
+        platformBindingId: bindingId,
+        responseMode: 'all',
+        deliveryMode: 'channel',
+        mirrorToTalk: 'off',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      }],
+    });
+
+    const sendSlackMessage = jest.fn(async (_params: { accountId?: string; channelId: string; threadTs?: string; message: string }) => true);
+    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: 'ack' } }],
+      }),
+    } as unknown as Response);
+    try {
+      const deps = {
+        ...buildDeps(),
+        autoProcessQueue: true,
+        sendSlackMessage,
+      };
+
+      await handleSlackMessageReceivedHook(
+        {
+          from: 'slack:channel:C894',
+          content: 'please summarize this',
+          metadata: {
+            to: 'channel:C894',
+            messageId: '1700000106.100',
+            senderId: 'U894',
+            senderName: 'Big Bad Daddy',
+          },
+        },
+        {
+          channelId: 'slack',
+          accountId: 'kimfamily',
+        },
+        deps,
+      );
+
+      for (let i = 0; i < 40 && sendSlackMessage.mock.calls.length < 1; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      const runtime = getSlackIngressTalkRuntimeSnapshot(talk.id);
+      expect(runtime.recentEvents.length).toBeGreaterThanOrEqual(1);
+      const phases = runtime.recentEvents[0]?.phases.map((entry) => entry.phase) ?? [];
+      expect(phases).toContain('queued');
+      expect(phases).toContain('worker_started');
+      expect(phases).toContain('llm_request_started');
+      expect(phases).toContain('llm_completed');
+      expect(phases).toContain('send_started');
+      expect(phases).toContain('send_completed');
+      expect(phases).toContain('worker_completed');
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
   it('blocks mismatched set intent and records intent diagnostic', async () => {
     const talk = store.createTalk('test-model');
     const bindingId = 'binding-intent-verification';
