@@ -24,6 +24,18 @@ const SLIDING_WINDOW_SIZE = envInt('CLAWTALK_AFFINITY_WINDOW', 50);
 const EXPLORATION_RATE = envInt('CLAWTALK_AFFINITY_EXPLORATION_RATE', 20);
 const MIN_AFFINITY_THRESHOLD = envFloat('CLAWTALK_AFFINITY_MIN_THRESHOLD', 0.1);
 
+/**
+ * Cold-start defaults: intents that are strongly correlated with zero tool
+ * usage skip warmup entirely and start in learned phase with an empty tool
+ * set. Exploration probes (5%) still fire to discover unexpected tool needs.
+ */
+const COLD_START_ZERO_TOOL_INTENTS = new Set([
+  'study',
+  'state_tracking',
+  'conversation',
+  'model_meta',
+]);
+
 function envInt(key: string, fallback: number): number {
   const raw = process.env[key];
   if (!raw) return fallback;
@@ -240,6 +252,15 @@ export class ToolAffinityStore {
     // Learned phase: filter to tools with affinity above threshold
     const intentData = snapshot?.intents.find((i) => i.intent === intent);
     if (!intentData) {
+      // Cold-start intent with no data yet: assume zero tools needed
+      if (COLD_START_ZERO_TOOL_INTENTS.has(intent)) {
+        return {
+          phase: 'learned',
+          selectedTools: [],
+          prunedTools: policyAllowedTools,
+          reason: `cold-start: intent="${intent}" defaults to zero tools`,
+        };
+      }
       return {
         phase: 'warmup',
         selectedTools: policyAllowedTools,
@@ -273,12 +294,14 @@ export class ToolAffinityStore {
 
   /** Determine which phase an intent is in. */
   resolvePhase(intent: string, snapshot: ToolAffinitySnapshot | undefined): AffinityPhase {
-    if (!snapshot) return 'warmup';
-    const intentData = snapshot.intents.find((i) => i.intent === intent);
-    if (!intentData || intentData.totalObservations < WARMUP_THRESHOLD) {
+    const intentData = snapshot?.intents.find((i) => i.intent === intent);
+    const hasEnoughData = intentData && intentData.totalObservations >= WARMUP_THRESHOLD;
+
+    if (!hasEnoughData && !COLD_START_ZERO_TOOL_INTENTS.has(intent)) {
       return 'warmup';
     }
-    // Exploration: 1-in-N chance
+
+    // Cold-start intents or intents with enough data: learned with exploration probes
     if (EXPLORATION_RATE > 0 && Math.random() < 1 / EXPLORATION_RATE) {
       return 'exploration';
     }

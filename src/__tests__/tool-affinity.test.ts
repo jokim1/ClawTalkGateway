@@ -217,16 +217,27 @@ describe('ToolAffinityStore', () => {
       }
     }
 
-    it('returns warmup for insufficient observations', () => {
+    it('returns warmup for insufficient observations on non-cold-start intent', () => {
       const dataDir = makeTmpDir();
       const store = new ToolAffinityStore(dataDir, logger);
       const talkId = 'test-warmup';
 
-      seedObservations(store, talkId, 3, ['tool_a']);
+      // Use 'web_research' intent which is NOT a cold-start intent
+      for (let i = 0; i < 3; i++) {
+        store.recordObservation(talkId, {
+          timestamp: Date.now() + i,
+          intent: 'web_research',
+          availableTools: ['tool_a', 'tool_b', 'tool_c'],
+          usedTools: ['tool_a'],
+          toolsOffered: 3,
+          model: 'test-model',
+          source: 'talk-chat',
+        });
+      }
       const snapshot = store.getSnapshot(talkId);
       const result = store.selectTools({
         talkId,
-        intent: 'study',
+        intent: 'web_research',
         policyAllowedTools: ['tool_a', 'tool_b', 'tool_c'],
         snapshot,
       });
@@ -234,6 +245,31 @@ describe('ToolAffinityStore', () => {
       expect(result.phase).toBe('warmup');
       expect(result.selectedTools).toEqual(['tool_a', 'tool_b', 'tool_c']);
       expect(result.prunedTools).toEqual([]);
+    });
+
+    it('returns cold-start learned with zero tools for study intent', () => {
+      const dataDir = makeTmpDir();
+      const store = new ToolAffinityStore(dataDir, logger);
+      const talkId = 'test-cold-start';
+
+      // No observations at all — cold-start intents go directly to learned
+      const origRandom = Math.random;
+      Math.random = () => 0.5; // avoid exploration
+      try {
+        const result = store.selectTools({
+          talkId,
+          intent: 'study',
+          policyAllowedTools: ['tool_a', 'tool_b', 'tool_c'],
+          snapshot: undefined,
+        });
+
+        expect(result.phase).toBe('learned');
+        expect(result.selectedTools).toEqual([]);
+        expect(result.prunedTools).toEqual(['tool_a', 'tool_b', 'tool_c']);
+        expect(result.reason).toContain('cold-start');
+      } finally {
+        Math.random = origRandom;
+      }
     });
 
     it('returns learned subset after warmup threshold', () => {
@@ -318,11 +354,12 @@ describe('ToolAffinityStore', () => {
       const talkId = 'test-transition';
       const allTools = ['tool_a', 'tool_b', 'tool_c', 'tool_d'];
 
+      // Use 'file_ops' intent — NOT a cold-start intent, so it goes through normal warmup
       // Record 7 observations (below threshold of 8)
       for (let i = 0; i < 7; i++) {
         store.recordObservation(talkId, {
           timestamp: Date.now() + i,
-          intent: 'conversation',
+          intent: 'file_ops',
           availableTools: allTools,
           usedTools: [],
           toolsOffered: 4,
@@ -334,7 +371,7 @@ describe('ToolAffinityStore', () => {
       let snapshot = store.getSnapshot(talkId);
       let selection = store.selectTools({
         talkId,
-        intent: 'conversation',
+        intent: 'file_ops',
         policyAllowedTools: allTools,
         snapshot,
       });
@@ -344,7 +381,7 @@ describe('ToolAffinityStore', () => {
       // Add observation #8 to cross threshold
       store.recordObservation(talkId, {
         timestamp: Date.now() + 8,
-        intent: 'conversation',
+        intent: 'file_ops',
         availableTools: allTools,
         usedTools: [],
         toolsOffered: 4,
@@ -359,7 +396,7 @@ describe('ToolAffinityStore', () => {
         snapshot = store.getSnapshot(talkId);
         selection = store.selectTools({
           talkId,
-          intent: 'conversation',
+          intent: 'file_ops',
           policyAllowedTools: allTools,
           snapshot,
         });
@@ -374,17 +411,32 @@ describe('ToolAffinityStore', () => {
   });
 
   describe('resolvePhase', () => {
-    it('returns warmup for undefined snapshot', () => {
+    it('returns warmup for undefined snapshot on non-cold-start intent', () => {
       const dataDir = makeTmpDir();
       const store = new ToolAffinityStore(dataDir, logger);
-      expect(store.resolvePhase('study', undefined)).toBe('warmup');
+      expect(store.resolvePhase('web_research', undefined)).toBe('warmup');
     });
 
     it('returns warmup for unknown intent in snapshot', () => {
       const dataDir = makeTmpDir();
       const store = new ToolAffinityStore(dataDir, logger);
       const snapshot = { talkId: 't', computedAt: Date.now(), intents: [] };
-      expect(store.resolvePhase('study', snapshot)).toBe('warmup');
+      expect(store.resolvePhase('web_research', snapshot)).toBe('warmup');
+    });
+
+    it('returns learned for cold-start intent even with no snapshot', () => {
+      const dataDir = makeTmpDir();
+      const store = new ToolAffinityStore(dataDir, logger);
+      const origRandom = Math.random;
+      Math.random = () => 0.5;
+      try {
+        expect(store.resolvePhase('study', undefined)).toBe('learned');
+        expect(store.resolvePhase('conversation', undefined)).toBe('learned');
+        expect(store.resolvePhase('state_tracking', undefined)).toBe('learned');
+        expect(store.resolvePhase('model_meta', undefined)).toBe('learned');
+      } finally {
+        Math.random = origRandom;
+      }
     });
   });
 });
