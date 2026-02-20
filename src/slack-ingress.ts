@@ -28,6 +28,12 @@ import {
 } from './talk-policy.js';
 import { isOpenClawNativeGoogleTool } from './openclaw-native-tools.js';
 import { assertRoutingHeaders, RoutingGuardError } from './routing-headers.js';
+import {
+  getToolAffinityStore,
+  isAffinityDisabled,
+  classifyMessageIntent as classifyAffinityIntent,
+  computeAffinityTimeout,
+} from './tool-affinity.js';
 
 const MAX_CONTEXT_MESSAGES = 50;
 const MAX_CONTEXT_BUDGET_BYTES = 60 * 1024;
@@ -1392,9 +1398,34 @@ async function callLlmForEvent(params: {
     policyStatesWithAuth.filter((tool) => tool.enabled).map((tool) => tool.name.trim().toLowerCase()),
   );
   const enableToolsForTurn = effectiveToolMode !== 'off' && enabledToolNames.size > 0;
-  const tools = enableToolsForTurn
+  let tools = enableToolsForTurn
     ? deps.registry.getToolSchemas().filter((tool) => enabledToolNames.has(tool.function.name.toLowerCase()))
     : [];
+
+  // --- Tool Affinity filtering ---
+  let affinityPhase: import('./tool-affinity.js').AffinityPhase = 'warmup';
+  const affinityIntent = classifyAffinityIntent(event.text);
+  if (tools.length > 0 && !isAffinityDisabled()) {
+    const affinityStore = getToolAffinityStore(deps.dataDir, deps.logger);
+    const snapshot = affinityStore.getSnapshot(talkId);
+    const selection = affinityStore.selectTools({
+      talkId,
+      intent: affinityIntent,
+      policyAllowedTools: tools.map((t) => t.function.name),
+      snapshot,
+    });
+    affinityPhase = selection.phase;
+    if (selection.prunedTools.length > 0) {
+      const kept = new Set(selection.selectedTools.map((n) => n.toLowerCase()));
+      tools = tools.filter((t) => kept.has(t.function.name.toLowerCase()));
+    }
+    deps.logger.info(
+      `ToolAffinity flow=slack-ingress intent=${affinityIntent} phase=${selection.phase} `
+      + `selected=${selection.selectedTools.length}/${selection.selectedTools.length + selection.prunedTools.length} `
+      + `pruned=${selection.prunedTools.join(',') || '-'} reason=${selection.reason}`,
+    );
+  }
+
   const routeDiag = await collectRoutingDiagnostics({
     requestedModel: model,
     headerAgentId: selectedAgent?.openClawAgentId?.trim(),
@@ -1446,7 +1477,11 @@ async function callLlmForEvent(params: {
     extraHeaders: headers,
     executor: deps.executor,
     logger: deps.logger,
-    timeoutMs: getLlmTimeoutMs(),
+    timeoutMs: computeAffinityTimeout({
+      phase: affinityPhase,
+      toolCount: tools.length,
+      baseTimeoutMs: getLlmTimeoutMs(),
+    }),
     toolChoice: enableToolsForTurn ? 'auto' : 'none',
     defaultGoogleAuthProfile: meta.googleAuthProfile,
     talkId,
@@ -1463,6 +1498,25 @@ async function callLlmForEvent(params: {
     `ModelRoute trace=${traceId} flow=slack-ingress-complete talkId=${talkId} eventId=${event.eventId} `
     + `responseModel=${result.responseModel?.trim() || '-'} chars=${reply.length}`,
   );
+
+  // Fire-and-forget: record tool affinity observation
+  if (!isAffinityDisabled()) {
+    try {
+      const usedToolNames = result.executedTools.map((t) => t.executedName);
+      const affinityStore = getToolAffinityStore(deps.dataDir, deps.logger);
+      affinityStore.recordObservation(talkId, {
+        timestamp: Date.now(),
+        intent: affinityIntent,
+        availableTools: tools.map((t) => t.function.name),
+        usedTools: [...new Set(usedToolNames)],
+        toolsOffered: tools.length,
+        model: result.responseModel?.trim() || model,
+        source: 'slack-ingress',
+      });
+    } catch {
+      // non-critical
+    }
+  }
 
   return {
     reply,

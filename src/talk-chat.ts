@@ -33,6 +33,13 @@ import {
 import { isTransientError } from './tool-loop.js';
 import { isOpenClawNativeGoogleTool } from './openclaw-native-tools.js';
 import { assertRoutingHeaders, RoutingGuardError } from './routing-headers.js';
+import {
+  getToolAffinityStore,
+  isAffinityDisabled,
+  classifyMessageIntent,
+  computeAffinityTimeout,
+  type ToolAffinityObservation,
+} from './tool-affinity.js';
 
 /** Maximum number of history messages to include in LLM context. */
 const MAX_CONTEXT_MESSAGES = 50;
@@ -1276,9 +1283,34 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
     hasPolicyBlockedTools,
   });
   const enabledToolNames = new Set(availableToolInfos.map((tool) => tool.name.toLowerCase()));
-  const tools = disableTools
+  let tools = disableTools
     ? []
     : registry.getToolSchemas().filter((tool) => enabledToolNames.has(tool.function.name.toLowerCase()));
+  // --- Tool Affinity filtering ---
+  let affinityPhase: import('./tool-affinity.js').AffinityPhase = 'warmup';
+  let affinityIntent: string | undefined;
+  if (!disableTools && tools.length > 0 && !isAffinityDisabled()) {
+    const affinityStore = getToolAffinityStore(dataDir, logger);
+    affinityIntent = classifyMessageIntent(body.message);
+    const snapshot = affinityStore.getSnapshot(talkId);
+    const selection = affinityStore.selectTools({
+      talkId,
+      intent: affinityIntent,
+      policyAllowedTools: tools.map((t) => t.function.name),
+      snapshot,
+    });
+    affinityPhase = selection.phase;
+    if (selection.prunedTools.length > 0) {
+      const kept = new Set(selection.selectedTools.map((n) => n.toLowerCase()));
+      tools = tools.filter((t) => kept.has(t.function.name.toLowerCase()));
+    }
+    logger.info(
+      `ToolAffinity flow=talk-chat intent=${affinityIntent} phase=${selection.phase} `
+      + `selected=${selection.selectedTools.length}/${selection.selectedTools.length + selection.prunedTools.length} `
+      + `pruned=${selection.prunedTools.join(',') || '-'} reason=${selection.reason}`,
+    );
+  }
+
   logger.info(
     `TalkChat: tool availability talkId=${talkId} enabled=${!disableTools} count=${tools.length} names=${tools.map((t) => t.function.name).join(',') || '-'}`,
   );
@@ -1495,7 +1527,11 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
       logger,
       clientSignal: clientAbort.signal,
       traceId,
-      firstTokenTimeoutMs: resolveTalkFirstTokenTimeoutMs(),
+      firstTokenTimeoutMs: computeAffinityTimeout({
+        phase: affinityPhase,
+        toolCount: tools.length,
+        baseTimeoutMs: resolveTalkFirstTokenTimeoutMs(),
+      }),
       timeoutMs: resolveTalkInactivityTimeoutMs(),
       maxTotalMs: resolveTalkTotalTimeoutMs(),
       maxIterations,
@@ -1511,6 +1547,28 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
     fullContent = result.fullContent;
     responseModel = result.responseModel;
     toolCallMessages = result.toolCallMessages;
+
+    // Fire-and-forget: record tool affinity observation
+    if (affinityIntent && !isAffinityDisabled()) {
+      try {
+        const usedToolNames = toolCallMessages
+          .filter((msg) => msg.role === 'tool' && msg.name)
+          .map((msg) => msg.name as string);
+        const affinityStore = getToolAffinityStore(dataDir, logger);
+        affinityStore.recordObservation(talkId, {
+          timestamp: Date.now(),
+          intent: affinityIntent,
+          availableTools: tools.map((t) => t.function.name),
+          usedTools: [...new Set(usedToolNames)],
+          toolsOffered: tools.length,
+          model: responseModel || model,
+          source: 'talk-chat',
+        });
+      } catch {
+        // non-critical — don't affect message processing
+      }
+    }
+
     logger.info(
       `ModelRoute trace=${traceId} flow=talk-chat-complete talkId=${talkId} responseModel=${responseModel ?? '-'} chars=${fullContent.length}`,
     );
