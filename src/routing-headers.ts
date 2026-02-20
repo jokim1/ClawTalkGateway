@@ -44,12 +44,13 @@ export function assertRoutingHeaders(params: {
     });
   }
 
-  if (hasValue(params.headers['x-openclaw-session-key'])) {
+  const sessionKey = params.headers['x-openclaw-session-key'];
+  if (hasValue(sessionKey) && sessionKey!.trim().startsWith('agent:')) {
     throw new RoutingGuardError({
       code: 'ROUTING_GUARD_FORBIDDEN_SESSION_KEY',
       flow: params.flow,
       executionMode: params.executionMode,
-      message: `routing_guard_forbidden_session_key: flow=${params.flow} executionMode=${params.executionMode}`,
+      message: `routing_guard_forbidden_session_key: flow=${params.flow} executionMode=${params.executionMode} (agent-prefixed key not allowed in full_control)`,
     });
   }
 }

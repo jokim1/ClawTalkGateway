@@ -1370,10 +1370,12 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
   const extraHeaders: Record<string, string> = {
     'x-openclaw-trace-id': traceId,
   };
-  if (talkExecutionMode !== 'full_control') {
-    const sessionKey = buildTalkSessionKey(talkId, resolvedSessionAgentId, runScopedSessionPart);
-    extraHeaders['x-openclaw-session-key'] = sessionKey;
-  }
+  // Always send session key. In full_control mode the key has no `agent:` prefix,
+  // so OpenClaw treats it as legacy_or_alias and skips embedded agent activation.
+  const sessionKey = talkExecutionMode === 'full_control'
+    ? buildFullControlTalkSessionKey(talkId, runScopedSessionPart)
+    : buildTalkSessionKey(talkId, resolvedSessionAgentId, runScopedSessionPart);
+  extraHeaders['x-openclaw-session-key'] = sessionKey;
   // In full_control mode, suppress agent-id header so OpenClaw doesn't activate
   // its embedded agent. Model routing happens via the `model` param instead.
   if (talkExecutionMode !== 'full_control' && resolvedHeaderAgentId?.trim()) {

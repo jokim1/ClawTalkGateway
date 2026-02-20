@@ -24,14 +24,25 @@ describe('routing header guard', () => {
     })).toThrow(RoutingGuardError);
   });
 
-  it('blocks session key header in full_control mode', () => {
+  it('blocks agent-prefixed session key in full_control mode', () => {
     expect(() => assertRoutingHeaders({
       flow: 'slack-ingress',
       executionMode: 'full_control',
       headers: {
         'x-openclaw-trace-id': 't1',
-        'x-openclaw-session-key': 'job:clawtalk:foo',
+        'x-openclaw-session-key': 'agent:main:clawtalk:foo',
       },
     })).toThrow(RoutingGuardError);
+  });
+
+  it('allows non-agent session key in full_control mode', () => {
+    expect(() => assertRoutingHeaders({
+      flow: 'slack-ingress',
+      executionMode: 'full_control',
+      headers: {
+        'x-openclaw-trace-id': 't1',
+        'x-openclaw-session-key': 'talk:clawtalk:talk:abc:slack:channel:C123:thread:t1',
+      },
+    })).not.toThrow();
   });
 });

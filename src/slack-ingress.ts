@@ -1416,10 +1416,9 @@ async function callLlmForEvent(params: {
   if (event.accountId?.trim()) {
     headers['x-openclaw-account-id'] = event.accountId.trim();
   }
-  // In full_control mode, avoid OpenClaw embedded runtime routing so gateway tools remain callable.
-  if (talkExecutionMode !== 'full_control') {
-    headers['x-openclaw-session-key'] = sessionKey;
-  }
+  // Always send session key. In full_control mode the key has no `agent:` prefix,
+  // so OpenClaw treats it as legacy_or_alias and skips embedded agent activation.
+  headers['x-openclaw-session-key'] = sessionKey;
   if (talkExecutionMode === 'openclaw' && resolvedHeaderAgentId?.trim()) {
     headers['x-openclaw-agent-id'] = resolvedHeaderAgentId.trim();
   }
