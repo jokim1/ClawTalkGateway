@@ -43,7 +43,7 @@ import { reconcileSlackRoutingForTalks } from './slack-routing-sync.js';
 import { reconcileAnthropicProxyBaseUrls, reconcileGatewayResponsesEndpoint } from './provider-baseurl-sync.js';
 import { registerOpenClawNativeGoogleTools } from './openclaw-native-tools.js';
 import { listSlackAccountIds, resolveSlackBotTokenForAccount } from './slack-auth.js';
-import { handleSlackEventProxy, resolveOpenClawWebhookUrl } from './slack-event-proxy.js';
+import { handleSlackEventProxy } from './slack-event-proxy.js';
 import { checkSlackProxySetup, logSlackProxySetupStatus } from './slack-proxy-setup.js';
 
 // ---------------------------------------------------------------------------
@@ -1387,13 +1387,33 @@ const plugin = {
             break;
           }
           case '/api/events/slack/proxy-setup': {
-            if (req.method !== 'GET') {
-              sendJson(res, 405, { error: 'Method not allowed' });
+            if (req.method === 'GET') {
+              const setupCfg = api.runtime.config.loadConfig();
+              const setupStatus = checkSlackProxySetup(talkStore, setupCfg);
+              sendJson(res, 200, setupStatus);
               break;
             }
-            const setupCfg = api.runtime.config.loadConfig();
-            const setupStatus = checkSlackProxySetup(talkStore, setupCfg);
-            sendJson(res, 200, setupStatus);
+            if (req.method === 'POST') {
+              // Save signing secret from client-side setup wizard
+              const body = await readJsonBody(req) as Record<string, unknown>;
+              const signingSecret = typeof body.signingSecret === 'string' ? body.signingSecret.trim() : '';
+              if (!signingSecret) {
+                sendJson(res, 400, { error: 'signingSecret is required' });
+                break;
+              }
+              try {
+                const { saveSlackSigningSecret } = await import('./slack-proxy-setup.js');
+                await saveSlackSigningSecret(signingSecret, api.logger);
+                const updatedCfg = api.runtime.config.loadConfig();
+                const updatedStatus = checkSlackProxySetup(talkStore, updatedCfg);
+                sendJson(res, 200, { ok: true, status: updatedStatus });
+              } catch (err) {
+                api.logger.warn(`proxy-setup POST failed: ${String(err)}`);
+                sendJson(res, 500, { error: 'Failed to save signing secret' });
+              }
+              break;
+            }
+            sendJson(res, 405, { error: 'Method not allowed' });
             break;
           }
           case '/api/events/slack': {
@@ -1442,7 +1462,6 @@ const plugin = {
               store: talkStore,
               logger: api.logger,
               getConfig: () => api.runtime.config.loadConfig(),
-              openclawWebhookUrl: resolveOpenClawWebhookUrl(cfg),
               buildIngressDeps: () => ({
                 ...buildSlackIngressDeps(),
                 gatewayOrigin,

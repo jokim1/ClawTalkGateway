@@ -33,8 +33,6 @@ export type SlackEventProxyDeps = {
   store: TalkStore;
   logger: Logger;
   getConfig: () => Record<string, unknown>;
-  /** Full URL of OpenClaw's Slack HTTP webhook, e.g. http://127.0.0.1:3000/slack/events */
-  openclawWebhookUrl: string;
   /** Build the deps object needed by routeSlackIngressEvent */
   buildIngressDeps: () => SlackIngressDeps;
 };
@@ -114,42 +112,100 @@ function readRawBody(req: IncomingMessage, maxBytes = 512 * 1024): Promise<Buffe
 // Config resolution helpers
 // ---------------------------------------------------------------------------
 
-export function resolveSlackSigningSecret(cfg: Record<string, unknown>): string | undefined {
-  const envSecret = process.env.GATEWAY_SLACK_SIGNING_SECRET?.trim()
-    || process.env.SLACK_SIGNING_SECRET?.trim();
-  if (envSecret) return envSecret;
+type AccountSecret = { accountId: string; secret: string };
 
-  const gw = cfg.gateway && typeof cfg.gateway === 'object'
-    ? cfg.gateway as Record<string, unknown> : null;
-  const gwSlack = gw?.slack && typeof gw.slack === 'object'
-    ? gw.slack as Record<string, unknown> : null;
-  const gwSecret = gwSlack?.signingSecret;
-  if (typeof gwSecret === 'string' && gwSecret.trim()) return gwSecret.trim();
+/**
+ * Collect all configured signing secrets mapped to their accountId.
+ * Resolution order:
+ *   1. Per-account secrets (channels.slack.accounts.{id}.signingSecret)
+ *   2. Base-level secret (channels.slack.signingSecret) applied to 'default' account
+ *   3. Env var fallback (GATEWAY_SLACK_SIGNING_SECRET or SLACK_SIGNING_SECRET) applied to 'default'
+ *
+ * Returns deduplicated list; a secret appears only once (first accountId wins).
+ */
+export function collectSigningSecrets(cfg: Record<string, unknown>): AccountSecret[] {
+  const result: AccountSecret[] = [];
+  const seenSecrets = new Set<string>();
 
   const channels = cfg.channels && typeof cfg.channels === 'object'
     ? cfg.channels as Record<string, unknown> : null;
   const chSlack = channels?.slack && typeof channels.slack === 'object'
     ? channels.slack as Record<string, unknown> : null;
-  const chSecret = chSlack?.signingSecret;
-  if (typeof chSecret === 'string' && chSecret.trim()) return chSecret.trim();
 
+  // 1. Per-account secrets (highest specificity)
   const accounts = chSlack?.accounts;
   if (accounts && typeof accounts === 'object') {
-    for (const acc of Object.values(accounts as Record<string, unknown>)) {
+    for (const [accountId, acc] of Object.entries(accounts as Record<string, unknown>)) {
       if (acc && typeof acc === 'object') {
         const s = (acc as Record<string, unknown>).signingSecret;
-        if (typeof s === 'string' && s.trim()) return s.trim();
+        if (typeof s === 'string' && s.trim() && !seenSecrets.has(s.trim())) {
+          seenSecrets.add(s.trim());
+          result.push({ accountId: accountId.trim().toLowerCase() || 'default', secret: s.trim() });
+        }
       }
     }
   }
 
-  return undefined;
+  // 2. Base-level secret (channels.slack.signingSecret)
+  const chSecret = chSlack?.signingSecret;
+  if (typeof chSecret === 'string' && chSecret.trim() && !seenSecrets.has(chSecret.trim())) {
+    seenSecrets.add(chSecret.trim());
+    result.push({ accountId: 'default', secret: chSecret.trim() });
+  }
+
+  // 3. Env var fallback
+  const envSecret = process.env.GATEWAY_SLACK_SIGNING_SECRET?.trim()
+    || process.env.SLACK_SIGNING_SECRET?.trim();
+  if (envSecret && !seenSecrets.has(envSecret)) {
+    result.push({ accountId: 'default', secret: envSecret });
+  }
+
+  return result;
 }
 
-export function resolveOpenClawWebhookUrl(cfg: Record<string, unknown>): string {
+/**
+ * Verify a Slack request signature against all configured signing secrets.
+ * Returns the accountId of the matching secret, or null if none match.
+ */
+export function verifyAndResolveAccount(
+  cfg: Record<string, unknown>,
+  timestamp: string,
+  rawBody: Buffer,
+  signature: string,
+): { accountId: string } | null {
+  const secrets = collectSigningSecrets(cfg);
+  for (const { accountId, secret } of secrets) {
+    if (verifySlackSignature(secret, timestamp, rawBody, signature)) {
+      return { accountId };
+    }
+  }
+  return null;
+}
+
+/** @deprecated Use collectSigningSecrets + verifyAndResolveAccount instead */
+export function resolveSlackSigningSecret(cfg: Record<string, unknown>): string | undefined {
+  const secrets = collectSigningSecrets(cfg);
+  return secrets[0]?.secret;
+}
+
+/**
+ * Resolve the OpenClaw webhook URL for forwarding Slack events.
+ *
+ * Priority:
+ *   1. Env var GATEWAY_SLACK_OPENCLAW_WEBHOOK_URL (override for all accounts)
+ *   2. Config gateway.slack.openclawWebhookUrl (override for all accounts)
+ *   3. Per-account webhookPath from channels.slack.accounts.{accountId}.webhookPath
+ *   4. Default: http://127.0.0.1:{port}/slack/events
+ */
+export function resolveOpenClawWebhookUrl(
+  cfg: Record<string, unknown>,
+  accountId?: string,
+): string {
+  // 1. Env var override (applies to all accounts)
   const envUrl = process.env.GATEWAY_SLACK_OPENCLAW_WEBHOOK_URL?.trim();
   if (envUrl) return envUrl;
 
+  // 2. Config-level override (applies to all accounts)
   const gw = cfg.gateway && typeof cfg.gateway === 'object'
     ? cfg.gateway as Record<string, unknown> : null;
   const gwSlack = gw?.slack && typeof gw.slack === 'object'
@@ -157,34 +213,59 @@ export function resolveOpenClawWebhookUrl(cfg: Record<string, unknown>): string 
   const cfgUrl = gwSlack?.openclawWebhookUrl;
   if (typeof cfgUrl === 'string' && cfgUrl.trim()) return cfgUrl.trim();
 
+  // 3. Resolve per-account webhookPath from OpenClaw config
   const openclawPort = process.env.OPENCLAW_HTTP_PORT?.trim() || '3000';
-  return `http://127.0.0.1:${openclawPort}/slack/events`;
+  const baseUrl = `http://127.0.0.1:${openclawPort}`;
+
+  if (accountId) {
+    const channels = cfg.channels && typeof cfg.channels === 'object'
+      ? cfg.channels as Record<string, unknown> : null;
+    const chSlack = channels?.slack && typeof channels.slack === 'object'
+      ? channels.slack as Record<string, unknown> : null;
+    const accounts = chSlack?.accounts;
+    if (accounts && typeof accounts === 'object') {
+      const acc = (accounts as Record<string, unknown>)[accountId];
+      if (acc && typeof acc === 'object') {
+        const webhookPath = (acc as Record<string, unknown>).webhookPath;
+        if (typeof webhookPath === 'string' && webhookPath.trim()) {
+          const p = webhookPath.trim();
+          return `${baseUrl}${p.startsWith('/') ? p : '/' + p}`;
+        }
+      }
+    }
+  }
+
+  // 4. Default path
+  return `${baseUrl}/slack/events`;
 }
 
 // ---------------------------------------------------------------------------
 // Convert raw Slack Events API payload to SlackIngressEvent body
 // ---------------------------------------------------------------------------
 
-function buildEventIdFromSlack(payload: SlackEventsApiPayload): string {
+function buildEventIdFromSlack(payload: SlackEventsApiPayload, accountId: string): string {
   const evt = payload.event;
-  if (!evt) return `slack:unknown:${Date.now()}`;
+  if (!evt) return `slack:${accountId}:unknown:${Date.now()}`;
   const channelId = evt.channel ?? 'unknown';
   const ts = evt.ts ?? evt.event_ts ?? String(Date.now());
-  return `slack:default:${channelId}:${ts}`;
+  return `slack:${accountId}:${channelId}:${ts}`;
 }
 
-function slackPayloadToIngressBody(payload: SlackEventsApiPayload): Record<string, unknown> | null {
+function slackPayloadToIngressBody(
+  payload: SlackEventsApiPayload,
+  accountId: string,
+): Record<string, unknown> | null {
   const evt = payload.event;
-  if (!evt?.channel || !evt?.text) return null;
+  if (!evt?.channel) return null;
 
   return {
-    eventId: buildEventIdFromSlack(payload),
-    accountId: 'default',
+    eventId: buildEventIdFromSlack(payload, accountId),
+    accountId,
     channelId: evt.channel,
     threadTs: evt.thread_ts,
     messageTs: evt.ts,
     userId: evt.user,
-    text: evt.text,
+    text: evt.text ?? '',
   };
 }
 
@@ -192,34 +273,64 @@ function slackPayloadToIngressBody(payload: SlackEventsApiPayload): Record<strin
 // Forward raw Slack event to OpenClaw's HTTP webhook
 // ---------------------------------------------------------------------------
 
+const FORWARD_MAX_RETRIES = 2;
+const FORWARD_RETRY_BASE_MS = 500;
+
+async function forwardToOpenClawOnce(
+  rawBody: Buffer,
+  originalHeaders: Record<string, string>,
+  openclawUrl: string,
+): Promise<{ status: number; body: unknown }> {
+  const resp = await undiciRequest(openclawUrl, {
+    method: 'POST',
+    headers: {
+      'content-type': originalHeaders['content-type'] || 'application/json',
+      'x-slack-signature': originalHeaders['x-slack-signature'] || '',
+      'x-slack-request-timestamp': originalHeaders['x-slack-request-timestamp'] || '',
+    },
+    body: rawBody,
+    headersTimeout: 10_000,
+    bodyTimeout: 30_000,
+  });
+  const text = await resp.body.text();
+  let body: unknown;
+  try { body = JSON.parse(text); } catch { body = text; }
+  return { status: resp.statusCode, body };
+}
+
 async function forwardToOpenClaw(
   rawBody: Buffer,
   originalHeaders: Record<string, string>,
   openclawUrl: string,
   logger: Logger,
 ): Promise<{ status: number; body: unknown }> {
-  try {
-    const resp = await undiciRequest(openclawUrl, {
-      method: 'POST',
-      headers: {
-        'content-type': originalHeaders['content-type'] || 'application/json',
-        'x-slack-signature': originalHeaders['x-slack-signature'] || '',
-        'x-slack-request-timestamp': originalHeaders['x-slack-request-timestamp'] || '',
-      },
-      body: rawBody,
-      headersTimeout: 10_000,
-      bodyTimeout: 30_000,
-    });
-    const text = await resp.body.text();
-    let body: unknown;
-    try { body = JSON.parse(text); } catch { body = text; }
-    return { status: resp.statusCode, body };
-  } catch (err) {
-    logger.warn(
-      `SlackEventProxy: failed to forward to OpenClaw at ${openclawUrl}: ${String(err)}`,
-    );
-    return { status: 502, body: { error: 'Failed to reach OpenClaw' } };
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= FORWARD_MAX_RETRIES; attempt++) {
+    try {
+      const result = await forwardToOpenClawOnce(rawBody, originalHeaders, openclawUrl);
+      // Retry on 5xx server errors (OpenClaw may be restarting)
+      if (result.status >= 500 && attempt < FORWARD_MAX_RETRIES) {
+        logger.debug(
+          `SlackEventProxy: OpenClaw returned ${result.status}, retrying (${attempt + 1}/${FORWARD_MAX_RETRIES})`,
+        );
+        await new Promise(r => setTimeout(r, FORWARD_RETRY_BASE_MS * (attempt + 1)));
+        continue;
+      }
+      return result;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < FORWARD_MAX_RETRIES) {
+        logger.debug(
+          `SlackEventProxy: forward attempt ${attempt + 1} failed, retrying: ${String(err)}`,
+        );
+        await new Promise(r => setTimeout(r, FORWARD_RETRY_BASE_MS * (attempt + 1)));
+      }
+    }
   }
+  logger.warn(
+    `SlackEventProxy: failed to forward to OpenClaw at ${openclawUrl} after ${FORWARD_MAX_RETRIES + 1} attempts: ${String(lastErr)}`,
+  );
+  return { status: 502, body: { error: 'Failed to reach OpenClaw' } };
 }
 
 // ---------------------------------------------------------------------------
@@ -245,22 +356,26 @@ export async function handleSlackEventProxy(
     return;
   }
 
-  // 2. Verify Slack request signature
+  // 2. Verify Slack request signature and resolve accountId
   const cfg = deps.getConfig();
-  const signingSecret = resolveSlackSigningSecret(cfg);
-  if (!signingSecret) {
+  const slackSignature = (req.headers['x-slack-signature'] as string) ?? '';
+  const slackTimestamp = (req.headers['x-slack-request-timestamp'] as string) ?? '';
+
+  const secrets = collectSigningSecrets(cfg);
+  if (secrets.length === 0) {
     deps.logger.warn('SlackEventProxy: no signing secret configured — rejecting request');
     sendJson(res, 500, { error: 'Slack signing secret not configured' });
     return;
   }
 
-  const slackSignature = (req.headers['x-slack-signature'] as string) ?? '';
-  const slackTimestamp = (req.headers['x-slack-request-timestamp'] as string) ?? '';
-  if (!verifySlackSignature(signingSecret, slackTimestamp, rawBody, slackSignature)) {
+  const verified = verifyAndResolveAccount(cfg, slackTimestamp, rawBody, slackSignature);
+  if (!verified) {
     deps.logger.warn('SlackEventProxy: invalid Slack signature — rejecting request');
     sendJson(res, 401, { error: 'Invalid Slack signature' });
     return;
   }
+
+  const resolvedAccountId = verified.accountId;
 
   // 3. Parse JSON payload
   let payload: SlackEventsApiPayload;
@@ -284,9 +399,12 @@ export async function handleSlackEventProxy(
     'x-slack-request-timestamp': slackTimestamp,
   };
 
+  // Resolve the OpenClaw webhook URL for this account (may differ per account's webhookPath)
+  const openclawUrl = resolveOpenClawWebhookUrl(cfg, resolvedAccountId);
+
   // 5. Only route event_callback payloads; forward everything else to OpenClaw
   if (payload.type !== 'event_callback') {
-    void forwardToOpenClaw(rawBody, originalHeaders, deps.openclawWebhookUrl, deps.logger);
+    void forwardToOpenClaw(rawBody, originalHeaders, openclawUrl, deps.logger);
     sendJson(res, 200, { ok: true, forwarded: true });
     return;
   }
@@ -294,7 +412,7 @@ export async function handleSlackEventProxy(
   // 6. Skip bot messages to prevent reply loops
   if (payload.event?.bot_id || payload.event?.subtype === 'bot_message') {
     // Still forward to OpenClaw — it may have bot-message handling
-    void forwardToOpenClaw(rawBody, originalHeaders, deps.openclawWebhookUrl, deps.logger);
+    void forwardToOpenClaw(rawBody, originalHeaders, openclawUrl, deps.logger);
     sendJson(res, 200, { ok: true, skipped: 'bot_message' });
     return;
   }
@@ -306,9 +424,9 @@ export async function handleSlackEventProxy(
   if (isMessage && payload.event?.channel) {
     // Check if any ClawTalk Talk owns this channel
     const minimalEvent = {
-      eventId: buildEventIdFromSlack(payload),
+      eventId: buildEventIdFromSlack(payload, resolvedAccountId),
       channelId: payload.event.channel,
-      accountId: 'default',
+      accountId: resolvedAccountId,
       text: payload.event.text ?? '',
     };
 
@@ -325,7 +443,7 @@ export async function handleSlackEventProxy(
       sendJson(res, 200, { ok: true, routed: 'clawtalk', talkId: ownership.talkId });
 
       // Feed into the existing ingress pipeline (async, non-blocking)
-      const ingressBody = slackPayloadToIngressBody(payload);
+      const ingressBody = slackPayloadToIngressBody(payload, resolvedAccountId);
       if (ingressBody) {
         const parsed = parseSlackIngressEvent(ingressBody);
         if (parsed) {
@@ -350,6 +468,6 @@ export async function handleSlackEventProxy(
   );
 
   // Fire-and-forget forward; ack Slack immediately
-  void forwardToOpenClaw(rawBody, originalHeaders, deps.openclawWebhookUrl, deps.logger);
+  void forwardToOpenClaw(rawBody, originalHeaders, openclawUrl, deps.logger);
   sendJson(res, 200, { ok: true, routed: 'openclaw' });
 }

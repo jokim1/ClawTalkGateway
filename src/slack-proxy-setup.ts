@@ -5,9 +5,11 @@
  * clear, actionable instructions when setup steps are missing.
  */
 
+import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
 import type { TalkStore } from './talk-store.js';
 import type { Logger, PlatformBinding } from './types.js';
-import { resolveSlackSigningSecret, resolveOpenClawWebhookUrl } from './slack-event-proxy.js';
+import { collectSigningSecrets, resolveOpenClawWebhookUrl } from './slack-event-proxy.js';
 
 // ---------------------------------------------------------------------------
 // Setup status types
@@ -81,8 +83,8 @@ export function checkSlackProxySetup(
   cfg: Record<string, unknown>,
 ): SlackProxySetupStatus {
   const hasSlackBindings = talksHaveSlackBindings(store);
-  const signingSecret = resolveSlackSigningSecret(cfg);
-  const signingSecretConfigured = !!signingSecret;
+  const signingSecrets = collectSigningSecrets(cfg);
+  const signingSecretConfigured = signingSecrets.length > 0;
   const openclawWebhookUrl = resolveOpenClawWebhookUrl(cfg);
   const gatewayProxyUrl = resolveGatewayProxyUrl(cfg);
 
@@ -128,10 +130,20 @@ export function checkSlackProxySetup(
       ].join('\n'),
       url: 'https://api.slack.com/apps',
     });
+
+    pendingSteps.push({
+      id: 'restart_openclaw',
+      title: 'Restart OpenClaw',
+      instructions: [
+        'OpenClaw does not hot-reload Slack connection settings.',
+        'After completing the steps above, restart OpenClaw so it picks up',
+        'the new HTTP mode and signing secret from openclaw.json.',
+      ].join('\n'),
+    });
   }
 
   return {
-    ready: hasSlackBindings && signingSecretConfigured && pendingSteps.length <= 1,
+    ready: hasSlackBindings && signingSecretConfigured && pendingSteps.every(s => s.id === 'request_url' || s.id === 'restart_openclaw'),
     slackBindingsDetected: hasSlackBindings,
     signingSecretConfigured,
     openclawWebhookUrl,
@@ -163,8 +175,9 @@ export function logSlackProxySetupStatus(
     return status;
   }
 
-  // Count only the steps that are truly pending (request_url is always shown as info)
-  const blockers = status.pendingSteps.filter(s => s.id !== 'request_url');
+  // Count only the steps that are truly pending (request_url and restart_openclaw are informational)
+  const infoStepIds = new Set(['request_url', 'restart_openclaw']);
+  const blockers = status.pendingSteps.filter(s => !infoStepIds.has(s.id));
   if (blockers.length === 0 && status.signingSecretConfigured) {
     logger.info(
       `ClawTalk: Slack event proxy ready — ensure your Slack app Request URL points to: ${status.gatewayProxyUrl}`,
@@ -204,4 +217,91 @@ export function logSlackProxySetupStatus(
   logger.warn('');
 
   return status;
+}
+
+// ---------------------------------------------------------------------------
+// Save signing secret to openclaw.json (used by client-side setup wizard)
+// ---------------------------------------------------------------------------
+
+function ensureObjectPath(root: Record<string, unknown>, key: string): Record<string, unknown> {
+  const value = root[key];
+  if (value && typeof value === 'object') return value as Record<string, unknown>;
+  const obj: Record<string, unknown> = {};
+  root[key] = obj;
+  return obj;
+}
+
+/**
+ * Save a Slack signing secret to openclaw.json.
+ *
+ * If `accountId` is provided, writes to `channels.slack.accounts.{accountId}.signingSecret`.
+ * Otherwise writes to the base-level `channels.slack.signingSecret` AND propagates to
+ * any existing per-account configs that don't already have their own signing secret.
+ * This ensures `collectSigningSecrets()` can map the correct accountId for verification.
+ */
+export async function saveSlackSigningSecret(
+  signingSecret: string,
+  logger: Logger,
+  accountId?: string,
+): Promise<void> {
+  const configPath = path.join(process.env.HOME ?? '', '.openclaw', 'openclaw.json');
+  if (!configPath || configPath === '.openclaw/openclaw.json') {
+    throw new Error('Cannot resolve openclaw.json path');
+  }
+
+  let raw: string;
+  try {
+    raw = await fs.readFile(configPath, 'utf-8');
+  } catch {
+    // File doesn't exist — create a minimal config
+    raw = '{}';
+  }
+
+  let cfg: Record<string, unknown>;
+  try {
+    cfg = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    throw new Error('Invalid openclaw.json — cannot parse');
+  }
+
+  const channels = ensureObjectPath(cfg, 'channels');
+  const chSlack = ensureObjectPath(channels, 'slack');
+
+  if (accountId && accountId !== 'default') {
+    // Write to specific account path
+    const accounts = ensureObjectPath(chSlack, 'accounts');
+    const accObj = ensureObjectPath(accounts, accountId);
+    accObj.signingSecret = signingSecret;
+    logger.info(`ClawTalk: saving Slack signing secret for account "${accountId}"`);
+  } else {
+    // Write to base-level (fallback for all accounts)
+    chSlack.signingSecret = signingSecret;
+
+    // Also propagate to existing per-account configs that lack a signing secret,
+    // so collectSigningSecrets() can map them to the correct accountId.
+    const accounts = chSlack.accounts;
+    if (accounts && typeof accounts === 'object') {
+      for (const [accId, acc] of Object.entries(accounts as Record<string, unknown>)) {
+        if (acc && typeof acc === 'object') {
+          const existing = (acc as Record<string, unknown>).signingSecret;
+          if (!existing || (typeof existing === 'string' && !existing.trim())) {
+            (acc as Record<string, unknown>).signingSecret = signingSecret;
+            logger.info(`ClawTalk: propagated signing secret to account "${accId}"`);
+          }
+        }
+      }
+    }
+  }
+
+  const next = `${JSON.stringify(cfg, null, 2)}\n`;
+  if (next === raw) return;
+
+  // Ensure directory exists
+  const dir = path.dirname(configPath);
+  await fs.mkdir(dir, { recursive: true });
+
+  const tmpPath = `${configPath}.tmp.${Date.now()}`;
+  await fs.writeFile(tmpPath, next, 'utf-8');
+  await fs.rename(tmpPath, configPath);
+  logger.info('ClawTalk: saved Slack signing secret to openclaw.json');
 }
