@@ -26,7 +26,7 @@ export type SlackIngressEvent = {
   userName?: string;
   /**
    * Expected OpenClaw outbound target for this conversation (e.g. channel:C123, user:U123).
-   * Used to suppress OpenClaw replies when ClawTalk owns the event.
+   * Used for Talk ownership resolution via binding scope matching.
    */
   outboundTarget?: string;
   text: string;
@@ -41,43 +41,12 @@ type SeenDecision = {
 
 
 type SlackIngressTalkCounters = {
-  handled: number;
   passed: number;
-  queueOverflow: number;
-  delivered: number;
-  failed: number;
-  retries: number;
 };
 
 export type SlackIngressTalkRuntimeSnapshot = {
   talkId: string;
-  inflight: number;
   counters: SlackIngressTalkCounters;
-  recentEvents: Array<{
-    eventId: string;
-    accountId?: string;
-    channelId: string;
-    state: 'queued' | 'running' | 'retrying' | 'done' | 'failed';
-    attempt: number;
-    retries: number;
-    queuedAt: number;
-    startedAt?: number;
-    finishedAt?: number;
-    replySent: boolean;
-    persisted: boolean;
-    lastError?: string;
-    lastErrorAt?: number;
-    phases: Array<{
-      ts: number;
-      phase: string;
-      attempt: number;
-      attemptToken: string;
-      elapsedMs?: number;
-      failurePhase?: string;
-      errorCode?: string;
-      errorMessage?: string;
-    }>;
-  }>;
 };
 
 export type SlackIngressDeps = {
@@ -130,7 +99,6 @@ export type SlackOwnershipDecision = {
   eventId: string;
   talkId?: string;
   reason?: string;
-  queued?: boolean;
   duplicate?: boolean;
 };
 
@@ -232,14 +200,7 @@ function buildDefaultOutboundTarget(channelId: string): string {
 function getTalkCounters(talkId: string): SlackIngressTalkCounters {
   const existing = runtimeCountersByTalkId.get(talkId);
   if (existing) return existing;
-  const initial: SlackIngressTalkCounters = {
-    handled: 0,
-    passed: 0,
-    queueOverflow: 0,
-    delivered: 0,
-    failed: 0,
-    retries: 0,
-  };
+  const initial: SlackIngressTalkCounters = { passed: 0 };
   runtimeCountersByTalkId.set(talkId, initial);
   return initial;
 }
@@ -651,8 +612,7 @@ export function routeSlackIngressEvent(
     };
   }
 
-  // Check if this Talk delegates Slack handling to an OpenClaw managed agent.
-  // If so, let OpenClaw process natively — no LLM call, no suppression, no queue.
+  // All Talk-bound channels delegate to OpenClaw managed agents (ct-*).
   // The before_agent_start hook injects Talk context into the managed agent.
   const managedAgentId = buildManagedAgentId(ownership.talkId);
   const ownerTalk = deps.store.getTalk(ownership.talkId);
@@ -888,8 +848,6 @@ export function getSlackIngressTalkRuntimeSnapshot(talkId: string): SlackIngress
   const counters = getTalkCounters(talkId);
   return {
     talkId,
-    inflight: 0,
     counters: { ...counters },
-    recentEvents: [],
   };
 }

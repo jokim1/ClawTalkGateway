@@ -73,18 +73,7 @@ export function registerCommands(api: PluginApi, talkStore: TalkStore): void {
       }
 
       const slackRuntime = getSlackIngressTalkRuntimeSnapshot(talk.id);
-      const recent = slackRuntime.recentEvents[0];
-      lines.push(
-        `Channel Delivery: inflight=${slackRuntime.inflight} delivered=${slackRuntime.counters.delivered} ` +
-        `failed=${slackRuntime.counters.failed} retries=${slackRuntime.counters.retries}`,
-      );
-      lines.push('Tip: if failed > 0, check gateway endpoint /api/events/slack/status?talkId=<talk-id>');
-      if (recent) {
-        lines.push(
-          `Last Channel Event: ${recent.state} channel=${recent.channelId} attempt=${recent.attempt + 1}` +
-          `${recent.lastError ? ` error="${recent.lastError.slice(0, 120)}"` : ''}`,
-        );
-      }
+      lines.push(`Slack Events: passed=${slackRuntime.counters.passed}`);
 
       ctx.reply(lines.join('\n'));
     },

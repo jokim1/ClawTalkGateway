@@ -395,11 +395,8 @@ describe('slack ingress delegation', () => {
     expect(result.payload.decision).toBe('pass');
     expect(result.payload.reason).toBe('delegated-to-agent');
 
-    // No runtime events should be tracked for delegated events
     const runtime = getSlackIngressTalkRuntimeSnapshot(talk.id);
-    expect(runtime.recentEvents).toHaveLength(0);
     expect(runtime.counters.passed).toBe(1);
-    expect(runtime.counters.handled).toBe(0);
   });
 
   it('deduplicates delegated events', () => {

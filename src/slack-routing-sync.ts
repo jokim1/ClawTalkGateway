@@ -12,6 +12,8 @@ type DesiredBinding = {
   accountId: string;
   peer: SlackPeer;
   requireMention: boolean;
+  responseMode: 'off' | 'mentions' | 'all';
+  onMessagePrompt: string | undefined;
 };
 type ManagedAgent = {
   id: string;
@@ -82,6 +84,8 @@ function desiredSlackBindingsFromTalks(talks: TalkMeta[]): DesiredBinding[] {
         accountId,
         peer,
         requireMention: responseMode === 'mentions',
+        responseMode,
+        onMessagePrompt: behavior?.onMessagePrompt?.trim() || undefined,
       });
     }
   }
@@ -259,6 +263,11 @@ export async function reconcileSlackRoutingForTalks(
     const accountChannels = ensureObjectPath(accountRoot, 'channels');
     const channelRow = ensureObjectPath(accountChannels, entry.peer.id);
     channelRow.requireMention = entry.requireMention;
+    if (entry.responseMode === 'off' || !entry.onMessagePrompt) {
+      delete channelRow.systemPrompt;
+    } else {
+      channelRow.systemPrompt = entry.onMessagePrompt;
+    }
   }
 
   // Propagate signing secret to accounts that are already in HTTP mode.
