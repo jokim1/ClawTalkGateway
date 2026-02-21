@@ -2,11 +2,33 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import type { Logger, PlatformBinding, TalkMeta } from './types.js';
 
-const CLAWTALK_AGENT_ID = 'clawtalk';
+const MANAGED_AGENT_PREFIX = 'ct-';
 const DEFAULT_ACCOUNT_ID = 'default';
 
 type SlackPeer = { kind: 'channel' | 'user'; id: string };
-type DesiredBinding = { accountId: string; peer: SlackPeer; requireMention: boolean };
+type DesiredBinding = {
+  talkId: string;
+  agentId: string;
+  accountId: string;
+  peer: SlackPeer;
+  requireMention: boolean;
+};
+type ManagedAgent = {
+  id: string;
+  name: string;
+  model: string;
+  sandbox: { mode: 'off' };
+};
+
+/** Build a stable managed agent ID from a Talk ID. */
+export function buildManagedAgentId(talkId: string): string {
+  return `${MANAGED_AGENT_PREFIX}${talkId.slice(0, 8)}`;
+}
+
+/** Check if an agent ID is ClawTalk-managed. */
+export function isManagedAgentId(agentId: string): boolean {
+  return agentId.startsWith(MANAGED_AGENT_PREFIX);
+}
 
 function normalizeAccountId(value: unknown): string {
   if (typeof value !== 'string') return DEFAULT_ACCOUNT_ID;
@@ -37,6 +59,7 @@ function desiredSlackBindingsFromTalks(talks: TalkMeta[]): DesiredBinding[] {
   const seen = new Set<string>();
 
   for (const talk of talks) {
+    const agentId = buildManagedAgentId(talk.id);
     const behaviorsByBindingId = new Map(
       (talk.platformBehaviors ?? []).map((behavior) => [behavior.platformBindingId, behavior]),
     );
@@ -54,6 +77,8 @@ function desiredSlackBindingsFromTalks(talks: TalkMeta[]): DesiredBinding[] {
         behavior?.responseMode ??
         ((behavior as { autoRespond?: boolean } | undefined)?.autoRespond === false ? 'off' : 'all');
       out.push({
+        talkId: talk.id,
+        agentId,
         accountId,
         peer,
         requireMention: responseMode === 'mentions',
@@ -61,6 +86,29 @@ function desiredSlackBindingsFromTalks(talks: TalkMeta[]): DesiredBinding[] {
     }
   }
   return out;
+}
+
+function buildManagedAgentsFromTalks(
+  talks: TalkMeta[],
+  desired: DesiredBinding[],
+  defaultModel: string,
+): ManagedAgent[] {
+  const talkIds = new Set(desired.map(d => d.talkId));
+  const agents: ManagedAgent[] = [];
+  const seen = new Set<string>();
+  for (const talk of talks) {
+    if (!talkIds.has(talk.id)) continue;
+    const agentId = buildManagedAgentId(talk.id);
+    if (seen.has(agentId)) continue;
+    seen.add(agentId);
+    agents.push({
+      id: agentId,
+      name: talk.topicTitle || `ClawTalk ${agentId}`,
+      model: talk.model || defaultModel,
+      sandbox: { mode: 'off' },
+    });
+  }
+  return agents;
 }
 
 function isSlackPeerBindingRow(row: unknown): row is Record<string, unknown> {
@@ -101,7 +149,7 @@ function ensureObjectPath(root: Record<string, unknown>, key: string): Record<st
 
 function buildManagedBinding(entry: DesiredBinding): Record<string, unknown> {
   return {
-    agentId: CLAWTALK_AGENT_ID,
+    agentId: entry.agentId,
     match: {
       channel: 'slack',
       accountId: entry.accountId,
@@ -163,7 +211,8 @@ export async function reconcileSlackRoutingForTalks(
       continue;
     }
     const agentId = typeof binding.agentId === 'string' ? binding.agentId.trim().toLowerCase() : '';
-    if (agentId === CLAWTALK_AGENT_ID) {
+    // Remove stale managed bindings and legacy 'clawtalk' bindings
+    if (isManagedAgentId(agentId) || agentId === 'clawtalk') {
       continue;
     }
     retained.push(binding);
@@ -171,6 +220,34 @@ export async function reconcileSlackRoutingForTalks(
 
   const managed = desired.map((entry) => buildManagedBinding(entry));
   cfg.bindings = [...managed, ...retained];
+
+  // Merge managed agents into agents.list
+  const agentsRoot = ensureObjectPath(cfg, 'agents');
+  const existingAgentList: Record<string, unknown>[] = Array.isArray(agentsRoot.list)
+    ? (agentsRoot.list as Record<string, unknown>[])
+    : [];
+  // Read default model from agents.defaults.model.primary
+  const agentDefaults = agentsRoot.defaults && typeof agentsRoot.defaults === 'object'
+    ? agentsRoot.defaults as Record<string, unknown>
+    : {};
+  const defaultModelObj = agentDefaults.model && typeof agentDefaults.model === 'object'
+    ? agentDefaults.model as Record<string, unknown>
+    : {};
+  const defaultModel = typeof defaultModelObj.primary === 'string'
+    ? defaultModelObj.primary.trim()
+    : 'moltbot';
+  const managedAgents = buildManagedAgentsFromTalks(talks, desired, defaultModel);
+  // Keep non-managed agents, remove stale managed ones
+  const retainedAgents = existingAgentList.filter(a => {
+    const id = typeof a.id === 'string' ? a.id.trim() : '';
+    return !isManagedAgentId(id);
+  });
+  agentsRoot.list = [...retainedAgents, ...managedAgents];
+  if (managedAgents.length > 0) {
+    logger.info(
+      `ClawTalk: reconciled ${managedAgents.length} managed agents: ${managedAgents.map(a => a.id).join(', ')}`,
+    );
+  }
 
   // Ensure channels configured by talks are mention-free by default.
   const channelsRoot = ensureObjectPath(cfg, 'channels');

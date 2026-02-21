@@ -35,12 +35,10 @@ import {
   inspectSlackOwnership,
   getSlackIngressTalkRuntimeSnapshot,
   handleSlackMessageReceivedHook,
-  handleSlackMessageSendingHook,
-  hasActiveSuppressionForTarget,
 } from './slack-ingress.js';
 import { normalizeSlackBindingScope } from './talks.js';
 import { findOpenClawSlackOwnershipConflicts } from './slack-ownership-doctor.js';
-import { reconcileSlackRoutingForTalks } from './slack-routing-sync.js';
+import { reconcileSlackRoutingForTalks, buildManagedAgentId } from './slack-routing-sync.js';
 import { reconcileAnthropicProxyBaseUrls, reconcileGatewayResponsesEndpoint } from './provider-baseurl-sync.js';
 import { registerOpenClawNativeGoogleTools } from './openclaw-native-tools.js';
 import { listSlackAccountIds, resolveSlackBotTokenForAccount } from './slack-auth.js';
@@ -253,7 +251,8 @@ function resolveClawTalkAgentIds(cfg: Record<string, any>): string[] {
     const id = typeof agent.id === 'string' ? agent.id.trim() : '';
     const name = typeof agent.name === 'string' ? agent.name.trim().toLowerCase() : '';
     if (!id) continue;
-    if (name.includes('clawtalk') || id.toLowerCase().includes('clawtalk')) {
+    // Include managed agents (ct-*) and any agent with 'clawtalk' in name/id
+    if (id.startsWith('ct-') || name.includes('clawtalk') || id.toLowerCase().includes('clawtalk')) {
       ids.add(id);
     }
   }
@@ -553,6 +552,112 @@ function createEventReplyHandler(
       return false;
     }
   };
+}
+
+// ============================================================================
+// Talk Context Builder (for before_agent_start hook)
+// ============================================================================
+
+const MAX_AGENT_CONTEXT_BYTES = 8 * 1024;
+
+/**
+ * Compose a compact context block for injection into OpenClaw's agent via
+ * the `before_agent_start` hook's `prependContext` return.
+ *
+ * Includes: onMessagePrompt (instructions), objective, directives (rules),
+ * conversation context (context.md), pinned messages, and state file paths.
+ */
+async function buildTalkContextForAgent(
+  talk: import('./types.js').TalkMeta,
+  store: TalkStore,
+  logger: import('./types.js').Logger,
+): Promise<string | null> {
+  const sections: string[] = [];
+
+  sections.push('--- ClawTalk Talk Context ---');
+
+  // Instructions from platform behaviors (onMessagePrompt)
+  const slackBehaviors = (talk.platformBehaviors ?? []).filter(b => {
+    const binding = (talk.platformBindings ?? []).find(pb => pb.id === b.platformBindingId);
+    return binding?.platform.trim().toLowerCase() === 'slack';
+  });
+  const onMessagePrompts = slackBehaviors
+    .map(b => b.onMessagePrompt?.trim())
+    .filter((p): p is string => Boolean(p));
+  if (onMessagePrompts.length > 0) {
+    sections.push(`## Instructions\n${onMessagePrompts.join('\n\n')}`);
+  }
+
+  // Objective
+  if (talk.objective?.trim()) {
+    sections.push(`## Objective\n${talk.objective.trim()}`);
+  }
+
+  // Rules (active directives)
+  const activeDirectives = (talk.directives ?? []).filter(d => d.active);
+  if (activeDirectives.length > 0) {
+    const lines = activeDirectives.map((d, i) => `${i + 1}. ${d.text}`);
+    sections.push(`## Rules\n${lines.join('\n')}`);
+  }
+
+  // Conversation context (context.md)
+  try {
+    const contextMd = await store.getContextMd(talk.id);
+    if (contextMd.trim()) {
+      sections.push(`## Conversation Context\n${contextMd.trim()}`);
+    }
+  } catch {
+    // context.md missing is non-fatal
+  }
+
+  // Pinned references
+  if (talk.pinnedMessageIds.length > 0) {
+    try {
+      const pinned = await Promise.all(
+        talk.pinnedMessageIds.slice(0, 5).map(id => store.getMessage(talk.id, id)),
+      );
+      const validPins = pinned.filter(Boolean) as import('./types.js').TalkMessage[];
+      if (validPins.length > 0) {
+        const pinLines = validPins.map(m => {
+          const preview = m.content.length > 200
+            ? m.content.slice(0, 200) + '...'
+            : m.content;
+          return `- ${m.role}: ${preview}`;
+        });
+        sections.push(`## Pinned References\n${pinLines.join('\n')}`);
+      }
+    } catch {
+      // non-fatal
+    }
+  }
+
+  // State paths — tell the agent where to read/write persistent data
+  const dataDir = store.getDataDir();
+  sections.push(
+    `## State\n` +
+    `Data directory: ${dataDir}/talks/${talk.id}/state/\n` +
+    `Context file: ${dataDir}/talks/${talk.id}/context.md\n` +
+    `Update context.md when significant progress occurs (not every message).`,
+  );
+
+  if (sections.length <= 1) return null; // only header, no meaningful content
+
+  let result = sections.join('\n\n');
+
+  // Cap at MAX_AGENT_CONTEXT_BYTES
+  if (Buffer.byteLength(result, 'utf-8') > MAX_AGENT_CONTEXT_BYTES) {
+    const encoder = new TextEncoder();
+    const encoded = encoder.encode(result);
+    const truncated = encoded.slice(0, MAX_AGENT_CONTEXT_BYTES);
+    result = new TextDecoder().decode(truncated);
+    const lastNewline = result.lastIndexOf('\n');
+    if (lastNewline > MAX_AGENT_CONTEXT_BYTES * 0.8) {
+      result = result.slice(0, lastNewline);
+    }
+    result += '\n\n[Talk context truncated]';
+  }
+
+  return result;
 }
 
 // ============================================================================
@@ -904,57 +1009,45 @@ const plugin = {
         return undefined;
       }
       emitOpenClawMessageDebug('send_start', event, ctx);
-      const suppression = handleSlackMessageSendingHook(event, ctx, api.logger);
-      if (suppression) {
-        emitOpenClawMessageDebug('suppressed', event, ctx);
-      }
-      return suppression;
+      return undefined;
     });
-    // Block OpenClaw's agent `message` tool when ClawTalk owns the conversation.
-    // The agent's tool calls bypass `message_sending`, so this is the only way
-    // to prevent dual responses in socket mode.
-    api.on('before_tool_call', (event: any, ctx: any) => {
+
+    // Inject Talk context into OpenClaw's agent before it runs.
+    // OpenClaw's agent handles Slack replies natively; the gateway is a context provider.
+    api.on('before_agent_start', async (event: any, ctx: any) => {
       if (!isGatewayReady()) return undefined;
 
-      const toolName = typeof event?.toolName === 'string' ? event.toolName.trim().toLowerCase() : '';
-      if (toolName !== 'message') return undefined;
-
-      const params = event?.params && typeof event.params === 'object'
-        ? event.params as Record<string, unknown> : null;
-      if (!params) return undefined;
-
-      // Only block message-sending actions
-      const action = typeof params.action === 'string' ? params.action.trim().toLowerCase() : '';
-      if (action !== 'send' && action !== 'thread-reply' && action !== 'reply') return undefined;
-
-      // Only block Slack sends
-      const provider = (typeof params.provider === 'string' ? params.provider.trim()
-        : typeof params.channel === 'string' ? params.channel.trim() : '').toLowerCase();
-      if (provider && provider !== 'slack') return undefined;
-
-      // OpenClaw's message tool uses `target` as primary, `to` as legacy alias
-      const to = typeof params.target === 'string' ? params.target.trim()
-        : typeof params.to === 'string' ? params.to.trim() : '';
-      if (!to) return undefined;
-
-      // Don't block ClawTalk's own sessions (full_control or job mode)
       const sessionKey = typeof ctx?.sessionKey === 'string' ? ctx.sessionKey : '';
-      if (sessionKey.startsWith('talk:clawtalk:') || sessionKey.startsWith('job:clawtalk:')) {
+      const agentId = typeof ctx?.agentId === 'string' ? ctx.agentId.trim() : '';
+
+      // Only inject for ClawTalk-managed agents (ct-XXXXXXXX)
+      if (!agentId.startsWith('ct-')) return undefined;
+
+      // Find the Talk that owns this agent
+      const talks = talkStore.listTalks();
+      const ownerTalk = talks.find(t => buildManagedAgentId(t.id) === agentId);
+      if (!ownerTalk) {
+        api.logger.debug(
+          `ClawTalk: before_agent_start no Talk found for agent=${agentId} session=${sessionKey}`,
+        );
         return undefined;
       }
 
-      // Check for active suppression (means ClawTalk claimed this event)
-      const accountId = typeof params.accountId === 'string' ? params.accountId : undefined;
-      const suppression = hasActiveSuppressionForTarget({ accountId, target: to });
-      if (suppression) {
-        api.logger.info(
-          `ClawTalk: blocked agent message tool for ${to} ` +
-          `(talk=${suppression.talkId} event=${suppression.eventId} session=${sessionKey || '-'})`,
-        );
-        return { block: true, blockReason: `ClawTalk is handling this conversation (talk=${suppression.talkId})` };
-      }
+      try {
+        const contextBlock = await buildTalkContextForAgent(ownerTalk, talkStore, api.logger);
+        if (!contextBlock) return undefined;
 
-      return undefined;
+        api.logger.info(
+          `ClawTalk: before_agent_start injecting context for talk ${ownerTalk.id.slice(0, 8)} ` +
+          `agent=${agentId} bytes=${Buffer.byteLength(contextBlock, 'utf-8')}`,
+        );
+        return { prependContext: contextBlock };
+      } catch (err) {
+        api.logger.warn(
+          `ClawTalk: before_agent_start context build failed for talk=${ownerTalk.id}: ${String(err)}`,
+        );
+        return undefined;
+      }
     });
 
     api.on('message_sent', (event: any, ctx: any) => {

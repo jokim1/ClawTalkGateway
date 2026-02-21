@@ -5,8 +5,9 @@ import {
   __resetSlackIngressStateForTests,
   getSlackIngressTalkRuntimeSnapshot,
   handleSlackMessageReceivedHook,
-  handleSlackMessageSendingHook,
   inspectSlackOwnership,
+  routeSlackIngressEvent,
+  type SlackIngressEvent,
 } from '../slack-ingress';
 import { TalkStore } from '../talk-store';
 import { ToolRegistry } from '../tool-registry';
@@ -33,13 +34,11 @@ beforeEach(async () => {
   executor = new ToolExecutor(registry, store, mockLogger);
   __resetSlackIngressStateForTests();
   jest.clearAllMocks();
-  delete process.env.CLAWTALK_INGRESS_SUPPRESS_MAX_CANCELS;
 });
 
 afterEach(async () => {
   __resetSlackIngressStateForTests();
   await fsp.rm(tmpDir, { recursive: true, force: true });
-  delete process.env.CLAWTALK_INGRESS_SUPPRESS_MAX_CANCELS;
 });
 
 function buildDeps() {
@@ -75,10 +74,9 @@ function addSlackBindingWithId(scope: string): { talkId: string; bindingId: stri
   return { talkId: talk.id, bindingId };
 }
 
-describe('slack ingress ownership hooks', () => {
-  it('claims matching channel events and suppresses OpenClaw outbound', async () => {
+describe('slack ingress delegation', () => {
+  it('delegates matching channel events to OpenClaw agent (returns pass)', async () => {
     addSlackBinding('channel:c123');
-    process.env.CLAWTALK_INGRESS_SUPPRESS_MAX_CANCELS = '1';
 
     const hookResult = await handleSlackMessageReceivedHook(
       {
@@ -96,38 +94,11 @@ describe('slack ingress ownership hooks', () => {
       },
       buildDeps(),
     );
-    expect(hookResult).toEqual({ cancel: true });
-
-    const first = handleSlackMessageSendingHook(
-      {
-        to: 'channel:C123',
-        content: 'openclaw reply',
-        metadata: { accountId: 'acct-1' },
-      },
-      {
-        channelId: 'slack',
-        accountId: 'acct-1',
-      },
-      mockLogger,
-    );
-    expect(first).toEqual({ cancel: true });
-
-    const second = handleSlackMessageSendingHook(
-      {
-        to: 'channel:C123',
-        content: 'openclaw retry',
-        metadata: { accountId: 'acct-1' },
-      },
-      {
-        channelId: 'slack',
-        accountId: 'acct-1',
-      },
-      mockLogger,
-    );
-    expect(second).toBeUndefined();
+    // Delegated channels return undefined (pass) — OpenClaw's managed agent handles
+    expect(hookResult).toBeUndefined();
   });
 
-  it('supports user-scoped bindings for Slack DM targets', async () => {
+  it('delegates user-scoped bindings for Slack DM targets', async () => {
     addSlackBinding('user:u777');
 
     const hookResult = await handleSlackMessageReceivedHook(
@@ -146,57 +117,7 @@ describe('slack ingress ownership hooks', () => {
       },
       buildDeps(),
     );
-    expect(hookResult).toEqual({ cancel: true });
-
-    const result = handleSlackMessageSendingHook(
-      {
-        to: 'user:U777',
-        content: 'openclaw dm reply',
-        metadata: { accountId: 'acct-2' },
-      },
-      {
-        channelId: 'slack',
-        accountId: 'acct-2',
-      },
-      mockLogger,
-    );
-    expect(result).toEqual({ cancel: true });
-  });
-
-  it('suppresses outbound across equivalent Slack target formats', async () => {
-    addSlackBinding('channel:c123');
-    process.env.CLAWTALK_INGRESS_SUPPRESS_MAX_CANCELS = '1';
-
-    await handleSlackMessageReceivedHook(
-      {
-        from: 'slack:channel:C123',
-        content: 'hello from slack',
-        metadata: {
-          to: 'slack:channel:C123',
-          messageId: '1700000005.100',
-          senderId: 'U123',
-        },
-      },
-      {
-        channelId: 'slack',
-        accountId: 'acct-1',
-      },
-      buildDeps(),
-    );
-
-    const result = handleSlackMessageSendingHook(
-      {
-        to: 'channel:C123',
-        content: 'openclaw reply',
-        metadata: { accountId: 'acct-1' },
-      },
-      {
-        channelId: 'slack',
-        accountId: 'acct-1',
-      },
-      mockLogger,
-    );
-    expect(result).toEqual({ cancel: true });
+    expect(hookResult).toBeUndefined();
   });
 
   it('does not suppress outbound when no talk binding matches', async () => {
@@ -217,111 +138,6 @@ describe('slack ingress ownership hooks', () => {
       buildDeps(),
     );
     expect(hookResult).toBeUndefined();
-
-    const result = handleSlackMessageSendingHook(
-      {
-        to: 'channel:C404',
-        content: 'openclaw reply',
-        metadata: { accountId: 'acct-3' },
-      },
-      {
-        channelId: 'slack',
-        accountId: 'acct-3',
-      },
-      mockLogger,
-    );
-    expect(result).toBeUndefined();
-  });
-
-  it('handles when behavior sets agent-only override (no on-message prompt)', async () => {
-    const { talkId, bindingId } = addSlackBindingWithId('channel:c901');
-    store.updateTalk(talkId, {
-      platformBehaviors: [{
-        id: 'behavior-1',
-        platformBindingId: bindingId,
-        agentName: 'DeepSeek',
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      }],
-    });
-
-    const hookResult = await handleSlackMessageReceivedHook(
-      {
-        from: 'slack:channel:C901',
-        content: 'hello from slack',
-        metadata: {
-          to: 'channel:C901',
-          messageId: '1700000003.400',
-          senderId: 'U901',
-        },
-      },
-      {
-        channelId: 'slack',
-        accountId: 'acct-9',
-      },
-      buildDeps(),
-    );
-    expect(hookResult).toEqual({ cancel: true });
-
-    const result = handleSlackMessageSendingHook(
-      {
-        to: 'channel:C901',
-        content: 'openclaw reply',
-        metadata: { accountId: 'acct-9' },
-      },
-      {
-        channelId: 'slack',
-        accountId: 'acct-9',
-      },
-      mockLogger,
-    );
-    expect(result).toEqual({ cancel: true });
-  });
-
-  it('suppresses outbound when on-message behavior is configured for the binding', async () => {
-    const { talkId, bindingId } = addSlackBindingWithId('channel:c902');
-    store.updateTalk(talkId, {
-      platformBehaviors: [{
-        id: 'behavior-2',
-        platformBindingId: bindingId,
-        onMessagePrompt: 'Reply with concise action items.',
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      }],
-    });
-    process.env.CLAWTALK_INGRESS_SUPPRESS_MAX_CANCELS = '1';
-
-    const hookResult = await handleSlackMessageReceivedHook(
-      {
-        from: 'slack:channel:C902',
-        content: 'status?',
-        metadata: {
-          to: 'channel:C902',
-          messageId: '1700000004.500',
-          senderId: 'U902',
-        },
-      },
-      {
-        channelId: 'slack',
-        accountId: 'acct-10',
-      },
-      buildDeps(),
-    );
-    expect(hookResult).toEqual({ cancel: true });
-
-    const first = handleSlackMessageSendingHook(
-      {
-        to: 'channel:C902',
-        content: 'openclaw reply',
-        metadata: { accountId: 'acct-10' },
-      },
-      {
-        channelId: 'slack',
-        accountId: 'acct-10',
-      },
-      mockLogger,
-    );
-    expect(first).toEqual({ cancel: true });
   });
 
   it('ignores non-slack hook events', async () => {
@@ -339,19 +155,6 @@ describe('slack ingress ownership hooks', () => {
       buildDeps(),
     );
     expect(hookResult).toBeUndefined();
-
-    const result = handleSlackMessageSendingHook(
-      {
-        to: 'channel:C123',
-        content: 'telegram outbound',
-      },
-      {
-        channelId: 'telegram',
-        accountId: 'acct-4',
-      },
-      mockLogger,
-    );
-    expect(result).toBeUndefined();
   });
 
   it('exposes ownership inspection details for diagnostics', () => {
@@ -410,244 +213,6 @@ describe('slack ingress ownership hooks', () => {
     expect(hookResult).toBeUndefined();
   });
 
-  it('uses binding account fallback when inbound event account is missing', async () => {
-    const talk = store.createTalk('test-model');
-    const bindingId = 'binding-account-fallback';
-    store.updateTalk(talk.id, {
-      platformBindings: [{
-        id: bindingId,
-        platform: 'slack',
-        accountId: 'kimfamily',
-        scope: 'channel:c777',
-        permission: 'read+write',
-        createdAt: Date.now(),
-      }],
-    });
-
-    const sendSlackMessage = jest.fn(async (_params: { accountId?: string; channelId: string; threadTs?: string; message: string }) => true);
-    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        choices: [{ message: { content: 'ack' } }],
-      }),
-    } as unknown as Response);
-    try {
-      const deps = {
-        ...buildDeps(),
-        autoProcessQueue: true,
-        sendSlackMessage,
-      };
-
-      const hookResult = await handleSlackMessageReceivedHook(
-        {
-          from: 'slack:channel:C777',
-          content: 'progress update',
-          metadata: {
-            to: 'channel:C777',
-            messageId: '1700000011.100',
-            senderId: 'U777',
-          },
-        },
-        {
-          channelId: 'slack',
-        },
-        deps,
-      );
-      expect(hookResult).toEqual({ cancel: true });
-
-      for (let i = 0; i < 40 && sendSlackMessage.mock.calls.length === 0; i += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-
-      expect(sendSlackMessage).toHaveBeenCalled();
-      const firstCall = sendSlackMessage.mock.calls[0]?.[0] as { accountId?: string } | undefined;
-      expect(firstCall?.accountId).toBe('kimfamily');
-
-      const runtime = getSlackIngressTalkRuntimeSnapshot(talk.id);
-      expect(runtime.counters.handled).toBeGreaterThanOrEqual(1);
-    } finally {
-      fetchSpy.mockRestore();
-    }
-  });
-
-  it('supports adaptive delivery: study updates post to channel, advice replies in thread', async () => {
-    const talk = store.createTalk('test-model');
-    const bindingId = 'binding-adaptive';
-    store.updateTalk(talk.id, {
-      platformBindings: [{
-        id: bindingId,
-        platform: 'slack',
-        accountId: 'kimfamily',
-        scope: 'channel:c888',
-        permission: 'read+write',
-        createdAt: Date.now(),
-      }],
-      platformBehaviors: [{
-        id: 'behavior-adaptive',
-        platformBindingId: bindingId,
-        responseMode: 'all',
-        deliveryMode: 'adaptive',
-        responsePolicy: { triggerPolicy: 'advice_or_study' },
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      }],
-    });
-
-    const sendSlackMessage = jest.fn(async (_params: { accountId?: string; channelId: string; threadTs?: string; message: string }) => true);
-    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        choices: [{ message: { content: 'ack' } }],
-      }),
-    } as unknown as Response);
-    try {
-      const deps = {
-        ...buildDeps(),
-        autoProcessQueue: true,
-        sendSlackMessage,
-      };
-
-      await handleSlackMessageReceivedHook(
-        {
-          from: 'slack:channel:C888',
-          content: '3h mathcounts practice',
-          metadata: {
-            to: 'channel:C888',
-            threadId: '1700000099.100',
-            messageId: '1700000099.100',
-            senderId: 'U888',
-            senderName: 'Asher',
-          },
-        },
-        {
-          channelId: 'slack',
-          accountId: 'kimfamily',
-        },
-        deps,
-      );
-
-      await handleSlackMessageReceivedHook(
-        {
-          from: 'slack:channel:C888',
-          content: 'can you help me plan tomorrow?',
-          metadata: {
-            to: 'channel:C888',
-            threadId: '1700000100.100',
-            messageId: '1700000100.100',
-            senderId: 'U888',
-            senderName: 'Asher',
-          },
-        },
-        {
-          channelId: 'slack',
-          accountId: 'kimfamily',
-        },
-        deps,
-      );
-
-      for (let i = 0; i < 50 && sendSlackMessage.mock.calls.length < 2; i += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-
-      expect(sendSlackMessage.mock.calls.length).toBeGreaterThanOrEqual(2);
-      const firstCall = sendSlackMessage.mock.calls[0]?.[0] as { threadTs?: string } | undefined;
-      const secondCall = sendSlackMessage.mock.calls[1]?.[0] as { threadTs?: string } | undefined;
-      expect(firstCall?.threadTs).toBeUndefined();
-      expect(secondCall?.threadTs).toBe('1700000100.100');
-    } finally {
-      fetchSpy.mockRestore();
-    }
-  });
-
-  it('supports adaptive explicit routing hints: thread/channel directives override intent routing', async () => {
-    const talk = store.createTalk('test-model');
-    const bindingId = 'binding-adaptive-explicit';
-    store.updateTalk(talk.id, {
-      platformBindings: [{
-        id: bindingId,
-        platform: 'slack',
-        accountId: 'kimfamily',
-        scope: 'channel:c898',
-        permission: 'read+write',
-        createdAt: Date.now(),
-      }],
-      platformBehaviors: [{
-        id: 'behavior-adaptive-explicit',
-        platformBindingId: bindingId,
-        responseMode: 'all',
-        deliveryMode: 'adaptive',
-        responsePolicy: { triggerPolicy: 'advice_or_study' },
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      }],
-    });
-
-    const sendSlackMessage = jest.fn(async (_params: { accountId?: string; channelId: string; threadTs?: string; message: string }) => true);
-    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        choices: [{ message: { content: 'ack' } }],
-      }),
-    } as unknown as Response);
-    try {
-      const deps = {
-        ...buildDeps(),
-        autoProcessQueue: true,
-        sendSlackMessage,
-      };
-
-      await handleSlackMessageReceivedHook(
-        {
-          from: 'slack:channel:C898',
-          content: '2h study update, reply in thread please',
-          metadata: {
-            to: 'channel:C898',
-            threadId: '1700000199.100',
-            messageId: '1700000199.100',
-            senderId: 'U898',
-            senderName: 'Asher',
-          },
-        },
-        {
-          channelId: 'slack',
-          accountId: 'kimfamily',
-        },
-        deps,
-      );
-
-      await handleSlackMessageReceivedHook(
-        {
-          from: 'slack:channel:C898',
-          content: 'can you help me plan tomorrow? post top-level',
-          metadata: {
-            to: 'channel:C898',
-            threadId: '1700000200.100',
-            messageId: '1700000200.100',
-            senderId: 'U898',
-            senderName: 'Asher',
-          },
-        },
-        {
-          channelId: 'slack',
-          accountId: 'kimfamily',
-        },
-        deps,
-      );
-
-      for (let i = 0; i < 50 && sendSlackMessage.mock.calls.length < 2; i += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-
-      expect(sendSlackMessage.mock.calls.length).toBeGreaterThanOrEqual(2);
-      const firstCall = sendSlackMessage.mock.calls[0]?.[0] as { threadTs?: string } | undefined;
-      const secondCall = sendSlackMessage.mock.calls[1]?.[0] as { threadTs?: string } | undefined;
-      expect(firstCall?.threadTs).toBe('1700000199.100');
-      expect(secondCall?.threadTs).toBeUndefined();
-    } finally {
-      fetchSpy.mockRestore();
-    }
-  });
-
   it('respects study_entries_only trigger policy and skips non-study chatter', async () => {
     const talk = store.createTalk('test-model');
     const bindingId = 'binding-trigger-policy';
@@ -691,73 +256,7 @@ describe('slack ingress ownership hooks', () => {
     expect(hookResult).toBeUndefined();
   });
 
-  it('does not mirror Slack messages into talk when mirrorToTalk is off', async () => {
-    const talk = store.createTalk('test-model');
-    const bindingId = 'binding-mirror-off';
-    store.updateTalk(talk.id, {
-      platformBindings: [{
-        id: bindingId,
-        platform: 'slack',
-        accountId: 'kimfamily',
-        scope: 'channel:c890',
-        permission: 'read+write',
-        createdAt: Date.now(),
-      }],
-      platformBehaviors: [{
-        id: 'behavior-mirror-off',
-        platformBindingId: bindingId,
-        responseMode: 'all',
-        mirrorToTalk: 'off',
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      }],
-    });
-
-    const sendSlackMessage = jest.fn(async (_params: { accountId?: string; channelId: string; threadTs?: string; message: string }) => true);
-    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        choices: [{ message: { content: 'ack' } }],
-      }),
-    } as unknown as Response);
-    try {
-      const deps = {
-        ...buildDeps(),
-        autoProcessQueue: true,
-        sendSlackMessage,
-      };
-
-      await handleSlackMessageReceivedHook(
-        {
-          from: 'slack:channel:C890',
-          content: '2h homework',
-          metadata: {
-            to: 'channel:C890',
-            messageId: '1700000102.100',
-            senderId: 'U890',
-            senderName: 'Asher',
-          },
-        },
-        {
-          channelId: 'slack',
-          accountId: 'kimfamily',
-        },
-        deps,
-      );
-
-      for (let i = 0; i < 40 && sendSlackMessage.mock.calls.length < 1; i += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-
-      const history = await store.getRecentMessages(talk.id, 50);
-      const mirroredSlackEntries = history.filter((m) => m.content.includes('[Slack #'));
-      expect(mirroredSlackEntries).toHaveLength(0);
-    } finally {
-      fetchSpy.mockRestore();
-    }
-  });
-
-  it('mirrors inbound only when mirrorToTalk is inbound', async () => {
+  it('mirrors inbound message for delegated channels when mirrorToTalk is inbound', async () => {
     const talk = store.createTalk('test-model');
     const bindingId = 'binding-mirror-inbound';
     store.updateTalk(talk.id, {
@@ -778,67 +277,41 @@ describe('slack ingress ownership hooks', () => {
         updatedAt: Date.now(),
       }],
     });
+    const deps = buildDeps();
 
-    const sendSlackMessage = jest.fn(async (_params: { accountId?: string; channelId: string; threadTs?: string; message: string }) => true);
-    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        choices: [{ message: { content: 'ack' } }],
-      }),
-    } as unknown as Response);
-    try {
-      const deps = {
-        ...buildDeps(),
-        autoProcessQueue: true,
-        sendSlackMessage,
-      };
+    const event: SlackIngressEvent = {
+      eventId: 'test:mirror',
+      accountId: 'kimfamily',
+      channelId: 'C891',
+      userName: 'Kaela',
+      text: '1h art project',
+    };
+    const result = routeSlackIngressEvent(event, deps);
+    expect(result.payload.decision).toBe('pass');
+    expect(result.payload.reason).toBe('delegated-to-agent');
 
-      await handleSlackMessageReceivedHook(
-        {
-          from: 'slack:channel:C891',
-          content: '1h art project',
-          metadata: {
-            to: 'channel:C891',
-            messageId: '1700000103.100',
-            senderId: 'U891',
-            senderName: 'Kaela',
-          },
-        },
-        {
-          channelId: 'slack',
-          accountId: 'kimfamily',
-        },
-        deps,
-      );
+    // Give async mirror time to complete
+    await new Promise(resolve => setTimeout(resolve, 100));
 
-      for (let i = 0; i < 40 && sendSlackMessage.mock.calls.length < 1; i += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-
-      const history = await store.getRecentMessages(talk.id, 50);
-      const mirroredSlackEntries = history.filter((m) => m.content.includes('[Slack #'));
-      expect(mirroredSlackEntries.length).toBeGreaterThanOrEqual(1);
-      const assistantEntries = history.filter((m) => m.role === 'assistant');
-      expect(assistantEntries).toHaveLength(0);
-    } finally {
-      fetchSpy.mockRestore();
-    }
+    const history = await store.getRecentMessages(talk.id, 50);
+    const mirroredEntries = history.filter(m => m.content.includes('[Slack #'));
+    expect(mirroredEntries.length).toBeGreaterThanOrEqual(1);
   });
 
-  it('includes a user message for llm calls when mirrorToTalk is off', async () => {
+  it('does not mirror when mirrorToTalk is off for delegated channels', async () => {
     const talk = store.createTalk('test-model');
-    const bindingId = 'binding-user-turn-required';
+    const bindingId = 'binding-mirror-off';
     store.updateTalk(talk.id, {
       platformBindings: [{
         id: bindingId,
         platform: 'slack',
         accountId: 'kimfamily',
-        scope: 'channel:c892',
+        scope: 'channel:c890',
         permission: 'read+write',
         createdAt: Date.now(),
       }],
       platformBehaviors: [{
-        id: 'behavior-user-turn-required',
+        id: 'behavior-mirror-off',
         platformBindingId: bindingId,
         responseMode: 'all',
         mirrorToTalk: 'off',
@@ -846,19 +319,30 @@ describe('slack ingress ownership hooks', () => {
         updatedAt: Date.now(),
       }],
     });
+    const deps = buildDeps();
 
-    const sendSlackMessage = jest.fn(async (_params: { accountId?: string; channelId: string; threadTs?: string; message: string }) => true);
-    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        choices: [{ message: { content: 'ack' } }],
-      }),
-    } as unknown as Response);
+    const event: SlackIngressEvent = {
+      eventId: 'test:nomirror',
+      accountId: 'kimfamily',
+      channelId: 'C890',
+      text: '2h homework',
+    };
+    routeSlackIngressEvent(event, deps);
+
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    const history = await store.getRecentMessages(talk.id, 50);
+    expect(history).toHaveLength(0);
+  });
+
+  it('does not make LLM calls for delegated channels', async () => {
+    addSlackBinding('channel:c892');
+
+    const fetchSpy = jest.spyOn(globalThis, 'fetch');
     try {
       const deps = {
         ...buildDeps(),
         autoProcessQueue: true,
-        sendSlackMessage,
       };
 
       await handleSlackMessageReceivedHook(
@@ -869,7 +353,6 @@ describe('slack ingress ownership hooks', () => {
             to: 'channel:C892',
             messageId: '1700000104.100',
             senderId: 'U892',
-            senderName: 'Big Bad Daddy',
           },
         },
         {
@@ -879,199 +362,59 @@ describe('slack ingress ownership hooks', () => {
         deps,
       );
 
-      for (let i = 0; i < 40 && sendSlackMessage.mock.calls.length < 1; i += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-
-      expect(fetchSpy).toHaveBeenCalled();
-      const llmCall = fetchSpy.mock.calls.find((call) => String(call[0]).includes('/v1/chat/completions'));
-      const llmReq = llmCall?.[1] as { body?: string } | undefined;
-      const payload = llmReq?.body ? JSON.parse(llmReq.body) as { messages?: Array<{ role?: string; content?: string }> } : {};
-      const userTurn = payload.messages?.find((m) => m.role === 'user');
-      expect(userTurn).toBeDefined();
-      expect(userTurn?.content).toContain('please summarize study time');
+      // No LLM calls should be made for delegated channels
+      const llmCalls = fetchSpy.mock.calls.filter(
+        call => String(call[0]).includes('/v1/chat/completions'),
+      );
+      expect(llmCalls).toHaveLength(0);
     } finally {
       fetchSpy.mockRestore();
     }
   });
 
-  it('captures ingress phase attribution timeline for successful delivery', async () => {
+  it('does not enqueue delegated events to the processing queue', () => {
     const talk = store.createTalk('test-model');
-    const bindingId = 'binding-phase-attribution';
+    const bindingId = 'binding-no-queue';
     store.updateTalk(talk.id, {
       platformBindings: [{
         id: bindingId,
         platform: 'slack',
-        accountId: 'kimfamily',
         scope: 'channel:c894',
         permission: 'read+write',
         createdAt: Date.now(),
       }],
-      platformBehaviors: [{
-        id: 'behavior-phase-attribution',
-        platformBindingId: bindingId,
-        responseMode: 'all',
-        deliveryMode: 'channel',
-        mirrorToTalk: 'off',
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      }],
     });
+    const deps = buildDeps();
 
-    const sendSlackMessage = jest.fn(async (_params: { accountId?: string; channelId: string; threadTs?: string; message: string }) => true);
-    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        choices: [{ message: { content: 'ack' } }],
-      }),
-    } as unknown as Response);
-    try {
-      const deps = {
-        ...buildDeps(),
-        autoProcessQueue: true,
-        sendSlackMessage,
-      };
+    const event: SlackIngressEvent = {
+      eventId: 'test:noqueue',
+      channelId: 'C894',
+      text: 'hello',
+    };
+    const result = routeSlackIngressEvent(event, deps);
+    expect(result.payload.decision).toBe('pass');
+    expect(result.payload.reason).toBe('delegated-to-agent');
 
-      await handleSlackMessageReceivedHook(
-        {
-          from: 'slack:channel:C894',
-          content: 'please summarize this',
-          metadata: {
-            to: 'channel:C894',
-            messageId: '1700000106.100',
-            senderId: 'U894',
-            senderName: 'Big Bad Daddy',
-          },
-        },
-        {
-          channelId: 'slack',
-          accountId: 'kimfamily',
-        },
-        deps,
-      );
-
-      for (let i = 0; i < 40 && sendSlackMessage.mock.calls.length < 1; i += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-
-      const runtime = getSlackIngressTalkRuntimeSnapshot(talk.id);
-      expect(runtime.recentEvents.length).toBeGreaterThanOrEqual(1);
-      const phases = runtime.recentEvents[0]?.phases.map((entry) => entry.phase) ?? [];
-      expect(phases).toContain('queued');
-      expect(phases).toContain('worker_started');
-      expect(phases).toContain('llm_request_started');
-      expect(phases).toContain('llm_completed');
-      expect(phases).toContain('send_started');
-      expect(phases).toContain('send_completed');
-      expect(phases).toContain('worker_completed');
-    } finally {
-      fetchSpy.mockRestore();
-    }
+    // No runtime events should be tracked for delegated events
+    const runtime = getSlackIngressTalkRuntimeSnapshot(talk.id);
+    expect(runtime.recentEvents).toHaveLength(0);
+    expect(runtime.counters.passed).toBe(1);
+    expect(runtime.counters.handled).toBe(0);
   });
 
-  it('blocks mismatched set intent and records intent diagnostic', async () => {
-    const talk = store.createTalk('test-model');
-    const bindingId = 'binding-intent-verification';
-    store.updateTalk(talk.id, {
-      stateBackend: 'stream_store',
-      defaultStateStream: 'kids_study',
-      platformBindings: [{
-        id: bindingId,
-        platform: 'slack',
-        accountId: 'kimfamily',
-        scope: 'channel:c893',
-        permission: 'read+write',
-        createdAt: Date.now(),
-      }],
-      platformBehaviors: [{
-        id: 'behavior-intent-verification',
-        platformBindingId: bindingId,
-        responseMode: 'all',
-        deliveryMode: 'channel',
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      }],
-    });
+  it('deduplicates delegated events', () => {
+    addSlackBinding('channel:c123');
+    const deps = buildDeps();
 
-    const sendSlackMessage = jest.fn(async (_params: { accountId?: string; channelId: string; threadTs?: string; message: string }) => true);
-    let completionCall = 0;
-    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockImplementation(async (input: unknown) => {
-      if (String(input).includes('/v1/chat/completions')) {
-        completionCall += 1;
-        if (completionCall === 1) {
-          return {
-            ok: true,
-            json: async () => ({
-              choices: [{
-                finish_reason: 'tool_calls',
-                message: {
-                  content: '',
-                  tool_calls: [{
-                    id: 'tc1',
-                    type: 'function',
-                    function: {
-                      name: 'state_append_event',
-                      arguments: JSON.stringify({
-                        talk_id: talk.id,
-                        stream: 'kids_study',
-                        event_type: 'manual_adjustment',
-                        payload: { kid: 'Asher', target: 360 },
-                      }),
-                    },
-                  }],
-                },
-              }],
-            }),
-          } as unknown as Response;
-        }
-        return {
-          ok: true,
-          json: async () => ({
-            choices: [{ message: { content: "Set Asher's weekly study time to 360 minutes." } }],
-          }),
-        } as unknown as Response;
-      }
-      throw new Error(`unexpected fetch call: ${String(input)}`);
-    });
-    try {
-      const deps = {
-        ...buildDeps(),
-        autoProcessQueue: true,
-        sendSlackMessage,
-      };
-
-      await handleSlackMessageReceivedHook(
-        {
-          from: 'slack:channel:C893',
-          content: "Kimi pls set asher's weekly study time to 360 minutes",
-          metadata: {
-            to: 'channel:C893',
-            messageId: '1700000105.100',
-            senderId: 'U893',
-            senderName: 'Big Bad Daddy',
-          },
-        },
-        {
-          channelId: 'slack',
-          accountId: 'kimfamily',
-        },
-        deps,
-      );
-
-      for (let i = 0; i < 50 && sendSlackMessage.mock.calls.length < 1; i += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-
-      expect(sendSlackMessage).toHaveBeenCalled();
-      const sent = sendSlackMessage.mock.calls[0]?.[0] as { message?: string } | undefined;
-      expect(sent?.message ?? '').toContain('I could not verify the requested set action safely.');
-      expect(sent?.message ?? '').toContain('state write changed a target/goal field instead of a running total');
-
-      const updated = store.getTalk(talk.id);
-      const diagnostics = updated?.diagnostics ?? [];
-      expect(diagnostics.some((entry) => entry.category === 'intent' && entry.code === 'INTENT_STATE_MISMATCH')).toBe(true);
-    } finally {
-      fetchSpy.mockRestore();
-    }
+    const event: SlackIngressEvent = {
+      eventId: 'test:dup',
+      channelId: 'C123',
+      text: 'hello',
+    };
+    const first = routeSlackIngressEvent(event, deps);
+    const second = routeSlackIngressEvent(event, deps);
+    expect(first.payload.decision).toBe('pass');
+    expect(second.payload.decision).toBe('pass');
+    expect(second.payload.duplicate).toBe(true);
   });
 });

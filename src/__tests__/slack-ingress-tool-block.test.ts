@@ -4,7 +4,8 @@ import * as path from 'node:path';
 import {
   __resetSlackIngressStateForTests,
   handleSlackMessageReceivedHook,
-  hasActiveSuppressionForTarget,
+  routeSlackIngressEvent,
+  type SlackIngressEvent,
 } from '../slack-ingress';
 import { TalkStore } from '../talk-store';
 import { ToolRegistry } from '../tool-registry';
@@ -66,82 +67,140 @@ function addSlackBinding(scope: string): string {
   return talk.id;
 }
 
-/** Claim an event via the message_received hook so a suppression lease is created. */
-async function claimEvent(channelId: string, accountId?: string): Promise<string> {
-  const talkId = addSlackBinding(`channel:${channelId}`);
-  const deps = buildDeps();
-  await handleSlackMessageReceivedHook(
-    {
-      from: `slack:${accountId ?? 'default'}:U999`,
-      content: 'hello',
-      metadata: {
-        to: `slack:channel:${channelId}`,
-        ...(accountId ? { accountId } : {}),
+describe('delegated channel routing', () => {
+  it('returns pass with delegated-to-agent reason for Talk-bound channels', () => {
+    const talkId = addSlackBinding('channel:C123');
+    const deps = buildDeps();
+
+    const event: SlackIngressEvent = {
+      eventId: 'test:1',
+      channelId: 'C123',
+      text: 'hello',
+    };
+    const result = routeSlackIngressEvent(event, deps);
+    expect(result.payload.decision).toBe('pass');
+    expect(result.payload.reason).toBe('delegated-to-agent');
+    expect(result.payload.talkId).toBe(talkId);
+  });
+
+  it('deduplicates delegated events', () => {
+    addSlackBinding('channel:C123');
+    const deps = buildDeps();
+
+    const event: SlackIngressEvent = {
+      eventId: 'test:dup',
+      channelId: 'C123',
+      text: 'hello',
+    };
+    const first = routeSlackIngressEvent(event, deps);
+    const second = routeSlackIngressEvent(event, deps);
+    expect(first.payload.decision).toBe('pass');
+    expect(second.payload.decision).toBe('pass');
+    expect(second.payload.duplicate).toBe(true);
+  });
+
+  it('mirrors inbound message when mirrorToTalk is set', async () => {
+    const talk = store.createTalk('test-model');
+    const bindingId = `binding-${Date.now()}`;
+    store.updateTalk(talk.id, {
+      platformBindings: [{
+        id: bindingId,
+        platform: 'slack',
+        scope: 'channel:C456',
+        permission: 'read+write',
+        createdAt: Date.now(),
+      }],
+      platformBehaviors: [{
+        id: `behavior-${Date.now()}`,
+        platformBindingId: bindingId,
+        mirrorToTalk: 'inbound',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      }],
+    });
+    const deps = buildDeps();
+
+    const event: SlackIngressEvent = {
+      eventId: 'test:mirror',
+      channelId: 'C456',
+      userName: 'alice',
+      text: 'study update: 30 minutes',
+    };
+    routeSlackIngressEvent(event, deps);
+
+    // Give async mirror time to complete
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    const messages = await store.getRecentMessages(talk.id, 10);
+    expect(messages.length).toBeGreaterThanOrEqual(1);
+    expect(messages[0].role).toBe('user');
+    expect(messages[0].content).toContain('study update');
+  });
+
+  it('does not mirror when mirrorToTalk is off', async () => {
+    const talk = store.createTalk('test-model');
+    const bindingId = `binding-${Date.now()}`;
+    store.updateTalk(talk.id, {
+      platformBindings: [{
+        id: bindingId,
+        platform: 'slack',
+        scope: 'channel:C789',
+        permission: 'read+write',
+        createdAt: Date.now(),
+      }],
+      platformBehaviors: [{
+        id: `behavior-${Date.now()}`,
+        platformBindingId: bindingId,
+        mirrorToTalk: 'off',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      }],
+    });
+    const deps = buildDeps();
+
+    const event: SlackIngressEvent = {
+      eventId: 'test:nomirror',
+      channelId: 'C789',
+      text: 'hello',
+    };
+    routeSlackIngressEvent(event, deps);
+
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    const messages = await store.getRecentMessages(talk.id, 10);
+    expect(messages.length).toBe(0);
+  });
+
+  it('passes events for unbound channels', () => {
+    addSlackBinding('channel:C123');
+    const deps = buildDeps();
+
+    const event: SlackIngressEvent = {
+      eventId: 'test:unbound',
+      channelId: 'C999',
+      text: 'hello',
+    };
+    const result = routeSlackIngressEvent(event, deps);
+    expect(result.payload.decision).toBe('pass');
+    expect(result.payload.reason).toBe('no-binding');
+  });
+
+  it('delegates via message_received hook path', async () => {
+    addSlackBinding('channel:C100');
+    const deps = buildDeps();
+
+    const hookResult = await handleSlackMessageReceivedHook(
+      {
+        from: 'slack:default:U999',
+        content: 'hello world',
+        metadata: {
+          to: 'slack:channel:C100',
+        },
       },
-    },
-    { channelId: 'slack', conversationId: `slack:channel:${channelId}` },
-    deps,
-  );
-  return talkId;
-}
-
-describe('hasActiveSuppressionForTarget', () => {
-  it('returns lease info when suppression is active', async () => {
-    const talkId = await claimEvent('C123');
-
-    const result = hasActiveSuppressionForTarget({ target: 'channel:C123' });
-    expect(result).toBeDefined();
-    expect(result!.talkId).toBe(talkId);
-    expect(result!.eventId).toBeDefined();
-  });
-
-  it('returns undefined when no suppression exists', () => {
-    const result = hasActiveSuppressionForTarget({ target: 'channel:CXXX' });
-    expect(result).toBeUndefined();
-  });
-
-  it('ignores expired suppressions', async () => {
-    await claimEvent('C456');
-
-    // Verify suppression exists first
-    expect(hasActiveSuppressionForTarget({ target: 'channel:C456' })).toBeDefined();
-
-    // Fast-forward past expiry (default TTL is 120s)
-    const realNow = Date.now;
-    Date.now = () => realNow() + 200_000;
-    try {
-      const result = hasActiveSuppressionForTarget({ target: 'channel:C456' });
-      expect(result).toBeUndefined();
-    } finally {
-      Date.now = realNow;
-    }
-  });
-
-  it('normalizes various target formats', async () => {
-    await claimEvent('C789');
-
-    // All these should resolve to the same suppression
-    expect(hasActiveSuppressionForTarget({ target: 'channel:C789' })).toBeDefined();
-    expect(hasActiveSuppressionForTarget({ target: 'slack:channel:C789' })).toBeDefined();
-    expect(hasActiveSuppressionForTarget({ target: 'C789' })).toBeDefined();
-  });
-
-  it('matches with accountId', async () => {
-    await claimEvent('C321', 'workspace-a');
-
-    // Exact account match
-    expect(hasActiveSuppressionForTarget({
-      accountId: 'workspace-a',
-      target: 'channel:C321',
-    })).toBeDefined();
-  });
-
-  it('does not consume the suppression (read-only)', async () => {
-    await claimEvent('C555');
-
-    // Call multiple times — should keep returning the lease
-    for (let i = 0; i < 5; i++) {
-      expect(hasActiveSuppressionForTarget({ target: 'channel:C555' })).toBeDefined();
-    }
+      { channelId: 'slack', conversationId: 'slack:channel:C100' },
+      deps,
+    );
+    // Delegated channels return undefined (pass) so OpenClaw processes normally
+    expect(hookResult).toBeUndefined();
   });
 });

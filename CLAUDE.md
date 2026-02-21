@@ -140,9 +140,9 @@ These apply to all code changes in this project:
 
 ```
 src/
-  slack-ingress.ts          Inbound Slack message handling: ownership resolution, LLM call, reply delivery, retry queue
+  slack-ingress.ts          Inbound Slack message handling: ownership resolution, delegation to OpenClaw agent, optional mirroring
   slack-ownership-doctor.ts Detects Talk/OpenClaw binding conflicts (detection-only, no auto-fix)
-  slack-routing-sync.ts     Writes Talk bindings into OpenClaw's openclaw.json config (startup only)
+  slack-routing-sync.ts     Writes managed agents (ct-*) and Talk bindings into OpenClaw's openclaw.json config (startup only)
   routing-headers.ts        Guards against header leakage between execution modes
   talk-policy.ts            Execution mode resolution, tool availability evaluation
   event-dispatcher.ts       Triggers event-driven jobs from OpenClaw message_received hook
@@ -151,49 +151,54 @@ src/
 
 ## Slack Message Flow
 
+The gateway acts as a **context provider**, not a parallel message processor. OpenClaw's managed agent handles Slack replies natively.
+
 ```
-Slack → OpenClaw → maybeHandoffSlackInbound() [HTTP to /api/events/slack]
-                     │
-                     ├── decision: "handled" → OpenClaw EXITS, ClawTalk processes
-                     │     └── routeSlackIngressEvent()
-                     │           ├── seenEvents dedup (6h TTL)
-                     │           ├── resolveOwnerTalk() → scoreSlackBinding()
-                     │           ├── shouldHandleViaBehavior() → response policy
-                     │           ├── upsertOutboundSuppression() → block OpenClaw replies
-                     │           └── enqueue → processQueue → callLlmForEvent → sendSlackReply
-                     │
-                     └── decision: "pass" → OpenClaw processes normally
-                           └── message_received hook fires (FIRE-AND-FORGET, cancel ignored)
-                                 └── eventDispatcher.handleMessageReceived() → event jobs
+Slack message arrives (socket mode)
+  │
+  ├── OpenClaw resolves agent via binding → ct-<shortId> (managed agent per Talk)
+  │
+  ├── before_agent_start hook fires (index.ts)
+  │     └── Gateway reads Talk metadata + context.md
+  │     └── Injects ~2KB context block via prependContext
+  │           (instructions, objective, rules, conversation summary, pins, state paths)
+  │
+  ├── Agent runs LLM call (Talk's model) with:
+  │     - OpenClaw's system prompt + tools (Read, Write, shell_exec, message)
+  │     - Talk context (injected via prependContext)
+  │     - User's Slack message
+  │
+  ├── Agent responds → OpenClaw delivers to Slack (single response, no duplicates)
+  │
+  └── message_received hook (parallel, fire-and-forget)
+        └── Gateway mirrors message to Talk history (if mirrorToTalk != 'off')
+        └── eventDispatcher.handleMessageReceived() → event jobs
 ```
 
-⚠️ **CRITICAL:** The `message_received` hook is fire-and-forget (`runVoidHook`). Its `{ cancel: true }` return is IGNORED by OpenClaw. The handoff endpoint is the ONLY way to prevent dual processing. Auto-configured by `reconcileSlackHandoffConfig()` in `slack-routing-sync.ts`.
+**Managed agents:** `reconcileSlackRoutingForTalks()` creates a `ct-<shortId>` agent per Talk with Slack write bindings (e.g., `ct-8fabc85a`). Each agent uses the Talk's configured model. Bindings route Slack channels/users to the correct managed agent. Manual agents (lila, gamemakers, etc.) are preserved.
 
-## Known Issues (2026-02-20)
+**Delegation:** When a Slack message arrives for a Talk-bound channel, `routeSlackIngressEvent()` returns `'pass'` with reason `'delegated-to-agent'` — no LLM call, no suppression, no queue. OpenClaw processes the message through its managed agent with Talk context injected.
 
-See `docs/FIX-PLAN-2026-02-20.md` for detailed fix proposals.
+## Known Issues (2026-02-21)
 
 | Issue | Severity | Status |
 |-------|----------|--------|
-| Handoff not auto-configured (root cause of duplicates) | Critical | **Fixed** |
-| Suppression TTL leak (120s default) | High | **Fixed** (heartbeat refresh) |
-| Dead letter race condition | High | **Fixed** (suppression clear on dead letter) |
-| full_control mode omitted session key → OpenClaw embedded agent triggered | Critical | **Fixed** |
-| Agent `message` tool bypasses `message_sending` hook → dual Slack responses | Critical | **Fixed** (`before_tool_call` hook) |
 | Ownership doctor detection-only, no auto-remediation | Medium | Open |
 | Slack routing sync only runs at startup, not on binding change | Medium | Open |
 | Gateway origin resolution inconsistency across files | Low | Open |
+| Gateway-installed tools (state_*, google_docs_*) not available in managed agent sessions | Low | Open |
+| Context.md not auto-updated by managed agent (agent can self-maintain via Write) | Low | Open |
 
-**Previously fixed:** Triple-path processing (seenEvents dedup), agent routing conflicts (assertRoutingHeaders guard), execution mode routing (routing-headers.ts), full_control session key omission (routing-headers.ts + slack-ingress.ts + talk-chat.ts).
+**Previously fixed:** Dual Slack processing (delegation architecture — gateway as context provider, OpenClaw as processor), triple-path processing (seenEvents dedup), agent routing conflicts (assertRoutingHeaders guard), execution mode routing (routing-headers.ts), full_control session key omission, suppression TTL leak, dead letter race condition, handoff not auto-configured.
 
 ## ⚠️ Warnings for Future Agents
 
 1. **Do not set `x-openclaw-agent-id` in `full_control` mode.** The `assertRoutingHeaders()` guard in `routing-headers.ts` will throw `RoutingGuardError`. Session keys ARE allowed in full_control mode but MUST NOT have an `agent:` prefix — non-agent keys (e.g., `talk:clawtalk:...`) are classified as `legacy_or_alias` by OpenClaw and bypass the embedded agent.
-2. **The `message_received` hook return value is IGNORED by OpenClaw.** Do not rely on `{ cancel: true }` to prevent dual processing. The `before_tool_call` hook blocks the agent's `message` tool instead (see index.ts).
+2. **The `message_received` hook return value is IGNORED by OpenClaw.** Do not rely on `{ cancel: true }` to prevent message delivery. The hook is fire-and-forget (`runVoidHook`).
 3. **The `ctx.channelId` in OpenClaw's `message_received` hook is the platform name** (e.g., "slack"), not a Slack channel ID. Don't confuse it with the Slack channel ID in `SlackIngressEvent.channelId`.
-4. **Suppression leases are refreshed every 30s during LLM processing** but still time-limited (120s TTL, max 10 cancels). If the heartbeat is somehow interrupted, OpenClaw outbound may leak.
-5. **`reconcileSlackRoutingForTalks()` only runs at startup.** New Talk bindings won't take effect until gateway restart.
-6. **The `before_tool_call` hook blocks OpenClaw's agent `message` tool** when a suppression lease is active. It does NOT block ClawTalk's own sessions (`talk:clawtalk:*` / `job:clawtalk:*` prefixes). The hook is read-only — it checks but does not consume suppression leases.
+4. **`reconcileSlackRoutingForTalks()` only runs at startup.** New Talk bindings won't take effect until gateway restart. Managed agents (`ct-*` prefix) and their bindings are written to `agents.list` and `bindings` in `openclaw.json`.
+5. **Managed agent IDs use the `ct-` prefix** (e.g., `ct-8fabc85a`). Do not manually create agents with this prefix — they will be overwritten by the routing sync. Use `buildManagedAgentId()` and `isManagedAgentId()` from `slack-routing-sync.ts`.
+6. **The `before_agent_start` hook injects Talk context for managed agents.** It matches on `ct-*` agent IDs. The context block (~2KB) includes instructions, objective, rules, context.md, pins, and state paths. If no Talk is found for the agent ID, the hook passes through.
 
 ## Related Projects
 
