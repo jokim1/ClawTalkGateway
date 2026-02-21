@@ -25,10 +25,10 @@ const EXPLORATION_RATE = envInt('CLAWTALK_AFFINITY_EXPLORATION_RATE', 20);
 const MIN_AFFINITY_THRESHOLD = envFloat('CLAWTALK_AFFINITY_MIN_THRESHOLD', 0.1);
 
 /**
- * Cold-start intents skip warmup and start in learned phase with only baseline
- * tools. The baseline pattern keeps state tools (state_append_event,
- * state_read_summary) so persistence always works, while pruning the other
- * ~15 tools that cause reasoning-model slowdowns.
+ * Cold-start intents skip warmup and start in learned phase with zero tools.
+ * When a `coldStartBaseline` is provided to `selectTools()`, ALL intents
+ * with no affinity data use it — not just these. These intents are the
+ * fallback for when no baseline is provided.
  * Exploration probes (5%) still fire to discover unexpected tool needs.
  */
 const COLD_START_INTENTS = new Set([
@@ -37,9 +37,6 @@ const COLD_START_INTENTS = new Set([
   'conversation',
   'model_meta',
 ]);
-
-/** Cold-start baseline: always include state tools so persistence works. */
-const COLD_START_BASELINE_PATTERN = /^state_/;
 
 function envInt(key: string, fallback: number): number {
   const raw = process.env[key];
@@ -164,18 +161,24 @@ export function classifyMessageIntent(text: string): string {
 
 /**
  * Scale timeout proportionally to tool count.
- * 0 tools → 60s, 1-3 tools → 80-120s, 4-8 tools → 140-220s, 9+ tools → baseTimeout.
+ * 0 tools → floor, 1-3 tools → 80-120s, 4-8 tools → 140-220s, 9+ tools → baseTimeout.
  * During warmup/exploration, always use baseTimeout since full tool set is sent.
+ *
+ * `minTimeoutMs` sets a floor for the learned-phase scaling. Defaults to 60s,
+ * which is fine for streaming (TTFT). Non-streaming callers (slack-ingress)
+ * should pass a higher floor since the timeout covers the full response.
  */
 export function computeAffinityTimeout(params: {
   phase: AffinityPhase;
   toolCount: number;
   baseTimeoutMs: number;
+  minTimeoutMs?: number;
 }): number {
   if (params.phase === 'warmup' || params.phase === 'exploration') {
     return params.baseTimeoutMs;
   }
-  return Math.min(params.baseTimeoutMs, 60_000 + params.toolCount * 20_000);
+  const floor = params.minTimeoutMs ?? 60_000;
+  return Math.min(params.baseTimeoutMs, Math.max(floor, 60_000 + params.toolCount * 20_000));
 }
 
 // ---------------------------------------------------------------------------
@@ -239,9 +242,12 @@ export class ToolAffinityStore {
     intent: string;
     policyAllowedTools: string[];
     snapshot: ToolAffinitySnapshot | undefined;
+    /** When provided, ALL intents with no affinity data use this baseline instead of warmup. */
+    coldStartBaseline?: string[];
   }): ToolAffinitySelection {
-    const { intent, policyAllowedTools, snapshot } = params;
-    const phase = this.resolvePhase(intent, snapshot);
+    const { intent, policyAllowedTools, snapshot, coldStartBaseline } = params;
+    const hasBaseline = coldStartBaseline !== undefined && coldStartBaseline.length > 0;
+    const phase = this.resolvePhase(intent, snapshot, hasBaseline);
 
     if (phase === 'warmup' || phase === 'exploration') {
       return {
@@ -256,18 +262,29 @@ export class ToolAffinityStore {
 
     // Learned phase: filter to tools with affinity above threshold
     const intentData = snapshot?.intents.find((i) => i.intent === intent);
-    if (!intentData) {
-      // Cold-start intent with no data yet: include only state tools baseline
-      if (COLD_START_INTENTS.has(intent)) {
-        const baseline = policyAllowedTools.filter(t => COLD_START_BASELINE_PATTERN.test(t));
-        const pruned = policyAllowedTools.filter(t => !COLD_START_BASELINE_PATTERN.test(t));
+    if (!intentData || intentData.totalObservations < WARMUP_THRESHOLD) {
+      // Cold-start: baseline provided → use it for ANY intent
+      if (hasBaseline) {
+        const baselineSet = new Set(coldStartBaseline!.map(t => t.toLowerCase()));
+        const selected = policyAllowedTools.filter(t => baselineSet.has(t.toLowerCase()));
+        const pruned = policyAllowedTools.filter(t => !baselineSet.has(t.toLowerCase()));
         return {
           phase: 'learned',
-          selectedTools: baseline,
+          selectedTools: selected,
           prunedTools: pruned,
-          reason: `cold-start: intent="${intent}" baseline=${baseline.length} state tools`,
+          reason: `cold-start: intent="${intent}" baseline=${selected.length} tools`,
         };
       }
+      // No baseline + COLD_START_INTENTS → learned with 0 tools
+      if (COLD_START_INTENTS.has(intent)) {
+        return {
+          phase: 'learned',
+          selectedTools: [],
+          prunedTools: policyAllowedTools,
+          reason: `cold-start: intent="${intent}" baseline=0 tools`,
+        };
+      }
+      // No baseline + non-cold-start intent → warmup with all tools
       return {
         phase: 'warmup',
         selectedTools: policyAllowedTools,
@@ -300,15 +317,16 @@ export class ToolAffinityStore {
   }
 
   /** Determine which phase an intent is in. */
-  resolvePhase(intent: string, snapshot: ToolAffinitySnapshot | undefined): AffinityPhase {
+  resolvePhase(intent: string, snapshot: ToolAffinitySnapshot | undefined, hasBaseline = false): AffinityPhase {
     const intentData = snapshot?.intents.find((i) => i.intent === intent);
     const hasEnoughData = intentData && intentData.totalObservations >= WARMUP_THRESHOLD;
 
-    if (!hasEnoughData && !COLD_START_INTENTS.has(intent)) {
+    if (!hasEnoughData && !hasBaseline && !COLD_START_INTENTS.has(intent)) {
       return 'warmup';
     }
 
-    // Cold-start intents or intents with enough data: learned with exploration probes
+    // Cold-start intents, baseline-provided intents, or intents with enough data:
+    // learned with exploration probes
     if (EXPLORATION_RATE > 0 && Math.random() < 1 / EXPLORATION_RATE) {
       return 'exploration';
     }
@@ -383,6 +401,26 @@ export class ToolAffinityStore {
       intents,
     };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Cold-Start Baseline from Talk Config
+// ---------------------------------------------------------------------------
+
+/**
+ * Derive the cold-start baseline tool set from Talk configuration.
+ * For stream_store backends, baseline = all state_* tools in the policy set.
+ * For other backends (workspace_files), no baseline → old warmup behavior.
+ */
+export function computeColdStartBaseline(params: {
+  stateBackend: 'stream_store' | 'workspace_files' | undefined;
+  policyAllowedTools: string[];
+}): string[] {
+  const backend = params.stateBackend ?? 'stream_store';
+  if (backend === 'stream_store') {
+    return params.policyAllowedTools.filter(t => t.toLowerCase().startsWith('state_'));
+  }
+  return [];
 }
 
 // ---------------------------------------------------------------------------

@@ -38,6 +38,7 @@ import {
   isAffinityDisabled,
   classifyMessageIntent,
   computeAffinityTimeout,
+  computeColdStartBaseline,
   type ToolAffinityObservation,
 } from './tool-affinity.js';
 
@@ -1293,11 +1294,17 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
     const affinityStore = getToolAffinityStore(dataDir, logger);
     affinityIntent = classifyMessageIntent(body.message);
     const snapshot = affinityStore.getSnapshot(talkId);
+    const policyToolNames = tools.map((t) => t.function.name);
+    const coldStartBaseline = computeColdStartBaseline({
+      stateBackend: meta.stateBackend,
+      policyAllowedTools: policyToolNames,
+    });
     const selection = affinityStore.selectTools({
       talkId,
       intent: affinityIntent,
-      policyAllowedTools: tools.map((t) => t.function.name),
+      policyAllowedTools: policyToolNames,
       snapshot,
+      coldStartBaseline,
     });
     affinityPhase = selection.phase;
     if (selection.prunedTools.length > 0) {

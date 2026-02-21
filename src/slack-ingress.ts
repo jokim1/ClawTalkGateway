@@ -33,6 +33,7 @@ import {
   isAffinityDisabled,
   classifyMessageIntent as classifyAffinityIntent,
   computeAffinityTimeout,
+  computeColdStartBaseline,
 } from './tool-affinity.js';
 
 const MAX_CONTEXT_MESSAGES = 50;
@@ -1408,11 +1409,17 @@ async function callLlmForEvent(params: {
   if (tools.length > 0 && !isAffinityDisabled()) {
     const affinityStore = getToolAffinityStore(deps.dataDir, deps.logger);
     const snapshot = affinityStore.getSnapshot(talkId);
+    const policyToolNames = tools.map((t) => t.function.name);
+    const coldStartBaseline = computeColdStartBaseline({
+      stateBackend: meta.stateBackend,
+      policyAllowedTools: policyToolNames,
+    });
     const selection = affinityStore.selectTools({
       talkId,
       intent: affinityIntent,
-      policyAllowedTools: tools.map((t) => t.function.name),
+      policyAllowedTools: policyToolNames,
       snapshot,
+      coldStartBaseline,
     });
     affinityPhase = selection.phase;
     if (selection.prunedTools.length > 0) {
@@ -1481,6 +1488,7 @@ async function callLlmForEvent(params: {
       phase: affinityPhase,
       toolCount: tools.length,
       baseTimeoutMs: getLlmTimeoutMs(),
+      minTimeoutMs: 120_000, // Non-streaming needs full response, not just first token
     }),
     toolChoice: enableToolsForTurn ? 'auto' : 'none',
     defaultGoogleAuthProfile: meta.googleAuthProfile,

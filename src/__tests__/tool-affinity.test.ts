@@ -4,6 +4,7 @@ import * as fs from 'node:fs';
 import {
   classifyMessageIntent,
   computeAffinityTimeout,
+  computeColdStartBaseline,
   ToolAffinityStore,
   type ToolAffinityObservation,
   type AffinityPhase,
@@ -20,6 +21,12 @@ describe('classifyMessageIntent', () => {
   it('classifies study entries', () => {
     expect(classifyMessageIntent('I studied math for 2 hours')).toBe('study');
     expect(classifyMessageIntent('Worked on coding for 30 minutes')).toBe('study');
+  });
+
+  it('classifies bare time quantities as other (no study keyword)', () => {
+    expect(classifyMessageIntent('add 440 minutes for asher and 135 for jaxon')).toBe('other');
+    expect(classifyMessageIntent('44m for kaela')).toBe('other');
+    expect(classifyMessageIntent('pls add 2h for jaxon')).toBe('other');
   });
 
   it('classifies state_tracking', () => {
@@ -99,6 +106,30 @@ describe('computeAffinityTimeout', () => {
 
   it('caps at baseTimeout for many tools', () => {
     expect(computeAffinityTimeout({ phase: 'learned', toolCount: 17, baseTimeoutMs: 240_000 }))
+      .toBe(240_000);
+  });
+
+  it('respects minTimeoutMs floor for learned phase with 0 tools', () => {
+    expect(computeAffinityTimeout({ phase: 'learned', toolCount: 0, baseTimeoutMs: 240_000, minTimeoutMs: 120_000 }))
+      .toBe(120_000);
+  });
+
+  it('respects minTimeoutMs floor for learned phase with 1 tool', () => {
+    // 60_000 + 1*20_000 = 80_000 < 120_000 floor → floor wins
+    expect(computeAffinityTimeout({ phase: 'learned', toolCount: 1, baseTimeoutMs: 240_000, minTimeoutMs: 120_000 }))
+      .toBe(120_000);
+  });
+
+  it('uses computed timeout when it exceeds minTimeoutMs', () => {
+    // 60_000 + 5*20_000 = 160_000 > 120_000 floor → computed wins
+    expect(computeAffinityTimeout({ phase: 'learned', toolCount: 5, baseTimeoutMs: 240_000, minTimeoutMs: 120_000 }))
+      .toBe(160_000);
+  });
+
+  it('ignores minTimeoutMs for warmup/exploration phases', () => {
+    expect(computeAffinityTimeout({ phase: 'warmup', toolCount: 0, baseTimeoutMs: 240_000, minTimeoutMs: 120_000 }))
+      .toBe(240_000);
+    expect(computeAffinityTimeout({ phase: 'exploration', toolCount: 0, baseTimeoutMs: 240_000, minTimeoutMs: 120_000 }))
       .toBe(240_000);
   });
 });
@@ -248,12 +279,12 @@ describe('ToolAffinityStore', () => {
       expect(result.prunedTools).toEqual([]);
     });
 
-    it('returns cold-start learned with state tools baseline for study intent', () => {
+    it('returns cold-start learned with baseline tools when baseline provided', () => {
       const dataDir = makeTmpDir();
       const store = new ToolAffinityStore(dataDir, logger);
       const talkId = 'test-cold-start';
 
-      // No observations at all — cold-start intents go directly to learned with state tools
+      // No observations at all — baseline provided, study intent uses it
       const origRandom = Math.random;
       Math.random = () => 0.5; // avoid exploration
       try {
@@ -262,6 +293,7 @@ describe('ToolAffinityStore', () => {
           intent: 'study',
           policyAllowedTools: ['state_append_event', 'state_read_summary', 'google_docs_append', 'web_search'],
           snapshot: undefined,
+          coldStartBaseline: ['state_append_event', 'state_read_summary'],
         });
 
         expect(result.phase).toBe('learned');
@@ -274,10 +306,10 @@ describe('ToolAffinityStore', () => {
       }
     });
 
-    it('returns cold-start learned with zero tools when no state tools in policy', () => {
+    it('returns cold-start learned with zero tools for cold-start intent without baseline', () => {
       const dataDir = makeTmpDir();
       const store = new ToolAffinityStore(dataDir, logger);
-      const talkId = 'test-cold-start-no-state';
+      const talkId = 'test-cold-start-no-baseline';
 
       const origRandom = Math.random;
       Math.random = () => 0.5; // avoid exploration
@@ -297,6 +329,48 @@ describe('ToolAffinityStore', () => {
       } finally {
         Math.random = origRandom;
       }
+    });
+
+    it('returns cold-start baseline for "other" intent when baseline provided', () => {
+      const dataDir = makeTmpDir();
+      const store = new ToolAffinityStore(dataDir, logger);
+      const talkId = 'test-other-with-baseline';
+
+      const origRandom = Math.random;
+      Math.random = () => 0.5; // avoid exploration
+      try {
+        const result = store.selectTools({
+          talkId,
+          intent: 'other',
+          policyAllowedTools: ['state_append_event', 'state_read_summary', 'google_docs_append', 'web_search'],
+          snapshot: undefined,
+          coldStartBaseline: ['state_append_event', 'state_read_summary'],
+        });
+
+        expect(result.phase).toBe('learned');
+        expect(result.selectedTools).toEqual(['state_append_event', 'state_read_summary']);
+        expect(result.prunedTools).toEqual(['google_docs_append', 'web_search']);
+        expect(result.reason).toContain('cold-start');
+        expect(result.reason).toContain('baseline=2');
+      } finally {
+        Math.random = origRandom;
+      }
+    });
+
+    it('returns warmup for "other" intent without baseline', () => {
+      const dataDir = makeTmpDir();
+      const store = new ToolAffinityStore(dataDir, logger);
+      const talkId = 'test-other-no-baseline';
+
+      const result = store.selectTools({
+        talkId,
+        intent: 'other',
+        policyAllowedTools: ['state_append_event', 'web_search'],
+        snapshot: undefined,
+      });
+
+      expect(result.phase).toBe('warmup');
+      expect(result.selectedTools).toEqual(['state_append_event', 'web_search']);
     });
 
     it('returns learned subset after warmup threshold', () => {
@@ -371,6 +445,113 @@ describe('ToolAffinityStore', () => {
 
       expect(result.phase).toBe('warmup');
       expect(result.selectedTools).toEqual(['tool_a', 'tool_b']);
+    });
+
+    it('uses baseline (not 0 tools) when 1 observation recorded with 0 tools used (death spiral regression)', () => {
+      const dataDir = makeTmpDir();
+      const store = new ToolAffinityStore(dataDir, logger);
+      const talkId = 'test-death-spiral';
+      const allTools = ['state_append_event', 'state_read_summary', 'state_read_state', 'state_get_event',
+        'google_docs_append', 'web_search', 'tool_x'];
+      const baseline = ['state_append_event', 'state_read_summary', 'state_read_state', 'state_get_event'];
+
+      // Simulate: first study request observed 0 tools used (cold-start baseline was sent)
+      store.recordObservation(talkId, {
+        timestamp: Date.now(),
+        intent: 'study',
+        availableTools: baseline,
+        usedTools: [],
+        toolsOffered: 4,
+        model: 'kimi-k2.5',
+        source: 'slack-ingress',
+      });
+
+      const origRandom = Math.random;
+      Math.random = () => 0.5; // avoid exploration
+      try {
+        const snapshot = store.getSnapshot(talkId);
+        const result = store.selectTools({
+          talkId,
+          intent: 'study',
+          policyAllowedTools: allTools,
+          snapshot,
+          coldStartBaseline: baseline,
+        });
+
+        // With the fix: 1 observation < warmup threshold (3) → use baseline, NOT affinity
+        expect(result.phase).toBe('learned');
+        expect(result.selectedTools).toEqual(baseline);
+        expect(result.reason).toContain('cold-start');
+        expect(result.reason).toContain('baseline=4');
+      } finally {
+        Math.random = origRandom;
+      }
+    });
+
+    it('uses baseline at WARMUP_THRESHOLD-1 observations, switches to affinity at WARMUP_THRESHOLD', () => {
+      const dataDir = makeTmpDir();
+      const store = new ToolAffinityStore(dataDir, logger);
+      const talkId = 'test-threshold-boundary';
+      const allTools = ['state_append_event', 'state_read_summary', 'google_docs_append'];
+      const baseline = ['state_append_event', 'state_read_summary'];
+
+      // Seed 2 observations (WARMUP_THRESHOLD - 1) with 0 tools used
+      for (let i = 0; i < 2; i++) {
+        store.recordObservation(talkId, {
+          timestamp: Date.now() + i,
+          intent: 'study',
+          availableTools: baseline,
+          usedTools: [],
+          toolsOffered: 2,
+          model: 'test-model',
+          source: 'talk-chat',
+        });
+      }
+
+      const origRandom = Math.random;
+      Math.random = () => 0.5; // avoid exploration
+      try {
+        let snapshot = store.getSnapshot(talkId);
+        let result = store.selectTools({
+          talkId,
+          intent: 'study',
+          policyAllowedTools: allTools,
+          snapshot,
+          coldStartBaseline: baseline,
+        });
+
+        // 2 < 3 → still uses baseline
+        expect(result.phase).toBe('learned');
+        expect(result.selectedTools).toEqual(baseline);
+        expect(result.reason).toContain('cold-start');
+
+        // Add observation #3 to cross threshold — still 0 tools used
+        store.recordObservation(talkId, {
+          timestamp: Date.now() + 3,
+          intent: 'study',
+          availableTools: baseline,
+          usedTools: [],
+          toolsOffered: 2,
+          model: 'test-model',
+          source: 'talk-chat',
+        });
+
+        snapshot = store.getSnapshot(talkId);
+        result = store.selectTools({
+          talkId,
+          intent: 'study',
+          policyAllowedTools: allTools,
+          snapshot,
+          coldStartBaseline: baseline,
+        });
+
+        // 3 >= 3 → learned affinity kicks in, all 3 observations had 0 tools → prunes all
+        expect(result.phase).toBe('learned');
+        expect(result.selectedTools).toEqual([]);
+        expect(result.reason).toContain('affinity=0');
+      } finally {
+        Math.random = origRandom;
+      }
     });
   });
 
@@ -465,5 +646,59 @@ describe('ToolAffinityStore', () => {
         Math.random = origRandom;
       }
     });
+
+    it('returns learned for non-cold-start intent when hasBaseline is true', () => {
+      const dataDir = makeTmpDir();
+      const store = new ToolAffinityStore(dataDir, logger);
+      const origRandom = Math.random;
+      Math.random = () => 0.5;
+      try {
+        expect(store.resolvePhase('other', undefined, true)).toBe('learned');
+        expect(store.resolvePhase('google_docs', undefined, true)).toBe('learned');
+      } finally {
+        Math.random = origRandom;
+      }
+    });
+
+    it('returns warmup for non-cold-start intent when hasBaseline is false', () => {
+      const dataDir = makeTmpDir();
+      const store = new ToolAffinityStore(dataDir, logger);
+      expect(store.resolvePhase('other', undefined, false)).toBe('warmup');
+      expect(store.resolvePhase('google_docs', undefined)).toBe('warmup');
+    });
+  });
+});
+
+describe('computeColdStartBaseline', () => {
+  it('returns state tools for stream_store backend', () => {
+    const result = computeColdStartBaseline({
+      stateBackend: 'stream_store',
+      policyAllowedTools: ['state_append_event', 'state_read_summary', 'google_docs_append', 'web_search'],
+    });
+    expect(result).toEqual(['state_append_event', 'state_read_summary']);
+  });
+
+  it('returns state tools when stateBackend is undefined (defaults to stream_store)', () => {
+    const result = computeColdStartBaseline({
+      stateBackend: undefined,
+      policyAllowedTools: ['state_append_event', 'state_read_summary', 'web_search'],
+    });
+    expect(result).toEqual(['state_append_event', 'state_read_summary']);
+  });
+
+  it('returns empty array for workspace_files backend', () => {
+    const result = computeColdStartBaseline({
+      stateBackend: 'workspace_files',
+      policyAllowedTools: ['state_append_event', 'state_read_summary', 'web_search'],
+    });
+    expect(result).toEqual([]);
+  });
+
+  it('returns empty array when no state tools in policy', () => {
+    const result = computeColdStartBaseline({
+      stateBackend: 'stream_store',
+      policyAllowedTools: ['google_docs_append', 'web_search'],
+    });
+    expect(result).toEqual([]);
   });
 });
