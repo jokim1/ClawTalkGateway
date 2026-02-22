@@ -259,6 +259,19 @@ export async function reconcileSlackRoutingForTalks(
   const channelsRoot = ensureObjectPath(cfg, 'channels');
   const slackRoot = ensureObjectPath(channelsRoot, 'slack');
   const accountsRoot = ensureObjectPath(slackRoot, 'accounts');
+
+  // Migrate old nested dm.{policy,allowFrom} → flat dmPolicy/allowFrom
+  // (OpenClaw 2026.2.19+ uses the flat format; avoids doctor warnings on every restart)
+  for (const acct of Object.values(accountsRoot)) {
+    if (!acct || typeof acct !== 'object') continue;
+    const a = acct as Record<string, unknown>;
+    const dm = a.dm;
+    if (!dm || typeof dm !== 'object') continue;
+    const d = dm as Record<string, unknown>;
+    if (d.policy !== undefined && a.dmPolicy === undefined) a.dmPolicy = d.policy;
+    if (d.allowFrom !== undefined && a.allowFrom === undefined) a.allowFrom = d.allowFrom;
+    delete a.dm;
+  }
   for (const entry of desired) {
     if (entry.peer.kind !== 'channel') continue;
     const accountRoot = ensureObjectPath(accountsRoot, entry.accountId);

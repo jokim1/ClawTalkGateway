@@ -235,7 +235,9 @@ function resolveGatewayOrigin(cfg: Record<string, any>, log: PluginApi['logger']
     }
   }
 
-  if (bind && bind !== 'tailnet' && bind !== 'tailscale' && bind !== '0.0.0.0') {
+  // "loopback" is a symbolic name used by OpenClaw when Tailscale Serve proxies
+  // HTTPS traffic to a localhost-bound gateway.
+  if (bind && bind !== 'tailnet' && bind !== 'tailscale' && bind !== 'loopback' && bind !== '0.0.0.0') {
     return `http://${bind}:${port}`;
   }
 
@@ -1280,8 +1282,9 @@ const plugin = {
 
         // WebSocket upgrade for voice streaming — handled separately
         if (url.pathname === '/api/voice/stream') {
-          const host = req.headers.host ?? 'localhost:18789';
-          const gatewayOrigin = `http://${host}`;
+          const selfAddr = req.socket?.localAddress ?? '127.0.0.1';
+          const selfPort = req.socket?.localPort ?? 18789;
+          const gatewayOrigin = `http://${selfAddr}:${selfPort}`;
           const gatewayToken = resolveGatewayToken(cfg);
           handleVoiceStreamUpgrade(
             req, res, api.logger,
@@ -1618,8 +1621,9 @@ const plugin = {
             break;
           }
           case '/api/events/slack': {
-            const host = req.headers.host ?? 'localhost:18789';
-            const gatewayOrigin = `http://${host}`;
+            const selfAddr = req.socket?.localAddress ?? '127.0.0.1';
+            const selfPort = req.socket?.localPort ?? 18789;
+            const gatewayOrigin = `http://${selfAddr}:${selfPort}`;
             const gatewayToken = resolveGatewayToken(cfg);
             await handleSlackIngress(ctx, {
               ...buildSlackIngressDeps(),
@@ -1656,8 +1660,9 @@ const plugin = {
             await handleRealtimeVoiceCapabilities(ctx);
             break;
           case '/slack/events': {
-            const host = req.headers.host ?? 'localhost:18789';
-            const gatewayOrigin = `http://${host}`;
+            const selfAddr = req.socket?.localAddress ?? '127.0.0.1';
+            const selfPort = req.socket?.localPort ?? 18789;
+            const gatewayOrigin = `http://${selfAddr}:${selfPort}`;
             const gatewayToken = resolveGatewayToken(cfg);
             await handleSlackEventProxy(req, res, {
               store: talkStore,
