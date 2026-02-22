@@ -48,6 +48,7 @@ import {
   computeColdStartBaseline,
   type ToolAffinityObservation,
 } from './tool-affinity.js';
+import { getTtftTracker } from './ttft-tracker.js';
 
 /** Maximum number of history messages to include in LLM context. */
 const MAX_CONTEXT_MESSAGES = 50;
@@ -1511,6 +1512,21 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
   }
 
   store.setProcessing(talkId, true);
+  const ttftTracker = getTtftTracker(logger);
+  const adaptiveBaseTimeout = ttftTracker.computeTimeout(model, resolveTalkFirstTokenTimeoutMs());
+  const ttftHealth = ttftTracker.getHealth(model);
+  if (ttftHealth.degraded) {
+    emitStatusEvent(res, {
+      code: 'MODEL_DEGRADED',
+      message: `Model class "${ttftHealth.modelClass}" is experiencing elevated timeouts (${Math.round(ttftHealth.recentTimeoutRate * 100)}% recent timeout rate). Requests may be slower than usual.`,
+      level: 'warn',
+      meta: {
+        modelClass: ttftHealth.modelClass,
+        recentTimeoutRate: ttftHealth.recentTimeoutRate,
+        observationCount: ttftHealth.observationCount,
+      },
+    });
+  }
   try {
     const result = await runToolLoop({
       messages,
@@ -1528,7 +1544,7 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
       firstTokenTimeoutMs: computeAffinityTimeout({
         phase: affinityPhase,
         toolCount: tools.length,
-        baseTimeoutMs: resolveTalkFirstTokenTimeoutMs(),
+        baseTimeoutMs: adaptiveBaseTimeout,
       }),
       timeoutMs: resolveTalkInactivityTimeoutMs(),
       maxTotalMs: resolveTalkTotalTimeoutMs(),
@@ -1539,6 +1555,8 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
       // explicit function-calling tool schema behavior.
       transport: 'chat_completions',
       onStatus: (status) => emitStatusEvent(res, status),
+      onTtftObserved: (obs) => ttftTracker.record(obs),
+      retryTtftMultiplier: 1.5,
       talkId,
     });
 

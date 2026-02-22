@@ -200,6 +200,10 @@ export interface ToolLoopStreamOptions {
   defaultGoogleAuthProfile?: string;
   /** Optional callback for user-visible status updates. */
   onStatus?: (payload: { code: string; message: string; level?: 'info' | 'warn' | 'error'; meta?: Record<string, unknown> }) => void;
+  /** Callback fired when a TTFT observation is available (first delta or timeout). */
+  onTtftObserved?: (obs: { model: string; ttftMs: number; timedOut: boolean }) => void;
+  /** Multiplier applied to firstTokenTimeoutMs on retry attempt (default 1.5). */
+  retryTtftMultiplier?: number;
   /** Transport for upstream OpenClaw call. */
   transport?: 'chat_completions' | 'responses';
   /** Current talk id for talk-scoped state tools. */
@@ -284,12 +288,17 @@ export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoop
       const ttftController = new AbortController();
       let ttftAborted = false;
       let sawFirstDelta = false;
-      const ttftMs = Math.max(5_000, opts.firstTokenTimeoutMs ?? 90_000);
+      const baseTtftMs = Math.max(5_000, opts.firstTokenTimeoutMs ?? 90_000);
+      const retryMultiplier = opts.retryTtftMultiplier ?? 1.5;
+      const ttftMs = attempt === 0 ? baseTtftMs : Math.round(baseTtftMs * retryMultiplier);
+      const fetchStartTime = Date.now();
       let ttftWarn30: ReturnType<typeof setTimeout> | undefined;
       let ttftWarn60: ReturnType<typeof setTimeout> | undefined;
       const markFirstDelta = () => {
         if (sawFirstDelta) return;
         sawFirstDelta = true;
+        const elapsed = Date.now() - fetchStartTime;
+        opts.onTtftObserved?.({ model, ttftMs: elapsed, timedOut: false });
         if (ttftTimer) {
           clearTimeout(ttftTimer);
           ttftTimer = undefined;
@@ -440,6 +449,8 @@ export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoop
       } catch (err) {
         let effectiveErr: unknown = err;
         if (ttftAborted && !abort.signal.aborted && !clientSignal?.aborted) {
+          const elapsed = Date.now() - fetchStartTime;
+          opts.onTtftObserved?.({ model, ttftMs: elapsed, timedOut: true });
           effectiveErr = new Error(`First token timeout after ${ttftMs}ms`);
         }
         if (ttftTimer) {
@@ -478,7 +489,7 @@ export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoop
             logger.info(`ToolLoop: fetch failure (iteration ${iteration}), retrying after 2s`);
           }
 
-          await sleep(2000);
+          await sleep(2000 + Math.floor(Math.random() * 1000));
           abort.touch();
           continue; // retry the inner attempt loop
         }
