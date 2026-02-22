@@ -20,6 +20,7 @@ type ManagedAgent = {
   name: string;
   model: string;
   sandbox: { mode: 'off' };
+  skills?: string[];
 };
 
 /** Build a stable managed agent ID from a Talk ID. */
@@ -110,6 +111,7 @@ function buildManagedAgentsFromTalks(
       name: talk.topicTitle || `ClawTalk ${agentId}`,
       model: talk.model || defaultModel,
       sandbox: { mode: 'off' },
+      ...(talk.skills ? { skills: talk.skills } : {}),
     });
   }
   return agents;

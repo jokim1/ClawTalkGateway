@@ -1240,6 +1240,16 @@ export async function handleTalks(ctx: HandlerContext, store: TalkStore, registr
     return;
   }
 
+  // GET/PATCH /api/talks/:id/skills
+  const skillsMatch = pathname.match(/^\/api\/talks\/([\w-]+)\/skills$/);
+  if (skillsMatch) {
+    const talkId = skillsMatch[1];
+    if (req.method === 'GET') return handleGetTalkSkills(ctx, store, talkId);
+    if (req.method === 'PATCH') return handleUpdateTalkSkills(ctx, store, talkId);
+    sendJson(res, 405, { error: 'Method not allowed' });
+    return;
+  }
+
   // GET /api/talks/:id/state/:stream/summary
   const stateSummaryMatch = pathname.match(/^\/api\/talks\/([\w-]+)\/state\/([\w.-]+)\/summary$/);
   if (stateSummaryMatch) {
@@ -1361,6 +1371,7 @@ async function handleCreateTalk(ctx: HandlerContext, store: TalkStore): Promise<
     stateBackend?: string;
     toolsAllow?: string[];
     toolsDeny?: string[];
+    skills?: string[];
     googleAuthProfile?: string;
     defaultStateStream?: string;
     toolPolicy?: {
@@ -1371,6 +1382,7 @@ async function handleCreateTalk(ctx: HandlerContext, store: TalkStore): Promise<
       stateBackend?: string;
       allow?: string[];
       deny?: string[];
+      skills?: string[];
       googleAuthProfile?: string;
       defaultStateStream?: string;
     };
@@ -1413,6 +1425,9 @@ async function handleCreateTalk(ctx: HandlerContext, store: TalkStore): Promise<
   }
   if (body.toolsDeny === undefined && body.toolPolicy?.deny !== undefined) {
     body.toolsDeny = body.toolPolicy.deny;
+  }
+  if (body.skills === undefined && body.toolPolicy?.skills !== undefined) {
+    body.skills = body.toolPolicy.skills;
   }
   if (body.googleAuthProfile === undefined && body.toolPolicy?.googleAuthProfile !== undefined) {
     body.googleAuthProfile = body.toolPolicy.googleAuthProfile;
@@ -1514,6 +1529,7 @@ async function handleCreateTalk(ctx: HandlerContext, store: TalkStore): Promise<
     ...(stateBackend !== undefined ? { stateBackend } : {}),
     ...(toolsAllow !== undefined ? { toolsAllow } : {}),
     ...(toolsDeny !== undefined ? { toolsDeny } : {}),
+    ...(body.skills !== undefined ? { skills: body.skills } : {}),
     ...(googleAuthProfile !== undefined ? { googleAuthProfile: googleAuthProfile || undefined } : {}),
     ...(defaultStateStream !== undefined ? { defaultStateStream: defaultStateStream || undefined } : {}),
   });
@@ -1835,6 +1851,156 @@ async function handleUpdateTalkTools(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Skills catalog cache
+// ---------------------------------------------------------------------------
+
+interface SkillCatalogEntry {
+  name: string;
+  description: string;
+  emoji?: string;
+  eligible: boolean;
+}
+
+let skillsCatalogCache: SkillCatalogEntry[] | null = null;
+let skillsCatalogCacheAt = 0;
+const SKILLS_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+async function fetchSkillsCatalog(logger?: { info: (msg: string) => void }): Promise<SkillCatalogEntry[]> {
+  const now = Date.now();
+  if (skillsCatalogCache && now - skillsCatalogCacheAt < SKILLS_CACHE_TTL_MS) {
+    return skillsCatalogCache;
+  }
+  try {
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execFileAsync = promisify(execFile);
+    const { stdout } = await execFileAsync('openclaw', ['skills', 'list', '--json'], {
+      timeout: 15_000,
+      env: { ...process.env },
+    });
+    // Parse JSON — the output may have non-JSON prefix lines from doctor warnings
+    const jsonStart = stdout.indexOf('{');
+    if (jsonStart < 0) {
+      logger?.info('[skills] openclaw skills list returned no JSON');
+      return skillsCatalogCache ?? [];
+    }
+    const parsed = JSON.parse(stdout.slice(jsonStart)) as { skills: Array<{
+      name: string;
+      description: string;
+      emoji?: string;
+      eligible: boolean;
+    }> };
+    skillsCatalogCache = parsed.skills.map(s => ({
+      name: s.name,
+      description: s.description,
+      emoji: s.emoji,
+      eligible: s.eligible,
+    }));
+    skillsCatalogCacheAt = now;
+    return skillsCatalogCache;
+  } catch (err) {
+    logger?.info(`[skills] Failed to fetch skills catalog: ${err}`);
+    return skillsCatalogCache ?? [];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/talks/:id/skills
+// ---------------------------------------------------------------------------
+
+async function handleGetTalkSkills(
+  ctx: HandlerContext,
+  store: TalkStore,
+  talkId: string,
+): Promise<void> {
+  const talk = store.getTalk(talkId);
+  if (!talk) {
+    sendJson(ctx.res, 404, { error: 'Talk not found' });
+    return;
+  }
+  const catalog = await fetchSkillsCatalog(ctx.logger);
+  const allSkillsMode = talk.skills === undefined;
+  const enabledSet = allSkillsMode ? null : new Set(talk.skills);
+  const skills = catalog.map(s => ({
+    name: s.name,
+    description: s.description,
+    emoji: s.emoji,
+    eligible: s.eligible,
+    enabled: enabledSet ? enabledSet.has(s.name) : true,
+  }));
+  sendJson(ctx.res, 200, { talkId, skills, allSkillsMode });
+}
+
+// ---------------------------------------------------------------------------
+// PATCH /api/talks/:id/skills
+// ---------------------------------------------------------------------------
+
+async function handleUpdateTalkSkills(
+  ctx: HandlerContext,
+  store: TalkStore,
+  talkId: string,
+): Promise<void> {
+  let body: { skills?: string[] | null };
+  try {
+    body = (await readJsonBody(ctx.req)) as typeof body;
+  } catch {
+    sendJson(ctx.res, 400, { error: 'Invalid JSON body' });
+    return;
+  }
+
+  const talk = store.getTalk(talkId);
+  if (!talk) {
+    sendJson(ctx.res, 404, { error: 'Talk not found' });
+    return;
+  }
+  const precondition = requireTalkPreconditionVersion(ctx, talk);
+  if (!precondition.ok) return;
+  const modifiedBy = extractClientIdHeader(ctx);
+
+  // null or undefined → reset to all-skills mode (undefined in meta)
+  // string[] → validate against catalog and set
+  let skillsValue: string[] | undefined;
+  if (body.skills === null || body.skills === undefined) {
+    skillsValue = undefined;
+  } else if (Array.isArray(body.skills)) {
+    const catalog = await fetchSkillsCatalog(ctx.logger);
+    const knownNames = new Set(catalog.map(s => s.name));
+    const invalid = body.skills.filter(s => !knownNames.has(s));
+    if (invalid.length > 0) {
+      sendJson(ctx.res, 400, { error: `Unknown skill names: ${invalid.join(', ')}` });
+      return;
+    }
+    skillsValue = body.skills;
+  } else {
+    sendJson(ctx.res, 400, { error: 'skills must be an array of strings or null' });
+    return;
+  }
+
+  // updateTalk treats empty array as clearing (sets undefined)
+  const updated = store.updateTalk(talkId, {
+    skills: skillsValue ?? [],
+  }, { modifiedBy });
+  if (!updated) {
+    sendJson(ctx.res, 404, { error: 'Talk not found' });
+    return;
+  }
+  void reconcileSlackRoutingForTalks(store.listTalks(), ctx.logger);
+
+  // Return same shape as GET
+  const catalog = await fetchSkillsCatalog(ctx.logger);
+  const allSkillsMode = updated.skills === undefined;
+  const enabledSet = allSkillsMode ? null : new Set(updated.skills);
+  const skills = catalog.map(s => ({
+    name: s.name,
+    description: s.description,
+    emoji: s.emoji,
+    eligible: s.eligible,
+    enabled: enabledSet ? enabledSet.has(s.name) : true,
+  }));
+  sendJson(ctx.res, 200, { talkId, skills, allSkillsMode });
+}
+
 async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: string): Promise<void> {
   let body: {
     topicTitle?: string;
@@ -1856,6 +2022,7 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
     stateBackend?: string;
     toolsAllow?: string[];
     toolsDeny?: string[];
+    skills?: string[];
     googleAuthProfile?: string;
     defaultStateStream?: string;
     toolPolicy?: {
@@ -1866,6 +2033,7 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
       stateBackend?: string;
       allow?: string[];
       deny?: string[];
+      skills?: string[];
       googleAuthProfile?: string;
       defaultStateStream?: string;
     };
@@ -1919,6 +2087,9 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
   if (body.toolsDeny === undefined && body.toolPolicy?.deny !== undefined) {
     body.toolsDeny = body.toolPolicy.deny;
   }
+  if (body.skills === undefined && body.toolPolicy?.skills !== undefined) {
+    body.skills = body.toolPolicy.skills;
+  }
   if (body.googleAuthProfile === undefined && body.toolPolicy?.googleAuthProfile !== undefined) {
     body.googleAuthProfile = body.toolPolicy.googleAuthProfile;
   }
@@ -1953,6 +2124,7 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
   }
   const toolsAllow = normalizeToolNameListInput(body.toolsAllow);
   const toolsDeny = normalizeToolNameListInput(body.toolsDeny);
+  const skills = normalizeToolNameListInput(body.skills);
   const googleAuthProfile = normalizeGoogleAuthProfileInput(body.googleAuthProfile);
   if (body.googleAuthProfile !== undefined && googleAuthProfile === undefined) {
     sendJson(ctx.res, 400, { error: 'googleAuthProfile must be a string' });
@@ -2042,6 +2214,7 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
     stateBackend,
     toolsAllow,
     toolsDeny,
+    ...(skills !== undefined ? { skills } : {}),
     ...(googleAuthProfile !== undefined ? { googleAuthProfile: googleAuthProfile || undefined } : {}),
     ...(defaultStateStream !== undefined ? { defaultStateStream: defaultStateStream || undefined } : {}),
   }, { modifiedBy });

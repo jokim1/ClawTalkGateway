@@ -814,7 +814,7 @@ export class TalkStore {
     updates: Partial<
       Pick<
         TalkMeta,
-        'topicTitle' | 'objective' | 'model' | 'agents' | 'directives' | 'platformBindings' | 'platformBehaviors' | 'toolMode' | 'executionMode' | 'filesystemAccess' | 'networkAccess' | 'stateBackend' | 'toolsAllow' | 'toolsDeny' | 'googleAuthProfile' | 'defaultStateStream'
+        'topicTitle' | 'objective' | 'model' | 'agents' | 'directives' | 'platformBindings' | 'platformBehaviors' | 'toolMode' | 'executionMode' | 'filesystemAccess' | 'networkAccess' | 'stateBackend' | 'toolsAllow' | 'toolsDeny' | 'skills' | 'googleAuthProfile' | 'defaultStateStream'
       >
     >,
     options?: { modifiedBy?: string },
@@ -857,6 +857,9 @@ export class TalkStore {
     }
     if (updates.toolsDeny !== undefined) {
       meta.toolsDeny = normalizeToolNames(updates.toolsDeny);
+    }
+    if (updates.skills !== undefined) {
+      meta.skills = updates.skills.length > 0 ? updates.skills : undefined;
     }
     if (updates.googleAuthProfile !== undefined) {
       meta.googleAuthProfile = normalizeGoogleAuthProfile(updates.googleAuthProfile);

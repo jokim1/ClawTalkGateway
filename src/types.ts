@@ -378,6 +378,8 @@ export interface TalkMeta {
   toolsAllow?: string[];
   /** Optional deny-list of tool names for this talk. */
   toolsDeny?: string[];
+  /** Optional allow-list of OpenClaw skill names for this talk (undefined = all skills). */
+  skills?: string[];
   /** Optional Google OAuth profile name for Google Docs/Drive tool calls in this talk. */
   googleAuthProfile?: string;
   /** Default state persistence backend policy for state_* operations. */
