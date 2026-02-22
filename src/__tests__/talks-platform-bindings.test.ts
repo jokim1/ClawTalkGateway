@@ -1,12 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import type { TalkMeta } from '../types';
+import { normalizeSlackBindingScope } from '../slack-scope-resolver';
 import {
   findSlackBindingConflicts,
   normalizeAndValidatePlatformBehaviorsInput,
   normalizeAndValidatePlatformBindingsInput,
-  normalizeSlackBindingScope,
   resolvePlatformBehaviorBindingRefsInput,
-} from '../talks';
+} from '../talk-platform-validation';
 
 function makeTalk(bindings: Array<{
   platform: string;

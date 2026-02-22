@@ -3,6 +3,7 @@ import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Logger } from './types.js';
 import { patchOpenClawConfig } from './openclaw-config-lock.js';
+import { OPENCLAW_HOME } from './constants.js';
 
 function isLocalHttpUrl(value: unknown): boolean {
   if (typeof value !== 'string') return false;
@@ -74,8 +75,7 @@ async function patchJsonFile(filePath: string, patch: (obj: Record<string, unkno
 }
 
 export async function reconcileAnthropicProxyBaseUrls(proxyPort: number, logger: Logger): Promise<void> {
-  const home = process.env.HOME?.trim();
-  if (!home) return;
+  if (!OPENCLAW_HOME) return;
 
   const targetBaseUrl = `http://127.0.0.1:${proxyPort}`;
   let changedFiles = 0;
@@ -84,7 +84,7 @@ export async function reconcileAnthropicProxyBaseUrls(proxyPort: number, logger:
     changedFiles += 1;
   }
 
-  const agentsRoot = path.join(home, '.openclaw', 'agents');
+  const agentsRoot = path.join(OPENCLAW_HOME, '.openclaw', 'agents');
   let agentDirs: string[] = [];
   try {
     const entries = await fs.readdir(agentsRoot, { withFileTypes: true });
@@ -137,8 +137,7 @@ function ensureResponsesEndpointEnabled(cfg: Record<string, unknown>): boolean {
 }
 
 export async function reconcileGatewayResponsesEndpoint(logger: Logger): Promise<void> {
-  const home = process.env.HOME?.trim();
-  if (!home) return;
+  if (!OPENCLAW_HOME) return;
   const changed = await patchOpenClawConfig(ensureResponsesEndpointEnabled, logger);
   if (changed) {
     logger.info('ClawTalk: enabled gateway.http.endpoints.responses for function-calling passthrough.');

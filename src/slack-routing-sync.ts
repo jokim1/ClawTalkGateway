@@ -1,10 +1,11 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import type { Logger, PlatformBinding, TalkMeta } from './types.js';
+import type { Logger, TalkPlatformBinding, TalkMeta } from './types.js';
 import { withOpenClawConfigLock } from './openclaw-config-lock.js';
+import { OPENCLAW_CONFIG_PATH } from './constants.js';
+import { SLACK_DEFAULT_ACCOUNT_ID, normalizeSlackAccountId } from './slack-auth.js';
 
 const MANAGED_AGENT_PREFIX = 'ct-';
-const DEFAULT_ACCOUNT_ID = 'default';
 
 type SlackPeer = { kind: 'channel' | 'user'; id: string };
 type DesiredBinding = {
@@ -34,13 +35,7 @@ export function isManagedAgentId(agentId: string): boolean {
   return agentId.startsWith(MANAGED_AGENT_PREFIX);
 }
 
-function normalizeAccountId(value: unknown): string {
-  if (typeof value !== 'string') return DEFAULT_ACCOUNT_ID;
-  const trimmed = value.trim().toLowerCase();
-  return trimmed || DEFAULT_ACCOUNT_ID;
-}
-
-function isWritePermission(permission: PlatformBinding['permission']): boolean {
+function isWritePermission(permission: TalkPlatformBinding['permission']): boolean {
   return permission === 'write' || permission === 'read+write';
 }
 
@@ -72,7 +67,7 @@ function desiredSlackBindingsFromTalks(talks: TalkMeta[]): DesiredBinding[] {
       if (!isWritePermission(binding.permission)) continue;
       const peer = parseSlackPeerFromScope(binding.scope);
       if (!peer) continue;
-      const accountId = normalizeAccountId(binding.accountId);
+      const accountId = normalizeSlackAccountId(binding.accountId) ?? SLACK_DEFAULT_ACCOUNT_ID;
       const key = `${accountId}:${peer.kind}:${peer.id}`;
       if (seen.has(key)) continue;
       seen.add(key);
@@ -139,7 +134,7 @@ function isSlackPeerBindingRow(row: unknown): row is Record<string, unknown> {
 function bindingKeyFromRow(row: Record<string, unknown>): string | null {
   const match = row.match as Record<string, unknown>;
   const peer = match.peer as Record<string, unknown>;
-  const accountId = normalizeAccountId(match.accountId);
+  const accountId = normalizeSlackAccountId(match.accountId) ?? SLACK_DEFAULT_ACCOUNT_ID;
   const kind = String(peer.kind).trim().toLowerCase();
   const id = String(peer.id).trim().toUpperCase();
   if (!id || (kind !== 'channel' && kind !== 'user')) return null;
@@ -173,8 +168,7 @@ export async function reconcileSlackRoutingForTalks(
   logger: Logger,
 ): Promise<void> {
   await withOpenClawConfigLock(async () => {
-    const configPath = path.join(process.env.HOME ?? '', '.openclaw', 'openclaw.json');
-    if (!configPath || configPath === '.openclaw/openclaw.json') return;
+    const configPath = OPENCLAW_CONFIG_PATH;
 
     let raw: string;
     try {

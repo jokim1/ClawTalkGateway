@@ -10,6 +10,7 @@
 import { randomUUID } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { TalkStore } from './talk-store.js';
+import { matchKnowledgeTopics } from './talk-store.js';
 import type { TalkMessage, ImageAttachmentMeta, KnowledgeIndexEntry, Logger } from './types.js';
 import type { ToolInfo, ToolRegistry } from './tool-registry.js';
 import type { ToolExecutor } from './tool-executor.js';
@@ -34,6 +35,12 @@ import { isTransientError } from './tool-loop.js';
 import { isOpenClawNativeGoogleTool } from './openclaw-native-tools.js';
 import { assertRoutingHeaders, RoutingGuardError } from './routing-headers.js';
 import {
+  CLAWTALK_DEFAULT_AGENT_ID,
+  sanitizeSessionPart,
+  buildTalkSessionKey,
+  buildFullControlTalkSessionKey,
+} from './session-key.js';
+import {
   getToolAffinityStore,
   isAffinityDisabled,
   classifyMessageIntent,
@@ -52,7 +59,6 @@ const MIN_HISTORY_MESSAGES = 8;
 const RESERVED_OVERHEAD_BYTES = 8 * 1024;
 /** Never shrink history budget below this floor. */
 const MIN_HISTORY_BUDGET_BYTES = 4 * 1024;
-const CLAWTALK_DEFAULT_AGENT_ID = 'clawtalk';
 const DEFAULT_TALK_FIRST_TOKEN_TIMEOUT_MS = 90_000;
 const DEFAULT_TALK_TOTAL_TIMEOUT_MS = 900_000;
 const DEFAULT_TALK_INACTIVITY_TIMEOUT_MS = 300_000;
@@ -390,10 +396,6 @@ function filterToolInfos(
   });
 }
 
-function sanitizeSessionPart(value: string): string {
-  return value.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '_').slice(0, 96);
-}
-
 function firstHeaderValue(value: string | string[] | undefined): string | undefined {
   if (typeof value === 'string') return value;
   if (Array.isArray(value) && value.length > 0) return value[0];
@@ -418,23 +420,6 @@ function resolveTalkAgentRouting(meta: { agents?: Array<{ name: string; openClaw
     headerAgentId: routed || undefined,
     sessionAgentPart: routed || requested,
   };
-}
-
-function buildTalkSessionKey(talkId: string, agentPart: string, lanePart?: string): string {
-  const talk = sanitizeSessionPart(talkId) || 'talk';
-  const agent = sanitizeSessionPart(agentPart) || CLAWTALK_DEFAULT_AGENT_ID;
-  const lane = lanePart ? sanitizeSessionPart(lanePart) : '';
-  return lane
-    ? `agent:${agent}:clawtalk:talk:${talk}:chat:lane:${lane}`
-    : `agent:${agent}:clawtalk:talk:${talk}:chat`;
-}
-
-function buildFullControlTalkSessionKey(talkId: string, lanePart?: string): string {
-  const talk = sanitizeSessionPart(talkId) || 'talk';
-  const lane = lanePart ? sanitizeSessionPart(lanePart) : '';
-  return lane
-    ? `talk:clawtalk:talk:${talk}:chat:lane:${lane}`
-    : `talk:clawtalk:talk:${talk}:chat`;
 }
 
 function buildRunScopedSessionPart(basePart: string, model: string, traceId: string): string {
@@ -474,51 +459,6 @@ function selectHistoryWithinBudget(
   }
 
   return selected;
-}
-
-// ---------------------------------------------------------------------------
-// Knowledge topic matching
-// ---------------------------------------------------------------------------
-
-const STOP_WORDS = new Set([
-  'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'had',
-  'her', 'was', 'one', 'our', 'out', 'has', 'have', 'been', 'some', 'them',
-  'than', 'its', 'over', 'also', 'that', 'this', 'from', 'they', 'with',
-  'what', 'how', 'who', 'which', 'when', 'where', 'will', 'each', 'make',
-  'like', 'just', 'into', 'about', 'could', 'would', 'should', 'does',
-  'doing', 'being', 'there', 'their', 'then', 'more', 'very', 'here',
-]);
-
-function extractWords(text: string): Set<string> {
-  const words = new Set<string>();
-  for (const word of text.toLowerCase().match(/[a-z0-9]+/g) ?? []) {
-    if (word.length >= 3 && !STOP_WORDS.has(word)) {
-      words.add(word);
-    }
-  }
-  return words;
-}
-
-/**
- * Match knowledge topics whose slug or summary words overlap with message words.
- * Returns matching slugs.
- */
-export function matchKnowledgeTopics(message: string, index: KnowledgeIndexEntry[]): string[] {
-  if (index.length === 0) return [];
-  const messageWords = extractWords(message);
-  if (messageWords.size === 0) return [];
-
-  const matched: string[] = [];
-  for (const entry of index) {
-    const topicWords = extractWords(entry.slug.replace(/-/g, ' ') + ' ' + entry.summary);
-    for (const word of topicWords) {
-      if (messageWords.has(word)) {
-        matched.push(entry.slug);
-        break;
-      }
-    }
-  }
-  return matched;
 }
 
 export interface TalkChatContext {

@@ -38,11 +38,11 @@ export interface PluginService {
 
 export interface PluginApi {
   id: string;
-  config: Record<string, any>;
+  config: OpenClawConfig;
   pluginConfig: Record<string, any> | undefined;
   runtime: {
     config: {
-      loadConfig: () => Record<string, any>;
+      loadConfig: () => OpenClawConfig;
     };
     state?: {
       resolveStateDir: () => string;
@@ -58,11 +58,65 @@ export interface PluginApi {
   on: (hookName: string, handler: (...args: any[]) => unknown | Promise<unknown>) => void;
 }
 
+export interface OpenClawConfig {
+  gateway?: {
+    port?: number;
+    bind?: string;
+    auth?: { token?: string };
+    slack?: { openclawWebhookUrl?: string; proxyUrl?: string };
+    http?: {
+      port?: number;
+      endpoints?: { responses?: { enabled?: boolean } };
+    };
+  };
+  models?: {
+    providers?: Record<string, { baseUrl?: string; [key: string]: unknown }>;
+  };
+  auth?: {
+    profiles?: Record<string, { provider?: string; [key: string]: unknown }>;
+  };
+  agents?: {
+    defaults?: {
+      model?: { primary?: string };
+      models?: Record<string, unknown>;
+    };
+    list?: Array<{
+      id?: string;
+      model?: string;
+      name?: string;
+      default?: boolean;
+      [key: string]: unknown;
+    }>;
+  };
+  channels?: {
+    slack?: {
+      botToken?: string;
+      signingSecret?: string;
+      accounts?: Record<string, {
+        botToken?: string;
+        signingSecret?: string;
+        webhookPath?: string;
+      }>;
+    };
+  };
+  bindings?: Array<{
+    agentId?: string;
+    match?: {
+      channel?: string;
+      accountId?: string;
+      peer?: { kind?: string; id?: string };
+    };
+    [key: string]: unknown;
+  }>;
+  defaultProvider?: string;
+  [key: string]: unknown;
+}
+
 export interface HandlerContext {
   req: IncomingMessage;
   res: ServerResponse;
   url: URL;
-  cfg: Record<string, any>;
+  cfg: OpenClawConfig;
   pluginCfg: ClawTalkPluginConfig;
   logger: Logger;
 }
@@ -151,8 +205,6 @@ export interface TalkDirective {
   createdAt: number;
 }
 
-export type Directive = TalkDirective;
-
 export type PlatformPermission = 'read' | 'write' | 'read+write';
 
 export interface TalkPlatformBinding {
@@ -166,8 +218,6 @@ export interface TalkPlatformBinding {
   permission: PlatformPermission;
   createdAt: number;
 }
-
-export type PlatformBinding = TalkPlatformBinding;
 
 export interface TalkPlatformBehavior {
   id: string;
@@ -221,8 +271,6 @@ export interface TalkPlatformBehavior {
   createdAt: number;
   updatedAt: number;
 }
-
-export type PlatformBehavior = TalkPlatformBehavior;
 
 export interface ImageAttachmentMeta {
   filename: string;

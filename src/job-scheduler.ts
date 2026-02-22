@@ -16,13 +16,14 @@
 
 import { randomUUID } from 'node:crypto';
 import type { TalkStore } from './talk-store.js';
+import { matchKnowledgeTopics } from './talk-store.js';
 import type { TalkJob, JobReport, JobDeliveryResult, Logger } from './types.js';
 import type { ToolInfo } from './tool-registry.js';
 import type { ToolRegistry } from './tool-registry.js';
 import type { ToolExecutor } from './tool-executor.js';
 import { composeSystemPrompt } from './system-prompt.js';
-import { matchKnowledgeTopics } from './talk-chat.js';
 import { runToolLoopNonStreaming } from './tool-loop.js';
+import { CLAWTALK_DEFAULT_AGENT_ID, sanitizeSessionPart, buildTalkJobSessionKey } from './session-key.js';
 import { getToolCatalog } from './tool-catalog.js';
 import { googleDocsAuthStatusForProfile } from './google-docs.js';
 import {
@@ -64,30 +65,6 @@ export interface JobSchedulerOptions {
     message: string;
   }) => Promise<boolean>;
 }
-
-const CLAWTALK_DEFAULT_AGENT_ID = 'clawtalk';
-
-function sanitizeSessionPart(value: string): string {
-  return value.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '_').slice(0, 96);
-}
-
-// Session keys for job scheduler use a `job:` prefix instead of `agent:`.
-// When a session key starts with `agent:<id>:`, OpenClaw resolves it as
-// an embedded-agent session, replacing the gateway's `tools` array with
-// the agent's own tool set (Read/Write/exec/…).  That makes gateway tools
-// like google_docs_append unreachable — they only appear in the system
-// prompt description, not in the callable function set.
-//
-// Using `job:` keeps the request in transparent LLM-proxy mode so the
-// gateway's tool array is forwarded to the model and executed via
-// ToolExecutor on the gateway side.
-
-function buildTalkJobSessionKey(talkId: string, jobId: string): string {
-  const talk = sanitizeSessionPart(talkId) || 'talk';
-  const job = sanitizeSessionPart(jobId) || 'job';
-  return `job:clawtalk:talk:${talk}:job:${job}`;
-}
-
 
 function filterToolInfos(
   tools: ToolInfo[],

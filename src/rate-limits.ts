@@ -158,7 +158,7 @@ function createSubprocessUsageLoader(
  * Eagerly warm up the usage loader in background.
  */
 export function warmUsageLoader(log: Logger): void {
-  ensureUsageLoader(log).catch(() => {});
+  ensureUsageLoader(log).catch((err) => log.warn(`warmUsageLoader failed: ${err}`));
 }
 
 // ---------------------------------------------------------------------------

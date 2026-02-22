@@ -2,6 +2,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Logger } from './types.js';
+import { OPENCLAW_CONFIG_PATH } from './constants.js';
 
 // Async mutex — promise-chain, no external deps.
 // Every caller awaits the previous holder before running.
@@ -15,9 +16,7 @@ export function withOpenClawConfigLock<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 function resolveConfigPath(): string | null {
-  const home = process.env.HOME?.trim();
-  if (!home) return null;
-  return path.join(home, '.openclaw', 'openclaw.json');
+  return OPENCLAW_CONFIG_PATH;
 }
 
 /**

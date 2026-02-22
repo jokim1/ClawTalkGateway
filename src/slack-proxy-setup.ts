@@ -8,9 +8,10 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import type { TalkStore } from './talk-store.js';
-import type { Logger, PlatformBinding } from './types.js';
+import type { Logger, TalkPlatformBinding } from './types.js';
 import { collectSigningSecrets, resolveOpenClawWebhookUrl } from './slack-event-proxy.js';
 import { withOpenClawConfigLock } from './openclaw-config-lock.js';
+import { DEFAULT_GATEWAY_PORT, OPENCLAW_CONFIG_PATH } from './constants.js';
 
 // ---------------------------------------------------------------------------
 // Setup status types
@@ -37,7 +38,7 @@ export type SlackProxySetupStep = {
 // Detect Slack bindings in Talks
 // ---------------------------------------------------------------------------
 
-function isWritePermission(permission: PlatformBinding['permission']): boolean {
+function isWritePermission(permission: TalkPlatformBinding['permission']): boolean {
   return permission === 'write' || permission === 'read+write';
 }
 
@@ -71,7 +72,7 @@ function resolveGatewayProxyUrl(cfg: Record<string, unknown>): string {
   // Default: local address
   const gwHttp = gw?.http && typeof gw.http === 'object'
     ? gw.http as Record<string, unknown> : null;
-  const port = typeof gwHttp?.port === 'number' ? gwHttp.port : 18789;
+  const port = typeof gwHttp?.port === 'number' ? gwHttp.port : DEFAULT_GATEWAY_PORT;
   return `http://127.0.0.1:${port}/slack/events`;
 }
 
@@ -246,10 +247,7 @@ export async function saveSlackSigningSecret(
   accountId?: string,
 ): Promise<void> {
   await withOpenClawConfigLock(async () => {
-    const configPath = path.join(process.env.HOME ?? '', '.openclaw', 'openclaw.json');
-    if (!configPath || configPath === '.openclaw/openclaw.json') {
-      throw new Error('Cannot resolve openclaw.json path');
-    }
+    const configPath = OPENCLAW_CONFIG_PATH;
 
     let raw: string;
     try {

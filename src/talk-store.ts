@@ -21,11 +21,7 @@ import type {
   TalkPlatformBehavior,
   JobReport,
   JobOutputDestination,
-  Directive,
-  PlatformBinding,
-  PlatformBehavior,
   PlatformPermission,
-  TalkStateCarryOverMode,
   TalkStateEvent,
   TalkStatePolicy,
   TalkStateSnapshot,
@@ -35,6 +31,21 @@ import type {
   KnowledgeIndexEntry,
   Logger,
 } from './types.js';
+import {
+  DEFAULT_STATE_STREAM,
+  DAY_MS,
+  DEFAULT_STATE_POLICY_BASE,
+  normalizeStateStream,
+  normalizeOptionalStateStream,
+  normalizeCarryOverMode,
+  normalizeStatePolicy,
+  normalizeKidKey,
+  formatWeekKeyFromPseudoUtc,
+  resolveWeekWindow,
+  computeCarryOver,
+  applyStateEventToTotals,
+  buildStateSnapshot,
+} from './talk-state-store.js';
 
 type TalkMutationType =
   | 'created'
@@ -78,16 +89,6 @@ const SMALL_FILE_BYTES = 64 * 1024; // 64KB
 
 /** TTL for context.md cache entries. */
 const CONTEXT_CACHE_TTL_MS = 30_000;
-const DEFAULT_STATE_STREAM = 'default';
-const DAY_MS = 24 * 60 * 60 * 1000;
-const DEFAULT_STATE_POLICY_BASE = {
-  timezone: 'America/Los_Angeles',
-  weekStartDay: 1,
-  rolloverHour: 0,
-  rolloverMinute: 0,
-  carryOverMode: 'excess_only' as TalkStateCarryOverMode,
-  targetMinutes: 300,
-};
 
 /** Validate that a talk ID is safe for use as a directory name. */
 function isValidId(id: string): boolean {
@@ -109,7 +110,7 @@ export function normalizeKnowledgeSlug(raw: string): string {
     .slice(0, 60);
 }
 
-function normalizePermission(raw: unknown): PlatformPermission {
+export function normalizePermission(raw: unknown): PlatformPermission {
   const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
   if (value === 'read' || value === 'write' || value === 'read+write') {
     return value;
@@ -117,37 +118,37 @@ function normalizePermission(raw: unknown): PlatformPermission {
   return 'read+write';
 }
 
-function normalizeToolMode(raw: unknown): 'off' | 'confirm' | 'auto' {
+export function normalizeToolMode(raw: unknown): 'off' | 'confirm' | 'auto' {
   const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
   if (value === 'off' || value === 'confirm' || value === 'auto') return value;
   return 'auto';
 }
 
-function normalizeResponseMode(raw: unknown): 'off' | 'mentions' | 'all' | undefined {
+export function normalizeResponseMode(raw: unknown): 'off' | 'mentions' | 'all' | undefined {
   const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
   if (value === 'off' || value === 'mentions' || value === 'all') return value;
   return undefined;
 }
 
-function normalizeMirrorToTalk(raw: unknown): 'off' | 'inbound' | 'full' | undefined {
+export function normalizeMirrorToTalk(raw: unknown): 'off' | 'inbound' | 'full' | undefined {
   const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
   if (value === 'off' || value === 'inbound' || value === 'full') return value;
   return undefined;
 }
 
-function normalizeDeliveryMode(raw: unknown): 'thread' | 'channel' | 'adaptive' | undefined {
+export function normalizeDeliveryMode(raw: unknown): 'thread' | 'channel' | 'adaptive' | undefined {
   const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
   if (value === 'thread' || value === 'channel' || value === 'adaptive') return value;
   return undefined;
 }
 
-function normalizeTriggerPolicy(raw: unknown): 'judgment' | 'study_entries_only' | 'advice_or_study' | undefined {
+export function normalizeTriggerPolicy(raw: unknown): 'judgment' | 'study_entries_only' | 'advice_or_study' | undefined {
   const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
   if (value === 'judgment' || value === 'study_entries_only' || value === 'advice_or_study') return value;
   return undefined;
 }
 
-function normalizeAllowedSenders(raw: unknown): string[] | undefined {
+export function normalizeAllowedSenders(raw: unknown): string[] | undefined {
   if (!Array.isArray(raw)) return undefined;
   const out: string[] = [];
   const seen = new Set<string>();
@@ -163,7 +164,7 @@ function normalizeAllowedSenders(raw: unknown): string[] | undefined {
   return out.length > 0 ? out : undefined;
 }
 
-function normalizeExecutionMode(raw: unknown): 'openclaw' | 'full_control' {
+export function normalizeExecutionMode(raw: unknown): 'openclaw' | 'full_control' {
   const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
   if (value === 'openclaw' || value === 'full_control') return value;
   if (value === 'openclaw_agent') return 'openclaw';
@@ -174,27 +175,27 @@ function normalizeExecutionMode(raw: unknown): 'openclaw' | 'full_control' {
   return 'openclaw';
 }
 
-function normalizeFilesystemAccess(raw: unknown): 'workspace_sandbox' | 'full_host_access' {
+export function normalizeFilesystemAccess(raw: unknown): 'workspace_sandbox' | 'full_host_access' {
   const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
   if (value === 'workspace_sandbox' || value === 'workspace' || value === 'sandbox') return 'workspace_sandbox';
   if (value === 'full_host_access' || value === 'full_host' || value === 'full') return 'full_host_access';
   return 'full_host_access';
 }
 
-function normalizeNetworkAccess(raw: unknown): 'restricted' | 'full_outbound' {
+export function normalizeNetworkAccess(raw: unknown): 'restricted' | 'full_outbound' {
   const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
   if (value === 'restricted') return 'restricted';
   if (value === 'full_outbound' || value === 'full') return 'full_outbound';
   return 'full_outbound';
 }
 
-function normalizeStateBackend(raw: unknown): 'stream_store' | 'workspace_files' {
+export function normalizeStateBackend(raw: unknown): 'stream_store' | 'workspace_files' {
   const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
   if (value === 'workspace_files' || value === 'workspace') return 'workspace_files';
   return 'stream_store';
 }
 
-function normalizeToolNames(input: unknown): string[] {
+export function normalizeToolNames(input: unknown): string[] {
   if (!Array.isArray(input)) return [];
   const seen = new Set<string>();
   const out: string[] = [];
@@ -219,117 +220,8 @@ function normalizeGoogleAuthProfile(raw: unknown): string | undefined {
   return normalized || undefined;
 }
 
-function normalizeStateStream(raw: unknown): string {
-  const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
-  if (!value) return DEFAULT_STATE_STREAM;
-  const normalized = value.replace(/[^a-z0-9_.-]+/g, '_').replace(/^_+|_+$/g, '');
-  return normalized || DEFAULT_STATE_STREAM;
-}
 
-function normalizeOptionalStateStream(raw: unknown): string | undefined {
-  if (raw === undefined || raw === null) return undefined;
-  if (typeof raw !== 'string') return undefined;
-  const trimmed = raw.trim();
-  if (!trimmed) return undefined;
-  return normalizeStateStream(trimmed);
-}
-
-function normalizeCarryOverMode(raw: unknown): TalkStateCarryOverMode {
-  const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
-  if (value === 'none' || value === 'excess_only' || value === 'all') return value;
-  return DEFAULT_STATE_POLICY_BASE.carryOverMode;
-}
-
-function normalizeStatePolicy(
-  stream: string,
-  raw: Partial<TalkStatePolicy> | undefined,
-  now = Date.now(),
-): TalkStatePolicy {
-  return {
-    stream: normalizeStateStream(stream),
-    timezone:
-      typeof raw?.timezone === 'string' && raw.timezone.trim()
-        ? raw.timezone.trim()
-        : DEFAULT_STATE_POLICY_BASE.timezone,
-    weekStartDay:
-      typeof raw?.weekStartDay === 'number' && Number.isInteger(raw.weekStartDay)
-        ? Math.max(0, Math.min(6, raw.weekStartDay))
-        : DEFAULT_STATE_POLICY_BASE.weekStartDay,
-    rolloverHour:
-      typeof raw?.rolloverHour === 'number' && Number.isInteger(raw.rolloverHour)
-        ? Math.max(0, Math.min(23, raw.rolloverHour))
-        : DEFAULT_STATE_POLICY_BASE.rolloverHour,
-    rolloverMinute:
-      typeof raw?.rolloverMinute === 'number' && Number.isInteger(raw.rolloverMinute)
-        ? Math.max(0, Math.min(59, raw.rolloverMinute))
-        : DEFAULT_STATE_POLICY_BASE.rolloverMinute,
-    carryOverMode: normalizeCarryOverMode(raw?.carryOverMode),
-    targetMinutes:
-      typeof raw?.targetMinutes === 'number' && Number.isFinite(raw.targetMinutes) && raw.targetMinutes > 0
-        ? Math.floor(raw.targetMinutes)
-        : DEFAULT_STATE_POLICY_BASE.targetMinutes,
-    updatedAt: typeof raw?.updatedAt === 'number' && Number.isFinite(raw.updatedAt) ? raw.updatedAt : now,
-  };
-}
-
-function formatWeekKeyFromPseudoUtc(startAt: number): string {
-  const d = new Date(startAt);
-  const yyyy = d.getUTCFullYear();
-  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-  const dd = String(d.getUTCDate()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd}`;
-}
-
-function resolveWeekWindow(ts: number, policy: TalkStatePolicy): { weekKey: string; weekStartAt: number; weekEndAt: number } {
-  const date = new Date(ts);
-  const fmt = new Intl.DateTimeFormat('en-US', {
-    timeZone: policy.timezone,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-  });
-  const parts = fmt.formatToParts(date);
-  const partMap = new Map(parts.map((part) => [part.type, part.value]));
-  const year = Number(partMap.get('year') ?? '0');
-  const month = Number(partMap.get('month') ?? '1');
-  const day = Number(partMap.get('day') ?? '1');
-  const hour = Number(partMap.get('hour') ?? '0');
-  const minute = Number(partMap.get('minute') ?? '0');
-  const second = Number(partMap.get('second') ?? '0');
-
-  let pseudoNow = Date.UTC(year, month - 1, day, hour, minute, second);
-  if (hour < policy.rolloverHour || (hour === policy.rolloverHour && minute < policy.rolloverMinute)) {
-    pseudoNow -= DAY_MS;
-  }
-  const pseudoDate = new Date(pseudoNow);
-  const pseudoWeekday = pseudoDate.getUTCDay();
-  const daysSinceStart = (pseudoWeekday - policy.weekStartDay + 7) % 7;
-  const weekStartDayAtMidnight = Date.UTC(
-    pseudoDate.getUTCFullYear(),
-    pseudoDate.getUTCMonth(),
-    pseudoDate.getUTCDate(),
-  ) - daysSinceStart * DAY_MS;
-  const weekStartAt = weekStartDayAtMidnight + policy.rolloverHour * 60 * 60 * 1000 + policy.rolloverMinute * 60 * 1000;
-  const weekEndAt = weekStartAt + 7 * DAY_MS;
-  return {
-    weekKey: formatWeekKeyFromPseudoUtc(weekStartAt),
-    weekStartAt,
-    weekEndAt,
-  };
-}
-
-function normalizeKidKey(raw: unknown): string | null {
-  if (typeof raw !== 'string') return null;
-  const value = raw.trim();
-  if (!value) return null;
-  return value;
-}
-
-function normalizeDirectives(input: unknown): Directive[] {
+function normalizeDirectives(input: unknown): TalkDirective[] {
   if (!Array.isArray(input)) return [];
   const now = Date.now();
   return input
@@ -347,9 +239,9 @@ function normalizeDirectives(input: unknown): Directive[] {
         text,
         active: row.active !== false,
         createdAt: typeof row.createdAt === 'number' ? row.createdAt : now,
-      } satisfies Directive;
+      } satisfies TalkDirective;
     })
-    .filter((entry): entry is Directive => Boolean(entry));
+    .filter((entry): entry is TalkDirective => Boolean(entry));
 }
 
 function normalizeJobOutput(raw: unknown): JobOutputDestination {
@@ -416,7 +308,7 @@ function normalizeJobs(input: unknown): TalkJob[] {
     .filter((job): job is TalkJob => Boolean(job));
 }
 
-function normalizePlatformBindings(input: unknown): PlatformBinding[] {
+function normalizeTalkPlatformBindings(input: unknown): TalkPlatformBinding[] {
   if (!Array.isArray(input)) return [];
   const now = Date.now();
   return input
@@ -440,15 +332,15 @@ function normalizePlatformBindings(input: unknown): PlatformBinding[] {
         ...(displayScope ? { displayScope } : {}),
         permission: normalizePermission(row.permission),
         createdAt: typeof row.createdAt === 'number' ? row.createdAt : now,
-      } satisfies PlatformBinding;
+      } satisfies TalkPlatformBinding;
     })
-    .filter((entry): entry is PlatformBinding => Boolean(entry));
+    .filter((entry): entry is TalkPlatformBinding => Boolean(entry));
 }
 
 function normalizePlatformBehaviors(
   input: unknown,
   bindings?: TalkPlatformBinding[],
-): PlatformBehavior[] {
+): TalkPlatformBehavior[] {
   if (!Array.isArray(input)) return [];
   const now = Date.now();
   const enforceBindingIds = Array.isArray(bindings);
@@ -517,9 +409,9 @@ function normalizePlatformBehaviors(
         ),
         createdAt: typeof row.createdAt === 'number' ? row.createdAt : now,
         updatedAt: typeof row.updatedAt === 'number' ? row.updatedAt : now,
-      } satisfies PlatformBehavior;
+      } satisfies TalkPlatformBehavior;
     })
-    .filter((entry): entry is PlatformBehavior => Boolean(entry));
+    .filter((entry): entry is TalkPlatformBehavior => Boolean(entry));
 }
 
 function normalizeDiagnosticStatus(raw: unknown): TalkDiagnosticStatus {
@@ -686,7 +578,7 @@ export class TalkStore {
           meta.jobs = normalizeJobs(meta.jobs);
           meta.agents ??= [];
           meta.directives = normalizeDirectives(meta.directives);
-          meta.platformBindings = normalizePlatformBindings(meta.platformBindings);
+          meta.platformBindings = normalizeTalkPlatformBindings(meta.platformBindings);
           meta.platformBehaviors = normalizePlatformBehaviors(meta.platformBehaviors, meta.platformBindings);
           meta.toolMode = normalizeToolMode(meta.toolMode);
           meta.executionMode = normalizeExecutionMode(meta.executionMode);
@@ -828,7 +720,7 @@ export class TalkStore {
     if (updates.agents !== undefined) meta.agents = updates.agents;
     if (updates.directives !== undefined) meta.directives = normalizeDirectives(updates.directives);
     if (updates.platformBindings !== undefined) {
-      meta.platformBindings = normalizePlatformBindings(updates.platformBindings);
+      meta.platformBindings = normalizeTalkPlatformBindings(updates.platformBindings);
       meta.platformBehaviors = normalizePlatformBehaviors(meta.platformBehaviors, meta.platformBindings);
     }
     if (updates.platformBehaviors !== undefined) {
@@ -1375,7 +1267,7 @@ export class TalkStore {
   async deleteKnowledgeTopic(talkId: string, slug: string): Promise<void> {
     if (!isValidId(talkId) || !isValidKnowledgeSlug(slug)) return;
     const filePath = path.join(this.knowledgeDir(talkId), `${slug}.md`);
-    await fsp.rm(filePath, { force: true }).catch(() => {});
+    await fsp.rm(filePath, { force: true }).catch((err) => this.logger.warn(`TalkStore: deleteKnowledgeTopic rm failed: ${err}`));
 
     // Update index
     const index = await this.getKnowledgeIndex(talkId);
@@ -1504,7 +1396,7 @@ export class TalkStore {
   }
 
   // -------------------------------------------------------------------------
-  // Directive management
+  // TalkDirective management
   // -------------------------------------------------------------------------
 
   async setDirectives(talkId: string, directives: TalkDirective[], options?: { modifiedBy?: string }): Promise<void> {
@@ -1518,14 +1410,14 @@ export class TalkStore {
   // Platform binding management
   // -------------------------------------------------------------------------
 
-  async setPlatformBindings(
+  async setTalkPlatformBindings(
     talkId: string,
     bindings: TalkPlatformBinding[],
     options?: { modifiedBy?: string },
   ): Promise<void> {
     const meta = this.talks.get(talkId);
     if (!meta) throw new Error('Talk not found');
-    meta.platformBindings = normalizePlatformBindings(bindings);
+    meta.platformBindings = normalizeTalkPlatformBindings(bindings);
     meta.platformBehaviors = normalizePlatformBehaviors(meta.platformBehaviors, meta.platformBindings);
     this.touchMeta(meta, 'bindings_set', { modifiedBy: options?.modifiedBy });
   }
@@ -1651,111 +1543,6 @@ export class TalkStore {
     }
   }
 
-  private computeCarryOver(
-    totals: Record<string, number>,
-    policy: TalkStatePolicy,
-  ): Record<string, number> {
-    const carry: Record<string, number> = {};
-    for (const [kid, total] of Object.entries(totals)) {
-      if (!Number.isFinite(total) || total <= 0) continue;
-      if (policy.carryOverMode === 'all') {
-        carry[kid] = total;
-      } else if (policy.carryOverMode === 'excess_only') {
-        carry[kid] = Math.max(0, total - policy.targetMinutes);
-      }
-    }
-    return carry;
-  }
-
-  private applyStateEventToTotals(
-    totals: Record<string, number>,
-    event: TalkStateEvent,
-  ): Record<string, number> {
-    const next = { ...totals };
-    const payload = event.payload ?? {};
-    if (event.type === 'minutes_logged' || event.type === 'manual_adjustment') {
-      const kid = normalizeKidKey((payload as Record<string, unknown>).kid);
-      const minutesRaw = Number((payload as Record<string, unknown>).minutes);
-      if (!kid || !Number.isFinite(minutesRaw)) return next;
-      next[kid] = Math.max(0, (next[kid] ?? 0) + minutesRaw);
-      return next;
-    }
-    if (event.type === 'set_total') {
-      const kid = normalizeKidKey((payload as Record<string, unknown>).kid);
-      const totalRaw = Number((payload as Record<string, unknown>).total);
-      if (!kid || !Number.isFinite(totalRaw)) return next;
-      next[kid] = Math.max(0, totalRaw);
-      return next;
-    }
-    return next;
-  }
-
-  private buildStateSnapshot(
-    stream: string,
-    policy: TalkStatePolicy,
-    events: TalkStateEvent[],
-    asOf: number = Date.now(),
-  ): TalkStateSnapshot {
-    const normalizedStream = normalizeStateStream(stream);
-    const baseWindow = resolveWeekWindow(asOf, policy);
-    let currentWeek = baseWindow;
-    let totals: Record<string, number> = {};
-    let carryOver: Record<string, number> = {};
-
-    for (const event of events) {
-      const eventWeek = resolveWeekWindow(event.occurredAt || event.recordedAt || asOf, policy);
-      if (eventWeek.weekStartAt > currentWeek.weekStartAt) {
-        while (currentWeek.weekStartAt < eventWeek.weekStartAt) {
-          carryOver = this.computeCarryOver(totals, policy);
-          totals = { ...carryOver };
-          currentWeek = {
-            weekStartAt: currentWeek.weekStartAt + 7 * DAY_MS,
-            weekEndAt: currentWeek.weekEndAt + 7 * DAY_MS,
-            weekKey: formatWeekKeyFromPseudoUtc(currentWeek.weekStartAt + 7 * DAY_MS),
-          };
-        }
-      } else if (eventWeek.weekStartAt < currentWeek.weekStartAt) {
-        currentWeek = eventWeek;
-        totals = {};
-        carryOver = {};
-      }
-      totals = this.applyStateEventToTotals(totals, event);
-    }
-
-    const finalWindow = resolveWeekWindow(asOf, policy);
-    if (finalWindow.weekStartAt > currentWeek.weekStartAt) {
-      while (currentWeek.weekStartAt < finalWindow.weekStartAt) {
-        carryOver = this.computeCarryOver(totals, policy);
-        totals = { ...carryOver };
-        currentWeek = {
-          weekStartAt: currentWeek.weekStartAt + 7 * DAY_MS,
-          weekEndAt: currentWeek.weekEndAt + 7 * DAY_MS,
-          weekKey: formatWeekKeyFromPseudoUtc(currentWeek.weekStartAt + 7 * DAY_MS),
-        };
-      }
-    } else {
-      currentWeek = finalWindow;
-    }
-
-    const completed: Record<string, boolean> = {};
-    for (const [kid, total] of Object.entries(totals)) {
-      completed[kid] = total >= policy.targetMinutes;
-    }
-
-    return {
-      stream: normalizedStream,
-      weekKey: currentWeek.weekKey,
-      weekStartAt: currentWeek.weekStartAt,
-      weekEndAt: currentWeek.weekEndAt,
-      totals,
-      carryOver,
-      completionTarget: policy.targetMinutes,
-      completed,
-      lastEventSequence: events.length ? events[events.length - 1].sequence : 0,
-      updatedAt: Date.now(),
-      policy,
-    };
-  }
 
   async configureStatePolicy(
     talkId: string,
@@ -1812,7 +1599,7 @@ export class TalkStore {
         ? events.find((event) => event.idempotencyKey === idempotencyKey)
         : undefined;
       if (existing) {
-        const snapshot = this.buildStateSnapshot(stream, policy, events);
+        const snapshot = buildStateSnapshot(stream, policy, events);
         await fsp.writeFile(this.getStateSnapshotPath(talkId, stream), JSON.stringify(snapshot, null, 2), 'utf-8');
         return { applied: false, event: existing, snapshot };
       }
@@ -1832,7 +1619,7 @@ export class TalkStore {
       };
       await fsp.appendFile(this.getStateEventsPath(talkId, stream), `${JSON.stringify(event)}\n`, 'utf-8');
       const nextEvents = [...events, event];
-      const snapshot = this.buildStateSnapshot(stream, policy, nextEvents);
+      const snapshot = buildStateSnapshot(stream, policy, nextEvents);
       await fsp.writeFile(this.getStateSnapshotPath(talkId, stream), JSON.stringify(snapshot, null, 2), 'utf-8');
       this.touchMeta(talk, 'state_updated', { modifiedBy: options?.modifiedBy });
       return { applied: true, event, snapshot };
@@ -1846,7 +1633,7 @@ export class TalkStore {
     return this.withStateLock(talkId, stream, async () => {
       const events = await this.readStateEvents(talkId, stream);
       const policy = await this.readStatePolicy(talkId, stream);
-      const snapshot = this.buildStateSnapshot(stream, policy, events, asOf);
+      const snapshot = buildStateSnapshot(stream, policy, events, asOf);
       await fsp.mkdir(this.getStateBaseDir(talkId, stream), { recursive: true });
       await fsp.writeFile(this.getStateSnapshotPath(talkId, stream), JSON.stringify(snapshot, null, 2), 'utf-8');
       return snapshot;
@@ -1888,4 +1675,49 @@ export class TalkStore {
   getDataDir(): string {
     return path.dirname(this.talksDir);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Knowledge topic matching
+// ---------------------------------------------------------------------------
+
+const STOP_WORDS = new Set([
+  'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'had',
+  'her', 'was', 'one', 'our', 'out', 'has', 'have', 'been', 'some', 'them',
+  'than', 'its', 'over', 'also', 'that', 'this', 'from', 'they', 'with',
+  'what', 'how', 'who', 'which', 'when', 'where', 'will', 'each', 'make',
+  'like', 'just', 'into', 'about', 'could', 'would', 'should', 'does',
+  'doing', 'being', 'there', 'their', 'then', 'more', 'very', 'here',
+]);
+
+function extractWords(text: string): Set<string> {
+  const words = new Set<string>();
+  for (const word of text.toLowerCase().match(/[a-z0-9]+/g) ?? []) {
+    if (word.length >= 3 && !STOP_WORDS.has(word)) {
+      words.add(word);
+    }
+  }
+  return words;
+}
+
+/**
+ * Match knowledge topics whose slug or summary words overlap with message words.
+ * Returns matching slugs.
+ */
+export function matchKnowledgeTopics(message: string, index: KnowledgeIndexEntry[]): string[] {
+  if (index.length === 0) return [];
+  const messageWords = extractWords(message);
+  if (messageWords.size === 0) return [];
+
+  const matched: string[] = [];
+  for (const entry of index) {
+    const topicWords = extractWords(entry.slug.replace(/-/g, ' ') + ' ' + entry.summary);
+    for (const word of topicWords) {
+      if (messageWords.has(word)) {
+        matched.push(entry.slug);
+        break;
+      }
+    }
+  }
+  return matched;
 }

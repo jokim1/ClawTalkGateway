@@ -5,15 +5,15 @@ import type { ToolRegistry } from './tool-registry.js';
 import type {
   HandlerContext,
   Logger,
-  PlatformBinding,
+  TalkPlatformBinding,
   TalkMessage,
   TalkMeta,
 } from './types.js';
 import { readJsonBody, sendJson } from './http.js';
 import { buildManagedAgentId } from './slack-routing-sync.js';
+import { SLACK_DEFAULT_ACCOUNT_ID, normalizeSlackAccountId } from './slack-auth.js';
 
 const EVENT_TTL_MS = 6 * 60 * 60_000;
-const SLACK_DEFAULT_ACCOUNT = 'default';
 
 export type SlackIngressEvent = {
   eventId: string;
@@ -276,9 +276,6 @@ function normalizeScope(scope: string): string {
   return scope.trim().toLowerCase();
 }
 
-function normalizeAccountId(value: string | undefined): string {
-  return (value ?? SLACK_DEFAULT_ACCOUNT).trim().toLowerCase();
-}
 
 function normalizeChannelName(value: string | undefined): string | undefined {
   if (!value) return undefined;
@@ -291,19 +288,15 @@ function canWrite(permission: string | undefined): boolean {
   return normalized === 'write' || normalized === 'read+write';
 }
 
-function scoreSlackBinding(binding: PlatformBinding, event: SlackIngressEvent): number {
+function scoreSlackBinding(binding: TalkPlatformBinding, event: SlackIngressEvent): number {
   if (binding.platform.trim().toLowerCase() !== 'slack') {
     return -1;
   }
   if (!canWrite(binding.permission)) {
     return -1;
   }
-  const bindingAccountId = binding.accountId?.trim()
-    ? normalizeAccountId(binding.accountId)
-    : undefined;
-  const explicitEventAccountId = event.accountId?.trim()
-    ? normalizeAccountId(event.accountId)
-    : undefined;
+  const bindingAccountId = normalizeSlackAccountId(binding.accountId);
+  const explicitEventAccountId = normalizeSlackAccountId(event.accountId);
   if (bindingAccountId && explicitEventAccountId && bindingAccountId !== explicitEventAccountId) {
     return -1;
   }
@@ -344,14 +337,14 @@ function resolveOwnerTalk(
   talks: TalkMeta[],
   event: SlackIngressEvent,
   logger: Logger,
-): { talkId?: string; reason?: string; binding?: PlatformBinding } {
+): { talkId?: string; reason?: string; binding?: TalkPlatformBinding } {
   let bestScore = -1;
-  const candidates: Array<{ talk: TalkMeta; binding: PlatformBinding }> = [];
+  const candidates: Array<{ talk: TalkMeta; binding: TalkPlatformBinding }> = [];
 
   for (const talk of talks) {
     const bindings = talk.platformBindings ?? [];
     let talkScore = -1;
-    let talkBestBinding: PlatformBinding | undefined;
+    let talkBestBinding: TalkPlatformBinding | undefined;
     for (const binding of bindings) {
       const score = scoreSlackBinding(binding, event);
       if (score > talkScore) {

@@ -1,5 +1,6 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { OPENCLAW_HOME, OPENCLAW_CONFIG_PATH } from './constants.js';
 
 type AgentEntry = {
   id?: string;
@@ -55,13 +56,12 @@ export async function collectRoutingDiagnostics(params: {
     notes,
   };
 
-  const home = process.env.HOME?.trim();
-  if (!home) {
+  if (!OPENCLAW_HOME) {
     notes.push('missing-home');
     return result;
   }
 
-  const configPath = path.join(home, '.openclaw', 'openclaw.json');
+  const configPath = OPENCLAW_CONFIG_PATH;
   let raw: string;
   try {
     raw = await fs.readFile(configPath, 'utf-8');

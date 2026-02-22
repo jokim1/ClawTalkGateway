@@ -1,8 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { execSync } from 'node:child_process';
-import { hostname } from 'node:os';
-import type { PluginApi, ClawTalkPluginConfig, Logger } from './types.js';
-import type { EventReplyTarget } from './event-dispatcher.js';
+import type { PluginApi, ClawTalkPluginConfig } from './types.js';
 import { sendJson, readJsonBody, handleCors } from './http.js';
 import { authorize, resolveGatewayToken, safeEqual } from './auth.js';
 import { handleProviders } from './providers.js';
@@ -44,6 +41,28 @@ import { registerOpenClawNativeGoogleTools } from './openclaw-native-tools.js';
 import { listSlackAccountIds, resolveSlackBotTokenForAccount } from './slack-auth.js';
 import { handleSlackEventProxy } from './slack-event-proxy.js';
 import { checkSlackProxySetup, logSlackProxySetupStatus } from './slack-proxy-setup.js';
+import { isRateLimited } from './pair-rate-limiter.js';
+import {
+  type SlackDebugPath,
+  type SlackDebugEntry,
+  isSlackDebugEnabled,
+  computeSlackInstanceTag,
+  recordSlackDebug,
+  querySlackDebugRing,
+} from './slack-debug.js';
+import {
+  detectTailscaleFunnelUrl,
+  resolveGatewayOrigin,
+  resolveClawTalkAgentIds,
+  resolveSelfOrigin,
+} from './gateway-origin.js';
+import { buildTalkContextForAgent } from './talk-context-builder.js';
+import { DEFAULT_GATEWAY_PORT } from './constants.js';
+import {
+  fetchSlackChannelsForAccount,
+  collectTalkSlackChannelHints,
+  createEventReplyHandler,
+} from './slack-reply.js';
 
 // ---------------------------------------------------------------------------
 // Node.js 25 fetch fix — replace built-in undici connector to fix Tailscale IP
@@ -87,178 +106,12 @@ const ROUTES = new Set([
   '/api/events/slack/proxy-setup',
 ]);
 
-type SlackDebugPath = 'slack-ingress' | 'event-reply' | 'openclaw-message';
-type SlackDebugEntry = {
-  ts: number;
-  instanceTag: string;
-  path: SlackDebugPath;
-  phase: string;
-  failurePhase?: string;
-  attempt?: number;
-  attemptToken?: string;
-  elapsedMs?: number;
-  talkId?: string;
-  jobId?: string;
-  eventId?: string;
-  accountId?: string;
-  channelIdRaw?: string;
-  channelIdResolved?: string;
-  threadTs?: string;
-  errorCode?: string;
-  errorMessage?: string;
-};
-
-const SLACK_DEBUG_RING_MAX = 200;
-const slackDebugRing: SlackDebugEntry[] = [];
-
-function isSlackDebugEnabled(): boolean {
-  return process.env.CLAWTALK_SLACK_DEBUG === '1';
-}
-
-function computeSlackInstanceTag(): string {
-  const explicit = (process.env.CLAWTALK_SLACK_DEBUG_INSTANCE_TAG ?? '').trim();
-  if (explicit) return explicit.slice(0, 64);
-  const host = hostname().replace(/[^a-zA-Z0-9_.-]+/g, '').slice(0, 24) || 'host';
-  const boot = Date.now().toString(36).slice(-6);
-  return `${host}:${process.pid}:${boot}`.slice(0, 64);
-}
-
-function recordSlackDebug(entry: Omit<SlackDebugEntry, 'ts' | 'instanceTag'>, instanceTag: string): void {
-  const normalized: SlackDebugEntry = {
-    ts: Date.now(),
-    instanceTag,
-    ...entry,
-    ...(entry.errorMessage ? { errorMessage: entry.errorMessage.slice(0, 220) } : {}),
-  };
-  slackDebugRing.push(normalized);
-  if (slackDebugRing.length > SLACK_DEBUG_RING_MAX) {
-    slackDebugRing.splice(0, slackDebugRing.length - SLACK_DEBUG_RING_MAX);
-  }
-}
-
-// ============================================================================
-// Rate Limiter (for pairing endpoint)
-// ============================================================================
-
-const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
-
-function isRateLimited(ip: string, maxAttempts = 5, windowMs = 60_000): boolean {
-  const now = Date.now();
-  const entry = rateLimitMap.get(ip);
-  if (!entry || now >= entry.resetAt) {
-    // Prevent unbounded map growth between cleanup cycles
-    if (!entry && rateLimitMap.size >= 10_000) return false;
-    rateLimitMap.set(ip, { count: 1, resetAt: now + windowMs });
-    return false;
-  }
-  entry.count++;
-  return entry.count > maxAttempts;
-}
-
-// Cleanup stale entries every 5 minutes
-const rateLimitCleanup = setInterval(() => {
-  const now = Date.now();
-  for (const [ip, entry] of rateLimitMap) {
-    if (now >= entry.resetAt) rateLimitMap.delete(ip);
-  }
-}, 5 * 60_000);
-rateLimitCleanup.unref();
-
 // ============================================================================
 // Pair Password
 // ============================================================================
 
 function resolvePairPassword(pluginCfg: ClawTalkPluginConfig): string | undefined {
   return pluginCfg.pairPassword ?? process.env.CLAWDBOT_PAIR_PASSWORD ?? undefined;
-}
-
-// ============================================================================
-// Tailscale Funnel auto-detection
-// ============================================================================
-
-let _cachedFunnelUrl: string | null | undefined; // undefined = not yet checked
-
-function detectTailscaleFunnelUrl(log: PluginApi['logger']): string | null {
-  if (_cachedFunnelUrl !== undefined) return _cachedFunnelUrl;
-
-  try {
-    const output = execSync('tailscale status --json', {
-      timeout: 5000,
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    const status = JSON.parse(output);
-    const dnsName: string | undefined = status?.Self?.DNSName;
-    if (dnsName) {
-      // DNSName has a trailing dot (e.g. "host.tailnet.ts.net.") — strip it
-      const hostname = dnsName.replace(/\.$/, '');
-      if (hostname.includes('.')) {
-        const url = `https://${hostname}`;
-        log.info(`ClawTalk: detected Tailscale hostname: ${url}`);
-        _cachedFunnelUrl = url;
-        return url;
-      }
-    }
-    log.info('ClawTalk: no Tailscale DNS name found');
-  } catch (err) {
-    log.info(`ClawTalk: Tailscale detection failed: ${err}`);
-  }
-
-  _cachedFunnelUrl = null;
-  return null;
-}
-
-/**
- * Resolve the gateway's self-origin for internal calls (scheduler, dispatcher).
- * Reads gateway.bind and gateway.port from config. If bind is "tailnet",
- * resolves the Tailscale IPv4 via `tailscale status --json`.
- */
-function resolveGatewayOrigin(cfg: Record<string, any>, log: PluginApi['logger']): string {
-  const port = cfg?.gateway?.port ?? 18789;
-  const bind = cfg?.gateway?.bind;
-
-  if (bind === 'tailnet' || bind === 'tailscale') {
-    try {
-      const output = execSync('tailscale ip -4', {
-        timeout: 5000,
-        encoding: 'utf-8',
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
-      const ip = output.trim();
-      if (ip) {
-        const origin = `http://${ip}:${port}`;
-        log.info(`ClawTalk: resolved gateway origin: ${origin}`);
-        return origin;
-      }
-    } catch {
-      // fall through to default
-    }
-  }
-
-  // "loopback" is a symbolic name used by OpenClaw when Tailscale Serve proxies
-  // HTTPS traffic to a localhost-bound gateway.
-  if (bind && bind !== 'tailnet' && bind !== 'tailscale' && bind !== 'loopback' && bind !== '0.0.0.0') {
-    return `http://${bind}:${port}`;
-  }
-
-  return `http://127.0.0.1:${port}`;
-}
-
-function resolveClawTalkAgentIds(cfg: Record<string, any>): string[] {
-  const ids = new Set<string>(['mobileclaw', 'clawtalk']);
-  const agents = Array.isArray(cfg?.agents?.list) ? cfg.agents.list : [];
-  for (const entry of agents) {
-    if (!entry || typeof entry !== 'object') continue;
-    const agent = entry as Record<string, unknown>;
-    const id = typeof agent.id === 'string' ? agent.id.trim() : '';
-    const name = typeof agent.name === 'string' ? agent.name.trim().toLowerCase() : '';
-    if (!id) continue;
-    // Include managed agents (ct-*) and any agent with 'clawtalk' in name/id
-    if (id.startsWith('ct-') || name.includes('clawtalk') || id.toLowerCase().includes('clawtalk')) {
-      ids.add(id);
-    }
-  }
-  return Array.from(ids);
 }
 
 function normalizeSlackResolveScope(channelIdRaw: string): string | null {
@@ -293,433 +146,6 @@ function listSlackAccountOptions(cfg: Record<string, any>): Array<{
       isDefault: id === 'default',
       hasBotToken: Boolean(resolveSlackBotTokenForDiscovery(cfg, id)),
     }));
-}
-
-async function fetchSlackChannelsForAccount(params: {
-  token: string;
-  limit: number;
-}): Promise<Array<{ id: string; name: string; scope: string; displayScope: string }>> {
-  const channels: Array<{ id: string; name: string; scope: string; displayScope: string }> = [];
-  let cursor = '';
-  const timeoutMs = 5_000;
-
-  while (channels.length < params.limit) {
-    const url = new URL('https://slack.com/api/conversations.list');
-    url.searchParams.set('exclude_archived', 'true');
-    url.searchParams.set('limit', '1000');
-    url.searchParams.set('types', 'public_channel,private_channel');
-    if (cursor) url.searchParams.set('cursor', cursor);
-
-    let payload: any;
-    try {
-      const res = await fetch(url, {
-        method: 'GET',
-        headers: { Authorization: `Bearer ${params.token}` },
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-      if (!res.ok) break;
-      payload = await res.json();
-    } catch {
-      break;
-    }
-
-    if (!payload?.ok) break;
-    const batch = Array.isArray(payload.channels) ? payload.channels : [];
-    for (const channel of batch) {
-      const id = typeof channel?.id === 'string' ? channel.id.trim().toUpperCase() : '';
-      const name = typeof channel?.name_normalized === 'string'
-        ? channel.name_normalized.trim()
-        : (typeof channel?.name === 'string' ? channel.name.trim() : '');
-      if (!id || !name) continue;
-      channels.push({
-        id,
-        name,
-        scope: `channel:${id}`,
-        displayScope: `#${name}`,
-      });
-      if (channels.length >= params.limit) break;
-    }
-
-    const nextCursor = typeof payload?.response_metadata?.next_cursor === 'string'
-      ? payload.response_metadata.next_cursor.trim()
-      : '';
-    if (!nextCursor) break;
-    cursor = nextCursor;
-  }
-
-  return channels;
-}
-
-function collectTalkSlackChannelHints(params: {
-  talkStore: TalkStore;
-  accountId: string;
-  limit: number;
-}): Array<{ id: string; name?: string; scope: string; displayScope: string }> {
-  const results = new Map<string, { id: string; name?: string; scope: string; displayScope: string }>();
-  const desiredAccount = params.accountId.trim().toLowerCase() || 'default';
-
-  for (const talk of params.talkStore.listTalks()) {
-    for (const binding of talk.platformBindings ?? []) {
-      if (binding.platform.trim().toLowerCase() !== 'slack') continue;
-      const bindingAccount = (binding.accountId?.trim().toLowerCase() || 'default');
-      if (bindingAccount !== desiredAccount) continue;
-
-      const scope = binding.scope.trim();
-      const channelMatch = scope.match(/^channel:([a-z0-9]+)$/i);
-      if (!channelMatch?.[1]) continue;
-
-      const id = channelMatch[1].toUpperCase();
-      const displayScope = binding.displayScope?.trim() || `#${id}`;
-      const name = displayScope.startsWith('#') ? displayScope.slice(1) : undefined;
-      results.set(id, {
-        id,
-        scope: `channel:${id}`,
-        displayScope,
-        ...(name ? { name } : {}),
-      });
-      if (results.size >= params.limit) break;
-    }
-    if (results.size >= params.limit) break;
-  }
-
-  return Array.from(results.values());
-}
-
-// ============================================================================
-// Platform reply — delivers event job output back to the originating platform
-// ============================================================================
-
-/**
- * Create a replyToEvent callback that delivers messages to platforms.
- * Currently supports Slack via chat.postMessage.
- */
-function createEventReplyHandler(
-  getConfig: () => Record<string, any>,
-  logger: Logger,
-  opts?: {
-    debugEnabled?: () => boolean;
-    onDebug?: (entry: Omit<SlackDebugEntry, 'ts' | 'instanceTag'>) => void;
-  },
-) {
-  const nameCacheByAccount = new Map<string, { expiresAt: number; byName: Map<string, string> }>();
-  const normalizeChannelName = (value: string): string =>
-    value.trim().toLowerCase().replace(/^#/, '').replace(/^channel:/, '').trim();
-  const isCanonicalChannelId = (value: string): boolean => /^[CDGU][A-Z0-9]+$/.test(value.trim().toUpperCase());
-  const inferErrorCode = (message: string): string => {
-    const text = message.toLowerCase();
-    if (text.includes('unknown channel')) return 'unknown_channel';
-    if (text.includes('not_in_channel')) return 'not_in_channel';
-    if (text.includes('timeout') || text.includes('timed out')) return 'timeout';
-    if (text.includes('unauthorized') || text.includes('forbidden')) return 'auth_error';
-    return 'error';
-  };
-  const emit = (entry: Omit<SlackDebugEntry, 'ts' | 'instanceTag'>): void => {
-    if (opts?.debugEnabled && !opts.debugEnabled()) return;
-    opts?.onDebug?.(entry);
-  };
-  const resolveChannelId = async (
-    channelRaw: string,
-    accountId: string,
-    token: string,
-  ): Promise<string | undefined> => {
-    const normalizedRaw = channelRaw.trim();
-    if (!normalizedRaw) return undefined;
-    const direct = normalizedRaw.includes(':') ? normalizedRaw.slice(normalizedRaw.lastIndexOf(':') + 1) : normalizedRaw;
-    if (isCanonicalChannelId(direct)) {
-      return direct.trim().toUpperCase();
-    }
-    const cacheKey = accountId.trim().toLowerCase() || 'default';
-    const now = Date.now();
-    const cached = nameCacheByAccount.get(cacheKey);
-    if (!cached || cached.expiresAt <= now) {
-      const channels = await fetchSlackChannelsForAccount({ token, limit: 2000 });
-      const byName = new Map<string, string>();
-      for (const channel of channels) {
-        byName.set(normalizeChannelName(channel.name), channel.id);
-      }
-      nameCacheByAccount.set(cacheKey, { expiresAt: now + 5 * 60_000, byName });
-    }
-    const refreshed = nameCacheByAccount.get(cacheKey);
-    return refreshed?.byName.get(normalizeChannelName(direct));
-  };
-  return async (target: EventReplyTarget, message: string): Promise<boolean> => {
-    if (target.platform !== 'slack') {
-      logger.warn(`EventReply: unsupported platform "${target.platform}"`);
-      return false;
-    }
-
-    if (!target.platformChannelId || !target.accountId) {
-      logger.warn('EventReply: slack_account_context_required (missing channelId or accountId)');
-      return false;
-    }
-
-    const cfg = getConfig();
-    const botToken = resolveSlackBotTokenForAccount(cfg, target.accountId);
-    if (!botToken) {
-      logger.warn(`EventReply: no bot token for Slack account "${target.accountId}"`);
-      emit({
-        path: 'event-reply',
-        phase: 'send_fail',
-        accountId: target.accountId,
-        channelIdRaw: target.platformChannelId,
-        threadTs: target.threadId,
-        errorCode: 'missing_token',
-        errorMessage: `no bot token for account ${target.accountId ?? '-'}`,
-      });
-      return false;
-    }
-
-    try {
-      const resolvedChannelId = await resolveChannelId(
-        target.platformChannelId,
-        target.accountId,
-        botToken,
-      );
-      if (!resolvedChannelId) {
-        const errorMessage = `Unknown channel: ${target.platformChannelId}`;
-        emit({
-          path: 'event-reply',
-          phase: 'send_fail',
-          accountId: target.accountId,
-          channelIdRaw: target.platformChannelId,
-          threadTs: target.threadId,
-          errorCode: 'unknown_channel_name',
-          errorMessage,
-        });
-        logger.warn(`EventReply: ${errorMessage}`);
-        return false;
-      }
-      emit({
-        path: 'event-reply',
-        phase: 'send_start',
-        accountId: target.accountId,
-        channelIdRaw: target.platformChannelId,
-        channelIdResolved: resolvedChannelId,
-        threadTs: target.threadId,
-      });
-      const body: Record<string, unknown> = {
-        channel: resolvedChannelId,
-        text: message,
-      };
-      if (target.threadId) {
-        body.thread_ts = target.threadId;
-      }
-
-      const res = await fetch('https://slack.com/api/chat.postMessage', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${botToken}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(body),
-      });
-
-      const result = await res.json() as { ok: boolean; error?: string };
-      if (!result.ok) {
-        emit({
-          path: 'event-reply',
-          phase: 'send_fail',
-          accountId: target.accountId,
-          channelIdRaw: target.platformChannelId,
-          channelIdResolved: resolvedChannelId,
-          threadTs: target.threadId,
-          errorCode: inferErrorCode(result.error ?? 'error'),
-          errorMessage: result.error ?? 'slack api error',
-        });
-        logger.warn(`EventReply: Slack API error: ${result.error}`);
-        return false;
-      }
-
-      emit({
-        path: 'event-reply',
-        phase: 'send_ok',
-        accountId: target.accountId,
-        channelIdRaw: target.platformChannelId,
-        channelIdResolved: resolvedChannelId,
-        threadTs: target.threadId,
-      });
-      return true;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      emit({
-        path: 'event-reply',
-        phase: 'send_fail',
-        accountId: target.accountId,
-        channelIdRaw: target.platformChannelId,
-        threadTs: target.threadId,
-        errorCode: inferErrorCode(msg),
-        errorMessage: msg,
-      });
-      logger.warn(`EventReply: Slack post failed: ${msg}`);
-      return false;
-    }
-  };
-}
-
-// ============================================================================
-// Talk Context Builder (for before_agent_start hook)
-// ============================================================================
-
-const MAX_AGENT_CONTEXT_BYTES = 8 * 1024;
-
-/**
- * Compose a compact context block for injection into OpenClaw's agent via
- * the `before_agent_start` hook's `prependContext` return.
- *
- * Includes: onMessagePrompt (instructions), objective, directives (rules),
- * conversation context (context.md), pinned messages, and state file paths.
- */
-async function buildTalkContextForAgent(
-  talk: import('./types.js').TalkMeta,
-  store: TalkStore,
-  logger: import('./types.js').Logger,
-): Promise<string | null> {
-  const sections: string[] = [];
-
-  sections.push('--- ClawTalk Talk Context ---');
-
-  // Instructions from platform behaviors (onMessagePrompt)
-  const slackBehaviors = (talk.platformBehaviors ?? []).filter(b => {
-    const binding = (talk.platformBindings ?? []).find(pb => pb.id === b.platformBindingId);
-    return binding?.platform.trim().toLowerCase() === 'slack';
-  });
-  const onMessagePrompts = slackBehaviors
-    .map(b => b.onMessagePrompt?.trim())
-    .filter((p): p is string => Boolean(p));
-  if (onMessagePrompts.length > 0) {
-    sections.push(`## Instructions\n${onMessagePrompts.join('\n\n')}`);
-  }
-
-  // Response policy — prompt the agent for 'off' and 'mentions' modes
-  const observeOnlyScopes: string[] = [];
-  const mentionsOnlyScopes: string[] = [];
-  for (const b of slackBehaviors) {
-    const mode = b.responseMode
-      ?? ((b as { autoRespond?: boolean }).autoRespond === false ? 'off' : 'all');
-    if (mode === 'all') continue;
-    const binding = (talk.platformBindings ?? []).find(pb => pb.id === b.platformBindingId);
-    if (!binding) continue;
-    const label = binding.displayScope ?? binding.scope;
-    if (mode === 'off') observeOnlyScopes.push(label);
-    else if (mode === 'mentions') mentionsOnlyScopes.push(label);
-  }
-  const policyLines: string[] = [];
-  if (observeOnlyScopes.length > 0) {
-    policyLines.push(
-      'Do not reply to messages from these channels. ' +
-      'Read them and update context.md if they contain relevant information.',
-      ...observeOnlyScopes.map(s => `- ${s}`),
-    );
-  }
-  if (mentionsOnlyScopes.length > 0) {
-    policyLines.push(
-      'Only reply in these channels when you are directly @mentioned. ' +
-      'Ignore messages that do not mention you.',
-      ...mentionsOnlyScopes.map(s => `- ${s}`),
-    );
-  }
-  if (policyLines.length > 0) {
-    sections.push('## Response Policy\n' + policyLines.join('\n'));
-  }
-
-  // Objective
-  if (talk.objective?.trim()) {
-    sections.push(`## Objective\n${talk.objective.trim()}`);
-  }
-
-  // Rules (active directives)
-  const activeDirectives = (talk.directives ?? []).filter(d => d.active);
-  if (activeDirectives.length > 0) {
-    const lines = activeDirectives.map((d, i) => `${i + 1}. ${d.text}`);
-    sections.push(
-      '## Rules\n' +
-      'Follow each directive as written. These are standing rules for this conversation.\n\n' +
-      lines.join('\n'),
-    );
-  }
-
-  // Conversation context (context.md)
-  try {
-    const contextMd = await store.getContextMd(talk.id);
-    if (contextMd.trim()) {
-      sections.push(
-        `## Conversation Context\nThe following is a running summary of this conversation so far:\n\n${contextMd.trim()}`,
-      );
-    }
-  } catch {
-    // context.md missing is non-fatal
-  }
-
-  // Knowledge files index (agent can Read full content)
-  try {
-    const knowledgeIndex = await store.getKnowledgeIndex(talk.id);
-    if (knowledgeIndex.length > 0) {
-      const indexLines = knowledgeIndex.map(e => `- ${e.slug}: ${e.summary}`);
-      const dataDir = store.getDataDir();
-      sections.push(
-        '## Knowledge Files\n' +
-        'Durable domain knowledge is stored in topic files. Use `Read` to access full content.\n\n' +
-        indexLines.join('\n') + '\n\n' +
-        `Directory: ${dataDir}/talks/${talk.id}/knowledge/`,
-      );
-    }
-  } catch {
-    // non-fatal
-  }
-
-  // Pinned references (match client cap of 10)
-  if (talk.pinnedMessageIds.length > 0) {
-    try {
-      const pinned = await Promise.all(
-        talk.pinnedMessageIds.slice(0, 10).map(id => store.getMessage(talk.id, id)),
-      );
-      const validPins = pinned.filter(Boolean) as import('./types.js').TalkMessage[];
-      if (validPins.length > 0) {
-        const pinLines = validPins.map(m => {
-          const preview = m.content.length > 200
-            ? m.content.slice(0, 200) + '...'
-            : m.content;
-          const ts = new Date(m.timestamp).toISOString().slice(0, 16).replace('T', ' ');
-          return `- ${m.role} (${ts}): ${preview}`;
-        });
-        const overflow = talk.pinnedMessageIds.length > 10
-          ? `\n- ... and ${talk.pinnedMessageIds.length - 10} more pinned messages`
-          : '';
-        sections.push(`## Pinned References\nThe user has pinned these as important:\n${pinLines.join('\n')}${overflow}`);
-      }
-    } catch {
-      // non-fatal
-    }
-  }
-
-  // State paths — tell the agent where to read/write persistent data
-  const dataDir = store.getDataDir();
-  sections.push(
-    `## State\n` +
-    `Data directory: ${dataDir}/talks/${talk.id}/state/\n` +
-    `Context file: ${dataDir}/talks/${talk.id}/context.md\n` +
-    `Knowledge directory: ${dataDir}/talks/${talk.id}/knowledge/\n` +
-    `Update context.md when significant progress occurs (not every message).`,
-  );
-
-  if (sections.length <= 1) return null; // only header, no meaningful content
-
-  let result = sections.join('\n\n');
-
-  // Cap at MAX_AGENT_CONTEXT_BYTES
-  if (Buffer.byteLength(result, 'utf-8') > MAX_AGENT_CONTEXT_BYTES) {
-    const encoder = new TextEncoder();
-    const encoded = encoder.encode(result);
-    const truncated = encoded.slice(0, MAX_AGENT_CONTEXT_BYTES);
-    result = new TextDecoder().decode(truncated);
-    const lastNewline = result.lastIndexOf('\n');
-    if (lastNewline > MAX_AGENT_CONTEXT_BYTES * 0.8) {
-      result = result.slice(0, lastNewline);
-    }
-    result += '\n\n[Talk context truncated]';
-  }
-
-  return result;
 }
 
 // ============================================================================
@@ -867,7 +293,7 @@ const plugin = {
         onDebug: emitSlackDebug,
       },
     );
-    let slackIngressOrigin = 'http://127.0.0.1:18789';
+    let slackIngressOrigin = `http://127.0.0.1:${DEFAULT_GATEWAY_PORT}`;
     let slackIngressToken: string | undefined;
     const refreshSlackIngressRoute = () => {
       const cfg0 = api.runtime.config.loadConfig();
@@ -966,7 +392,7 @@ const plugin = {
                 params.message,
               ),
           });
-        }).catch(() => {});
+        }).catch((err) => api.logger.warn(`ClawTalk: scheduler start failed: ${err}`));
       },
       stop: () => {
         if (stopScheduler) {
@@ -996,7 +422,7 @@ const plugin = {
             replyToEvent: replyHandler,
           });
           api.logger.info('ClawTalk: event dispatcher started');
-        }).catch(() => {});
+        }).catch((err) => api.logger.warn(`ClawTalk: event dispatcher start failed: ${err}`));
       },
       stop: () => {
         if (eventDispatcher) {
@@ -1242,10 +668,10 @@ const plugin = {
               const parsed = new URL(resolvedUrl);
               port = parsed.port ? parseInt(parsed.port, 10) : (parsed.protocol === 'https:' ? 443 : 80);
             } catch {
-              port = 18789;
+              port = DEFAULT_GATEWAY_PORT;
             }
           } else {
-            const host = req.headers.host ?? 'localhost:18789';
+            const host = req.headers.host ?? `localhost:${DEFAULT_GATEWAY_PORT}`;
             const hostPort = host.includes(':') ? parseInt(host.split(':').pop()!, 10) : 80;
             port = hostPort;
             gatewayURL = `http://${host}`;
@@ -1287,9 +713,7 @@ const plugin = {
 
         // WebSocket upgrade for voice streaming — handled separately
         if (url.pathname === '/api/voice/stream') {
-          const selfAddr = req.socket?.localAddress ?? '127.0.0.1';
-          const selfPort = req.socket?.localPort ?? 18789;
-          const gatewayOrigin = `http://${selfAddr}:${selfPort}`;
+          const gatewayOrigin = resolveSelfOrigin(req);
           const gatewayToken = resolveGatewayToken(cfg);
           handleVoiceStreamUpgrade(
             req, res, api.logger,
@@ -1334,11 +758,7 @@ const plugin = {
           // POST /api/talks/:id/chat
           const chatMatch = url.pathname.match(/^\/api\/talks\/([\w-]+)\/chat$/);
           if (chatMatch) {
-            // Use the socket's local address for self-calls — the gateway may
-            // bind to a specific IP (e.g. Tailscale) rather than 0.0.0.0.
-            const selfAddr = req.socket?.localAddress ?? '127.0.0.1';
-            const selfPort = req.socket?.localPort ?? 18789;
-            const gatewayOrigin = `http://${selfAddr}:${selfPort}`;
+            const gatewayOrigin = resolveSelfOrigin(req);
             const gatewayToken = resolveGatewayToken(cfg);
             await handleTalkChat({
               req, res,
@@ -1579,14 +999,10 @@ const plugin = {
             const validPath = pathFilter === 'slack-ingress' || pathFilter === 'event-reply' || pathFilter === 'openclaw-message'
               ? pathFilter
               : undefined;
-            const entries = slackDebugRing
-              .filter((entry) => {
-                if (talkIdFilter && entry.talkId !== talkIdFilter) return false;
-                if (validPath && entry.path !== validPath) return false;
-                return true;
-              })
-              .slice(-limit)
-              .reverse();
+            const entries = querySlackDebugRing(
+              { talkId: talkIdFilter, path: validPath },
+              limit,
+            );
             sendJson(res, 200, {
               debugEnabled: isSlackDebugEnabled(),
               instanceTag: slackDebugInstanceTag,
@@ -1626,9 +1042,7 @@ const plugin = {
             break;
           }
           case '/api/events/slack': {
-            const selfAddr = req.socket?.localAddress ?? '127.0.0.1';
-            const selfPort = req.socket?.localPort ?? 18789;
-            const gatewayOrigin = `http://${selfAddr}:${selfPort}`;
+            const gatewayOrigin = resolveSelfOrigin(req);
             const gatewayToken = resolveGatewayToken(cfg);
             await handleSlackIngress(ctx, {
               ...buildSlackIngressDeps(),
@@ -1665,9 +1079,7 @@ const plugin = {
             await handleRealtimeVoiceCapabilities(ctx);
             break;
           case '/slack/events': {
-            const selfAddr = req.socket?.localAddress ?? '127.0.0.1';
-            const selfPort = req.socket?.localPort ?? 18789;
-            const gatewayOrigin = `http://${selfAddr}:${selfPort}`;
+            const gatewayOrigin = resolveSelfOrigin(req);
             const gatewayToken = resolveGatewayToken(cfg);
             await handleSlackEventProxy(req, res, {
               store: talkStore,

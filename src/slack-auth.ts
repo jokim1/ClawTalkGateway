@@ -1,7 +1,7 @@
-const DEFAULT_SLACK_ACCOUNT_ID = 'default';
+export const SLACK_DEFAULT_ACCOUNT_ID = 'default';
 
-export function normalizeSlackAccountId(value: string | undefined): string | undefined {
-  if (!value) return undefined;
+export function normalizeSlackAccountId(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !value) return undefined;
   const trimmed = value.trim().toLowerCase();
   return trimmed || undefined;
 }
@@ -21,12 +21,12 @@ export function resolveTemplateSecret(raw: string | undefined): string | undefin
 export function listSlackAccountIds(cfg: Record<string, any>): string[] {
   const accounts = cfg?.channels?.slack?.accounts;
   if (!accounts || typeof accounts !== 'object') {
-    return [DEFAULT_SLACK_ACCOUNT_ID];
+    return [SLACK_DEFAULT_ACCOUNT_ID];
   }
   const ids = Object.keys(accounts).filter(Boolean);
-  if (ids.length === 0) return [DEFAULT_SLACK_ACCOUNT_ID];
-  if (ids.includes(DEFAULT_SLACK_ACCOUNT_ID)) {
-    return [DEFAULT_SLACK_ACCOUNT_ID, ...ids.filter((id) => id !== DEFAULT_SLACK_ACCOUNT_ID).sort()];
+  if (ids.length === 0) return [SLACK_DEFAULT_ACCOUNT_ID];
+  if (ids.includes(SLACK_DEFAULT_ACCOUNT_ID)) {
+    return [SLACK_DEFAULT_ACCOUNT_ID, ...ids.filter((id) => id !== SLACK_DEFAULT_ACCOUNT_ID).sort()];
   }
   return ids.sort();
 }
@@ -41,7 +41,7 @@ export function resolveSlackBotTokenForAccount(
   const accountToken = resolveTemplateSecret(cfg?.channels?.slack?.accounts?.[normalizedAccountId]?.botToken);
   if (accountToken) return accountToken;
 
-  if (normalizedAccountId === DEFAULT_SLACK_ACCOUNT_ID) {
+  if (normalizedAccountId === SLACK_DEFAULT_ACCOUNT_ID) {
     const topLevelToken = resolveTemplateSecret(cfg?.channels?.slack?.botToken);
     if (topLevelToken) return topLevelToken;
     const envToken = resolveTemplateSecret(process.env.SLACK_BOT_TOKEN);

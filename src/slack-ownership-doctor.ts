@@ -1,7 +1,6 @@
-import type { PlatformBinding, TalkMeta } from './types.js';
+import type { TalkPlatformBinding, TalkMeta } from './types.js';
 import { normalizeSlackBindingScope } from './talks.js';
-
-const DEFAULT_ACCOUNT_ID = 'default';
+import { SLACK_DEFAULT_ACCOUNT_ID, normalizeSlackAccountId } from './slack-auth.js';
 
 type OpenClawSlackBinding = {
   agentId: string;
@@ -19,17 +18,11 @@ export type SlackOwnershipConflict = {
   openClawAccountId: string;
 };
 
-function normalizeAccountId(value: unknown): string {
-  if (typeof value !== 'string') return DEFAULT_ACCOUNT_ID;
-  const trimmed = value.trim().toLowerCase();
-  return trimmed || DEFAULT_ACCOUNT_ID;
-}
-
 function normalizeSlackScopeForOwnership(scope: string): string | null {
   return normalizeSlackBindingScope(scope)?.toLowerCase() ?? null;
 }
 
-function isWritePermission(permission: PlatformBinding['permission']): boolean {
+function isWritePermission(permission: TalkPlatformBinding['permission']): boolean {
   return permission === 'write' || permission === 'read+write';
 }
 
@@ -50,7 +43,7 @@ function parseOpenClawSlackBindings(cfg: Record<string, unknown>): OpenClawSlack
     const channel = typeof match.channel === 'string' ? match.channel.trim().toLowerCase() : '';
     if (channel !== 'slack') continue;
 
-    const accountId = normalizeAccountId(match.accountId);
+    const accountId = normalizeSlackAccountId(match.accountId) ?? SLACK_DEFAULT_ACCOUNT_ID;
     const peer = (match.peer && typeof match.peer === 'object')
       ? match.peer as Record<string, unknown>
       : null;
@@ -84,7 +77,7 @@ function talkSlackBindings(talk: TalkMeta): Array<{ talkId: string; accountId: s
     if (!scope) continue;
     out.push({
       talkId: talk.id,
-      accountId: normalizeAccountId(binding.accountId),
+      accountId: normalizeSlackAccountId(binding.accountId) ?? SLACK_DEFAULT_ACCOUNT_ID,
       scope,
     });
   }
