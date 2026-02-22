@@ -740,14 +740,18 @@ const plugin = {
     // Start the rate-limit capture proxy
     const proxyPort = pluginCfg.proxyPort ?? 18793;
     startProxy(proxyPort, api.logger);
-    void reconcileAnthropicProxyBaseUrls(proxyPort, api.logger).catch((err) => {
-      const message = err instanceof Error ? err.message : String(err);
-      api.logger.warn(`ClawTalk: failed to reconcile Anthropic baseUrl: ${message}`);
-    });
-    void reconcileGatewayResponsesEndpoint(api.logger).catch((err) => {
-      const message = err instanceof Error ? err.message : String(err);
-      api.logger.warn(`ClawTalk: failed to reconcile responses endpoint config: ${message}`);
-    });
+    // Reconcile config files sequentially (shared lock serializes openclaw.json writes).
+    // This promise runs in parallel with talkStore.init() and is awaited before Slack routing.
+    const configReconciled = reconcileAnthropicProxyBaseUrls(proxyPort, api.logger)
+      .catch((err) => {
+        const message = err instanceof Error ? err.message : String(err);
+        api.logger.warn(`ClawTalk: failed to reconcile Anthropic baseUrl: ${message}`);
+      })
+      .then(() => reconcileGatewayResponsesEndpoint(api.logger))
+      .catch((err) => {
+        const message = err instanceof Error ? err.message : String(err);
+        api.logger.warn(`ClawTalk: failed to reconcile responses endpoint config: ${message}`);
+      });
 
     // Eagerly warm up the usage loader in background
     warmUsageLoader(api.logger);
@@ -813,6 +817,7 @@ const plugin = {
       .then(async () => {
         readyPhase = 'reconciling_routes';
         appendSyncEvent('gateway_phase', { phase: readyPhase });
+        await configReconciled;
         await reconcileSlackRoutingForTalks(talkStore.listTalks(), api.logger);
         // Check and log Slack event proxy setup status
         const proxyCfg = api.runtime.config.loadConfig();

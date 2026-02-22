@@ -10,6 +10,7 @@ import * as path from 'node:path';
 import type { TalkStore } from './talk-store.js';
 import type { Logger, PlatformBinding } from './types.js';
 import { collectSigningSecrets, resolveOpenClawWebhookUrl } from './slack-event-proxy.js';
+import { withOpenClawConfigLock } from './openclaw-config-lock.js';
 
 // ---------------------------------------------------------------------------
 // Setup status types
@@ -244,64 +245,66 @@ export async function saveSlackSigningSecret(
   logger: Logger,
   accountId?: string,
 ): Promise<void> {
-  const configPath = path.join(process.env.HOME ?? '', '.openclaw', 'openclaw.json');
-  if (!configPath || configPath === '.openclaw/openclaw.json') {
-    throw new Error('Cannot resolve openclaw.json path');
-  }
+  await withOpenClawConfigLock(async () => {
+    const configPath = path.join(process.env.HOME ?? '', '.openclaw', 'openclaw.json');
+    if (!configPath || configPath === '.openclaw/openclaw.json') {
+      throw new Error('Cannot resolve openclaw.json path');
+    }
 
-  let raw: string;
-  try {
-    raw = await fs.readFile(configPath, 'utf-8');
-  } catch {
-    // File doesn't exist — create a minimal config
-    raw = '{}';
-  }
+    let raw: string;
+    try {
+      raw = await fs.readFile(configPath, 'utf-8');
+    } catch {
+      // File doesn't exist — create a minimal config
+      raw = '{}';
+    }
 
-  let cfg: Record<string, unknown>;
-  try {
-    cfg = JSON.parse(raw) as Record<string, unknown>;
-  } catch {
-    throw new Error('Invalid openclaw.json — cannot parse');
-  }
+    let cfg: Record<string, unknown>;
+    try {
+      cfg = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      throw new Error('Invalid openclaw.json — cannot parse');
+    }
 
-  const channels = ensureObjectPath(cfg, 'channels');
-  const chSlack = ensureObjectPath(channels, 'slack');
+    const channels = ensureObjectPath(cfg, 'channels');
+    const chSlack = ensureObjectPath(channels, 'slack');
 
-  if (accountId && accountId !== 'default') {
-    // Write to specific account path
-    const accounts = ensureObjectPath(chSlack, 'accounts');
-    const accObj = ensureObjectPath(accounts, accountId);
-    accObj.signingSecret = signingSecret;
-    logger.info(`ClawTalk: saving Slack signing secret for account "${accountId}"`);
-  } else {
-    // Write to base-level (fallback for all accounts)
-    chSlack.signingSecret = signingSecret;
+    if (accountId && accountId !== 'default') {
+      // Write to specific account path
+      const accounts = ensureObjectPath(chSlack, 'accounts');
+      const accObj = ensureObjectPath(accounts, accountId);
+      accObj.signingSecret = signingSecret;
+      logger.info(`ClawTalk: saving Slack signing secret for account "${accountId}"`);
+    } else {
+      // Write to base-level (fallback for all accounts)
+      chSlack.signingSecret = signingSecret;
 
-    // Also propagate to existing per-account configs that lack a signing secret,
-    // so collectSigningSecrets() can map them to the correct accountId.
-    const accounts = chSlack.accounts;
-    if (accounts && typeof accounts === 'object') {
-      for (const [accId, acc] of Object.entries(accounts as Record<string, unknown>)) {
-        if (acc && typeof acc === 'object') {
-          const existing = (acc as Record<string, unknown>).signingSecret;
-          if (!existing || (typeof existing === 'string' && !existing.trim())) {
-            (acc as Record<string, unknown>).signingSecret = signingSecret;
-            logger.info(`ClawTalk: propagated signing secret to account "${accId}"`);
+      // Also propagate to existing per-account configs that lack a signing secret,
+      // so collectSigningSecrets() can map them to the correct accountId.
+      const accounts = chSlack.accounts;
+      if (accounts && typeof accounts === 'object') {
+        for (const [accId, acc] of Object.entries(accounts as Record<string, unknown>)) {
+          if (acc && typeof acc === 'object') {
+            const existing = (acc as Record<string, unknown>).signingSecret;
+            if (!existing || (typeof existing === 'string' && !existing.trim())) {
+              (acc as Record<string, unknown>).signingSecret = signingSecret;
+              logger.info(`ClawTalk: propagated signing secret to account "${accId}"`);
+            }
           }
         }
       }
     }
-  }
 
-  const next = `${JSON.stringify(cfg, null, 2)}\n`;
-  if (next === raw) return;
+    const next = `${JSON.stringify(cfg, null, 2)}\n`;
+    if (next === raw) return;
 
-  // Ensure directory exists
-  const dir = path.dirname(configPath);
-  await fs.mkdir(dir, { recursive: true });
+    // Ensure directory exists
+    const dir = path.dirname(configPath);
+    await fs.mkdir(dir, { recursive: true });
 
-  const tmpPath = `${configPath}.tmp.${Date.now()}`;
-  await fs.writeFile(tmpPath, next, 'utf-8');
-  await fs.rename(tmpPath, configPath);
-  logger.info('ClawTalk: saved Slack signing secret to openclaw.json');
+    const tmpPath = `${configPath}.tmp.${Date.now()}`;
+    await fs.writeFile(tmpPath, next, 'utf-8');
+    await fs.rename(tmpPath, configPath);
+    logger.info('ClawTalk: saved Slack signing secret to openclaw.json');
+  });
 }

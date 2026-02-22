@@ -1,6 +1,7 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import type { Logger, PlatformBinding, TalkMeta } from './types.js';
+import { withOpenClawConfigLock } from './openclaw-config-lock.js';
 
 const MANAGED_AGENT_PREFIX = 'ct-';
 const DEFAULT_ACCOUNT_ID = 'default';
@@ -171,146 +172,148 @@ export async function reconcileSlackRoutingForTalks(
   talks: TalkMeta[],
   logger: Logger,
 ): Promise<void> {
-  const configPath = path.join(process.env.HOME ?? '', '.openclaw', 'openclaw.json');
-  if (!configPath || configPath === '.openclaw/openclaw.json') return;
+  await withOpenClawConfigLock(async () => {
+    const configPath = path.join(process.env.HOME ?? '', '.openclaw', 'openclaw.json');
+    if (!configPath || configPath === '.openclaw/openclaw.json') return;
 
-  let raw: string;
-  try {
-    raw = await fs.readFile(configPath, 'utf-8');
-  } catch {
-    return;
-  }
+    let raw: string;
+    try {
+      raw = await fs.readFile(configPath, 'utf-8');
+    } catch {
+      return;
+    }
 
-  let cfg: Record<string, unknown>;
-  try {
-    cfg = JSON.parse(raw) as Record<string, unknown>;
-  } catch (err) {
-    logger.warn(`ClawTalk: slack routing reconcile skipped (invalid openclaw.json): ${String(err)}`);
-    return;
-  }
+    let cfg: Record<string, unknown>;
+    try {
+      cfg = JSON.parse(raw) as Record<string, unknown>;
+    } catch (err) {
+      logger.warn(`ClawTalk: slack routing reconcile skipped (invalid openclaw.json): ${String(err)}`);
+      return;
+    }
 
-  const desired = desiredSlackBindingsFromTalks(talks);
-  const desiredByKey = new Map<string, DesiredBinding>();
-  for (const entry of desired) {
-    desiredByKey.set(`${entry.accountId}:${entry.peer.kind}:${entry.peer.id}`, entry);
-  }
+    const desired = desiredSlackBindingsFromTalks(talks);
+    const desiredByKey = new Map<string, DesiredBinding>();
+    for (const entry of desired) {
+      desiredByKey.set(`${entry.accountId}:${entry.peer.kind}:${entry.peer.id}`, entry);
+    }
 
-  const existingBindings = Array.isArray(cfg.bindings) ? cfg.bindings : [];
-  const retained: Record<string, unknown>[] = [];
-  for (const row of existingBindings) {
-    if (!row || typeof row !== 'object') continue;
-    const binding = row as Record<string, unknown>;
-    if (!isSlackPeerBindingRow(binding)) {
+    const existingBindings = Array.isArray(cfg.bindings) ? cfg.bindings : [];
+    const retained: Record<string, unknown>[] = [];
+    for (const row of existingBindings) {
+      if (!row || typeof row !== 'object') continue;
+      const binding = row as Record<string, unknown>;
+      if (!isSlackPeerBindingRow(binding)) {
+        retained.push(binding);
+        continue;
+      }
+
+      const key = bindingKeyFromRow(binding);
+      if (!key) {
+        retained.push(binding);
+        continue;
+      }
+
+      // Rebuild all ClawTalk-managed rows and any conflicting peer-specific rows
+      // so talk bindings always own their configured Slack channel/user route.
+      if (desiredByKey.has(key)) {
+        continue;
+      }
+      const agentId = typeof binding.agentId === 'string' ? binding.agentId.trim().toLowerCase() : '';
+      // Remove stale managed bindings and legacy 'clawtalk' bindings
+      if (isManagedAgentId(agentId) || agentId === 'clawtalk') {
+        continue;
+      }
       retained.push(binding);
-      continue;
     }
 
-    const key = bindingKeyFromRow(binding);
-    if (!key) {
-      retained.push(binding);
-      continue;
+    const managed = desired.map((entry) => buildManagedBinding(entry));
+    cfg.bindings = [...managed, ...retained];
+
+    // Merge managed agents into agents.list
+    const agentsRoot = ensureObjectPath(cfg, 'agents');
+    const existingAgentList: Record<string, unknown>[] = Array.isArray(agentsRoot.list)
+      ? (agentsRoot.list as Record<string, unknown>[])
+      : [];
+    // Read default model from agents.defaults.model.primary
+    const agentDefaults = agentsRoot.defaults && typeof agentsRoot.defaults === 'object'
+      ? agentsRoot.defaults as Record<string, unknown>
+      : {};
+    const defaultModelObj = agentDefaults.model && typeof agentDefaults.model === 'object'
+      ? agentDefaults.model as Record<string, unknown>
+      : {};
+    const defaultModel = typeof defaultModelObj.primary === 'string'
+      ? defaultModelObj.primary.trim()
+      : 'moltbot';
+    const managedAgents = buildManagedAgentsFromTalks(talks, desired, defaultModel);
+    // Keep non-managed agents, remove stale managed ones
+    const retainedAgents = existingAgentList.filter(a => {
+      const id = typeof a.id === 'string' ? a.id.trim() : '';
+      return !isManagedAgentId(id);
+    });
+    agentsRoot.list = [...retainedAgents, ...managedAgents];
+    if (managedAgents.length > 0) {
+      logger.info(
+        `ClawTalk: reconciled ${managedAgents.length} managed agents: ${managedAgents.map(a => a.id).join(', ')}`,
+      );
     }
 
-    // Rebuild all ClawTalk-managed rows and any conflicting peer-specific rows
-    // so talk bindings always own their configured Slack channel/user route.
-    if (desiredByKey.has(key)) {
-      continue;
+    // Ensure channels configured by talks are mention-free by default.
+    const channelsRoot = ensureObjectPath(cfg, 'channels');
+    const slackRoot = ensureObjectPath(channelsRoot, 'slack');
+    const accountsRoot = ensureObjectPath(slackRoot, 'accounts');
+
+    // Migrate old nested dm.{policy,allowFrom} → flat dmPolicy/allowFrom
+    // (OpenClaw 2026.2.19+ uses the flat format; avoids doctor warnings on every restart)
+    for (const acct of Object.values(accountsRoot)) {
+      if (!acct || typeof acct !== 'object') continue;
+      const a = acct as Record<string, unknown>;
+      const dm = a.dm;
+      if (!dm || typeof dm !== 'object') continue;
+      const d = dm as Record<string, unknown>;
+      if (d.policy !== undefined && a.dmPolicy === undefined) a.dmPolicy = d.policy;
+      if (d.allowFrom !== undefined && a.allowFrom === undefined) a.allowFrom = d.allowFrom;
+      delete a.dm;
     }
-    const agentId = typeof binding.agentId === 'string' ? binding.agentId.trim().toLowerCase() : '';
-    // Remove stale managed bindings and legacy 'clawtalk' bindings
-    if (isManagedAgentId(agentId) || agentId === 'clawtalk') {
-      continue;
+    for (const entry of desired) {
+      if (entry.peer.kind !== 'channel') continue;
+      const accountRoot = ensureObjectPath(accountsRoot, entry.accountId);
+      const accountChannels = ensureObjectPath(accountRoot, 'channels');
+      const channelRow = ensureObjectPath(accountChannels, entry.peer.id);
+      channelRow.requireMention = entry.requireMention;
+      if (entry.responseMode === 'off' || !entry.onMessagePrompt) {
+        delete channelRow.systemPrompt;
+      } else {
+        channelRow.systemPrompt = entry.onMessagePrompt;
+      }
     }
-    retained.push(binding);
-  }
 
-  const managed = desired.map((entry) => buildManagedBinding(entry));
-  cfg.bindings = [...managed, ...retained];
-
-  // Merge managed agents into agents.list
-  const agentsRoot = ensureObjectPath(cfg, 'agents');
-  const existingAgentList: Record<string, unknown>[] = Array.isArray(agentsRoot.list)
-    ? (agentsRoot.list as Record<string, unknown>[])
-    : [];
-  // Read default model from agents.defaults.model.primary
-  const agentDefaults = agentsRoot.defaults && typeof agentsRoot.defaults === 'object'
-    ? agentsRoot.defaults as Record<string, unknown>
-    : {};
-  const defaultModelObj = agentDefaults.model && typeof agentDefaults.model === 'object'
-    ? agentDefaults.model as Record<string, unknown>
-    : {};
-  const defaultModel = typeof defaultModelObj.primary === 'string'
-    ? defaultModelObj.primary.trim()
-    : 'moltbot';
-  const managedAgents = buildManagedAgentsFromTalks(talks, desired, defaultModel);
-  // Keep non-managed agents, remove stale managed ones
-  const retainedAgents = existingAgentList.filter(a => {
-    const id = typeof a.id === 'string' ? a.id.trim() : '';
-    return !isManagedAgentId(id);
-  });
-  agentsRoot.list = [...retainedAgents, ...managedAgents];
-  if (managedAgents.length > 0) {
-    logger.info(
-      `ClawTalk: reconciled ${managedAgents.length} managed agents: ${managedAgents.map(a => a.id).join(', ')}`,
-    );
-  }
-
-  // Ensure channels configured by talks are mention-free by default.
-  const channelsRoot = ensureObjectPath(cfg, 'channels');
-  const slackRoot = ensureObjectPath(channelsRoot, 'slack');
-  const accountsRoot = ensureObjectPath(slackRoot, 'accounts');
-
-  // Migrate old nested dm.{policy,allowFrom} → flat dmPolicy/allowFrom
-  // (OpenClaw 2026.2.19+ uses the flat format; avoids doctor warnings on every restart)
-  for (const acct of Object.values(accountsRoot)) {
-    if (!acct || typeof acct !== 'object') continue;
-    const a = acct as Record<string, unknown>;
-    const dm = a.dm;
-    if (!dm || typeof dm !== 'object') continue;
-    const d = dm as Record<string, unknown>;
-    if (d.policy !== undefined && a.dmPolicy === undefined) a.dmPolicy = d.policy;
-    if (d.allowFrom !== undefined && a.allowFrom === undefined) a.allowFrom = d.allowFrom;
-    delete a.dm;
-  }
-  for (const entry of desired) {
-    if (entry.peer.kind !== 'channel') continue;
-    const accountRoot = ensureObjectPath(accountsRoot, entry.accountId);
-    const accountChannels = ensureObjectPath(accountRoot, 'channels');
-    const channelRow = ensureObjectPath(accountChannels, entry.peer.id);
-    channelRow.requireMention = entry.requireMention;
-    if (entry.responseMode === 'off' || !entry.onMessagePrompt) {
-      delete channelRow.systemPrompt;
-    } else {
-      channelRow.systemPrompt = entry.onMessagePrompt;
-    }
-  }
-
-  // Propagate signing secret to accounts that are already in HTTP mode.
-  // We no longer force HTTP mode — socket mode works with the handoff flow
-  // and doesn't require a public URL or Slack portal configuration.
-  if (desired.length > 0) {
-    const seenAccounts = new Set(desired.map(d => d.accountId));
-    for (const accountId of seenAccounts) {
-      const accountRoot = ensureObjectPath(accountsRoot, accountId);
-      if (accountRoot.mode === 'http' && !accountRoot.signingSecret) {
-        const envSecret = process.env.GATEWAY_SLACK_SIGNING_SECRET?.trim()
-          || process.env.SLACK_SIGNING_SECRET?.trim();
-        const baseSecret = typeof slackRoot.signingSecret === 'string'
-          ? slackRoot.signingSecret.trim() : '';
-        const fallback = envSecret || baseSecret;
-        if (fallback) {
-          accountRoot.signingSecret = fallback;
-          logger.info(`ClawTalk: propagated signing secret to account "${accountId}" from ${envSecret ? 'env' : 'base config'}`);
+    // Propagate signing secret to accounts that are already in HTTP mode.
+    // We no longer force HTTP mode — socket mode works with the handoff flow
+    // and doesn't require a public URL or Slack portal configuration.
+    if (desired.length > 0) {
+      const seenAccounts = new Set(desired.map(d => d.accountId));
+      for (const accountId of seenAccounts) {
+        const accountRoot = ensureObjectPath(accountsRoot, accountId);
+        if (accountRoot.mode === 'http' && !accountRoot.signingSecret) {
+          const envSecret = process.env.GATEWAY_SLACK_SIGNING_SECRET?.trim()
+            || process.env.SLACK_SIGNING_SECRET?.trim();
+          const baseSecret = typeof slackRoot.signingSecret === 'string'
+            ? slackRoot.signingSecret.trim() : '';
+          const fallback = envSecret || baseSecret;
+          if (fallback) {
+            accountRoot.signingSecret = fallback;
+            logger.info(`ClawTalk: propagated signing secret to account "${accountId}" from ${envSecret ? 'env' : 'base config'}`);
+          }
         }
       }
     }
-  }
 
-  const next = `${JSON.stringify(cfg, null, 2)}\n`;
-  if (next === raw) return;
+    const next = `${JSON.stringify(cfg, null, 2)}\n`;
+    if (next === raw) return;
 
-  const tmpPath = `${configPath}.tmp.${Date.now()}`;
-  await fs.writeFile(tmpPath, next, 'utf-8');
-  await fs.rename(tmpPath, configPath);
-  logger.info(`ClawTalk: reconciled Slack routing for ${desired.length} talk channel/user bindings`);
+    const tmpPath = `${configPath}.tmp.${Date.now()}`;
+    await fs.writeFile(tmpPath, next, 'utf-8');
+    await fs.rename(tmpPath, configPath);
+    logger.info(`ClawTalk: reconciled Slack routing for ${desired.length} talk channel/user bindings`);
+  });
 }
