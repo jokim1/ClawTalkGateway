@@ -851,7 +851,22 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
       const existingAgents = talk.agents ?? [];
       const incomingNames = new Set(parsedAgents.agents.map((agent) => agent.name.toLowerCase()));
       const preserved = existingAgents.filter((agent) => !incomingNames.has(agent.name.toLowerCase()));
+      // Enforce single-primary: if incoming agents include a primary, demote preserved ones.
+      const incomingHasPrimary = parsedAgents.agents.some((agent) => agent.isPrimary);
+      if (incomingHasPrimary) {
+        for (const agent of preserved) {
+          agent.isPrimary = false;
+        }
+      }
       normalizedAgentsForUpdate = [...parsedAgents.agents, ...preserved];
+    }
+    // Final safety check: ensure at most one primary across the full merged list.
+    let primarySeen = false;
+    for (const agent of normalizedAgentsForUpdate) {
+      if (agent.isPrimary) {
+        if (primarySeen) agent.isPrimary = false;
+        else primarySeen = true;
+      }
     }
     body.agents = normalizedAgentsForUpdate;
   }

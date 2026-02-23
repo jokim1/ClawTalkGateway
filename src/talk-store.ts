@@ -1369,6 +1369,12 @@ export class TalkStore {
     const meta = this.talks.get(talkId);
     if (!meta) throw new Error('Talk not found');
     if (!meta.agents) meta.agents = [];
+    // Enforce single-primary invariant: demote existing primary when adding a new one.
+    if (agent.isPrimary) {
+      for (const existing of meta.agents) {
+        existing.isPrimary = false;
+      }
+    }
     meta.agents.push(agent);
     this.touchMeta(meta, 'agent_added', { modifiedBy: options?.modifiedBy });
     return agent;
