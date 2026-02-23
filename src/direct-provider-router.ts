@@ -97,16 +97,19 @@ export function resolveDirectRoute(
     return { ok: false, error: `no baseUrl for provider "${providerKey}"` };
   }
 
-  // Build URL and headers based on API format
+  // Build URL and headers based on API format.
+  // Handle baseUrl with or without trailing /v1 (e.g. OpenAI uses
+  // "https://api.openai.com/v1", Anthropic proxy uses "http://127.0.0.1:18793").
+  const hasV1Suffix = /\/v1\/?$/.test(baseUrl);
   let url: string;
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
 
   if (apiFormat === 'anthropic-messages') {
-    url = `${baseUrl}/v1/messages`;
+    url = hasV1Suffix ? `${baseUrl}/messages` : `${baseUrl}/v1/messages`;
     headers['x-api-key'] = apiKey;
     headers['anthropic-version'] = '2023-06-01';
   } else {
-    url = `${baseUrl}/v1/chat/completions`;
+    url = hasV1Suffix ? `${baseUrl}/chat/completions` : `${baseUrl}/v1/chat/completions`;
     headers['Authorization'] = `Bearer ${apiKey}`;
   }
 

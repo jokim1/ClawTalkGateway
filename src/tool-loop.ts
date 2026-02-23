@@ -374,11 +374,12 @@ export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoop
           // Direct OpenAI-compatible: swap URL/headers, use provider model ID
           fetchUrl = dr.url;
           fetchHeaders = { ...dr.headers };
+          const hasTools = tools.length > 0;
           fetchBody = JSON.stringify({
             model: dr.providerModelId,
             messages,
-            tools: tools.length > 0 ? tools : undefined,
-            tool_choice: opts.toolChoice,
+            tools: hasTools ? tools : undefined,
+            tool_choice: hasTools ? opts.toolChoice : undefined,
             stream: true,
             stream_options: { include_usage: true },
           });
@@ -1007,11 +1008,12 @@ export async function runToolLoopNonStreaming(opts: ToolLoopNonStreamOptions): P
     } else if (dr?.apiFormat === 'openai-completions') {
       fetchUrl = dr.url;
       fetchHeaders = { ...dr.headers };
+      const hasTools = tools.length > 0;
       fetchBody = JSON.stringify({
         model: dr.providerModelId,
         messages,
-        tools: tools.length > 0 ? tools : undefined,
-        tool_choice: opts.toolChoice,
+        tools: hasTools ? tools : undefined,
+        tool_choice: hasTools ? opts.toolChoice : undefined,
         stream: false,
       });
     } else {
