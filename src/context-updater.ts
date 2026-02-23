@@ -11,8 +11,10 @@
  */
 
 import type { TalkStore } from './talk-store.js';
-import type { KnowledgeIndexEntry, Logger } from './types.js';
+import type { KnowledgeIndexEntry, Logger, OpenClawConfig } from './types.js';
 import { isValidKnowledgeSlug, normalizeKnowledgeSlug } from './talk-store.js';
+import { resolveDirectRoute } from './direct-provider-router.js';
+import { translateRequestToAnthropic, translateAnthropicResponse } from './anthropic-format.js';
 
 const CONTEXT_UPDATE_PROMPT = `You maintain a running context document and optional knowledge files for an ongoing conversation.
 
@@ -71,6 +73,8 @@ export interface ContextUpdateOptions {
   authToken: string | undefined;
   store: TalkStore;
   logger: Logger;
+  /** Returns fresh OpenClaw config for direct provider routing. */
+  getConfig?: () => OpenClawConfig;
 }
 
 export interface ParsedContextUpdateOutput {
@@ -197,25 +201,57 @@ async function doContextUpdate(opts: ContextUpdateOptions): Promise<void> {
     .replace('{{USER_MESSAGE}}', userMessage)
     .replace('{{ASSISTANT_RESPONSE}}', truncatedResponse);
 
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-  };
-  if (authToken) {
-    headers['Authorization'] = `Bearer ${authToken}`;
-  }
-
   const maxTokens = hasKnowledge ? 1200 : 1000;
 
-  const response = await fetch(`${gatewayOrigin}/v1/chat/completions`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({
-      model,
-      messages: [{ role: 'user', content: prompt }],
+  // Attempt direct provider routing (same pattern as talk-chat)
+  let directRoute: ReturnType<typeof resolveDirectRoute> | undefined;
+  if (model.includes('/') && opts.getConfig) {
+    directRoute = resolveDirectRoute(model, opts.getConfig(), logger);
+  }
+
+  let fetchUrl: string;
+  let fetchHeaders: Record<string, string>;
+  let fetchBody: string;
+  const openaiMessages = [{ role: 'user' as const, content: prompt }];
+
+  if (directRoute?.ok && directRoute.data.apiFormat === 'anthropic-messages') {
+    const dr = directRoute.data;
+    fetchUrl = dr.url;
+    fetchHeaders = { ...dr.headers };
+    const anthropicReq = translateRequestToAnthropic(
+      { messages: openaiMessages, stream: false },
+      dr.providerModelId,
+      Math.min(maxTokens, dr.maxTokens),
+    );
+    fetchBody = JSON.stringify(anthropicReq);
+  } else if (directRoute?.ok && directRoute.data.apiFormat === 'openai-completions') {
+    const dr = directRoute.data;
+    fetchUrl = dr.url;
+    fetchHeaders = { ...dr.headers };
+    fetchBody = JSON.stringify({
+      model: dr.providerModelId,
+      messages: openaiMessages,
       max_tokens: maxTokens,
       tool_choice: 'none',
       stream: false,
-    }),
+    });
+  } else {
+    fetchUrl = `${gatewayOrigin}/v1/chat/completions`;
+    fetchHeaders = { 'Content-Type': 'application/json' };
+    if (authToken) fetchHeaders['Authorization'] = `Bearer ${authToken}`;
+    fetchBody = JSON.stringify({
+      model,
+      messages: openaiMessages,
+      max_tokens: maxTokens,
+      tool_choice: 'none',
+      stream: false,
+    });
+  }
+
+  const response = await fetch(fetchUrl, {
+    method: 'POST',
+    headers: fetchHeaders,
+    body: fetchBody,
     signal: AbortSignal.timeout(30_000),
   });
 
@@ -225,9 +261,10 @@ async function doContextUpdate(opts: ContextUpdateOptions): Promise<void> {
     return;
   }
 
-  const json = await response.json() as {
-    choices?: Array<{ message?: { content?: string } }>;
-  };
+  // Translate Anthropic response if needed
+  const json = directRoute?.ok && directRoute.data.apiFormat === 'anthropic-messages'
+    ? translateAnthropicResponse(await response.json() as any) as any
+    : await response.json() as { choices?: Array<{ message?: { content?: string } }> };
   const rawOutput = json.choices?.[0]?.message?.content?.trim();
 
   if (!rawOutput) return;

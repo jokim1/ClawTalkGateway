@@ -770,6 +770,7 @@ const plugin = {
               registry: toolRegistry,
               executor: toolExecutor,
               dataDir: pluginCfg.dataDir,
+              getConfig: () => api.runtime.config.loadConfig(),
             });
             return true;
           }

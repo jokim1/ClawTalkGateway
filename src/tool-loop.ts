@@ -18,6 +18,8 @@ import type { Logger, ToolCallInfo } from './types.js';
 import type { ToolRegistry, ToolDefinition } from './tool-registry.js';
 import type { ToolExecutor, ToolExecResult } from './tool-executor.js';
 import { extractGoogleDocsDocumentIdFromUrl } from './google-docs-url.js';
+import type { DirectProviderRoute } from './direct-provider-router.js';
+import { translateRequestToAnthropic, translateAnthropicStream, translateAnthropicResponse } from './anthropic-format.js';
 
 /** Dispatcher with disabled headers/body timeout for long-running non-streaming requests.
  *  Node.js undici defaults to 5 min headersTimeout which kills requests before our
@@ -208,6 +210,8 @@ export interface ToolLoopStreamOptions {
   transport?: 'chat_completions' | 'responses';
   /** Current talk id for talk-scoped state tools. */
   talkId?: string;
+  /** Direct provider route — bypasses OpenClaw when set. */
+  directRoute?: DirectProviderRoute;
 }
 
 export interface ToolLoopStreamResult {
@@ -350,17 +354,52 @@ export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoop
       }, ttftMs);
 
       try {
-        llmResponse = await fetch(`${gatewayOrigin}/v1/chat/completions`, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({
+        // --- Build fetch URL, headers, and body based on routing ---
+        const dr = opts.directRoute;
+        let fetchUrl: string;
+        let fetchHeaders: Record<string, string>;
+        let fetchBody: string;
+
+        if (dr?.apiFormat === 'anthropic-messages') {
+          // Direct Anthropic: translate request and use provider endpoint
+          fetchUrl = dr.url;
+          fetchHeaders = { ...dr.headers };
+          const anthropicReq = translateRequestToAnthropic(
+            { messages: messages as any, tools, tool_choice: opts.toolChoice, stream: true },
+            dr.providerModelId,
+            dr.maxTokens,
+          );
+          fetchBody = JSON.stringify(anthropicReq);
+        } else if (dr?.apiFormat === 'openai-completions') {
+          // Direct OpenAI-compatible: swap URL/headers, use provider model ID
+          fetchUrl = dr.url;
+          fetchHeaders = { ...dr.headers };
+          fetchBody = JSON.stringify({
+            model: dr.providerModelId,
+            messages,
+            tools: tools.length > 0 ? tools : undefined,
+            tool_choice: opts.toolChoice,
+            stream: true,
+            stream_options: { include_usage: true },
+          });
+        } else {
+          // Default: route through OpenClaw
+          fetchUrl = `${gatewayOrigin}/v1/chat/completions`;
+          fetchHeaders = headers;
+          fetchBody = JSON.stringify({
             model,
             messages,
             tools: tools.length > 0 ? tools : undefined,
             tool_choice: opts.toolChoice,
             stream: true,
             stream_options: { include_usage: true },
-          }),
+          });
+        }
+
+        llmResponse = await fetch(fetchUrl, {
+          method: 'POST',
+          headers: fetchHeaders,
+          body: fetchBody,
           signal: AbortSignal.any([fetchSignal, ttftController.signal]),
         });
 
@@ -371,84 +410,144 @@ export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoop
         }
         fetchOk = true;
 
-        const reader = llmResponse.body?.getReader();
-        if (!reader) throw new Error('No response body from AI provider');
+        const rawReader = llmResponse.body?.getReader();
+        if (!rawReader) throw new Error('No response body from AI provider');
 
-        // Parse the SSE stream
-        const decoder = new TextDecoder();
-        let buffer = '';
+        // For Anthropic, wrap the raw reader with the format translator.
+        // The generator yields OpenAI-format `data: {...}\n\n` lines.
+        if (dr?.apiFormat === 'anthropic-messages') {
+          const anthropicLines = translateAnthropicStream(rawReader);
+          for await (const openaiLine of anthropicLines) {
+            abort.touch();
+            // Each line is already `data: {...}\n\n` or `data: [DONE]\n\n`
+            const data = openaiLine.replace(/^data: /, '').replace(/\n\n$/, '');
+            if (data === '[DONE]') continue;
 
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
+            try {
+              const parsed = JSON.parse(data);
+              if (!responseModel && parsed.model) {
+                responseModel = parsed.model;
+                if (traceId) {
+                  logger.info(
+                    `ModelRoute trace=${traceId} flow=tool-loop responseModel=${responseModel} iteration=${iteration + 1} attempt=${attempt + 1}`,
+                  );
+                }
+              }
+              const choice = parsed.choices?.[0];
+              if (!choice) continue;
 
-          abort.touch(); // Reset inactivity timer on each chunk
-          const chunk = decoder.decode(value, { stream: true });
+              const contentDelta = choice.delta?.content;
+              if (contentDelta) {
+                markFirstDelta();
+                iterContent += contentDelta;
+                res.write(`data: ${JSON.stringify({
+                  choices: [{ delta: { content: contentDelta } }],
+                  model: parsed.model,
+                })}\n\n`);
+              }
 
-          buffer += chunk;
-          const lines = buffer.split('\n');
-          buffer = lines.pop() ?? '';
-
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              const data = line.slice(6);
-              if (data === '[DONE]') continue;
-
-              try {
-                const parsed = JSON.parse(data);
-                if (!responseModel && parsed.model) {
-                  responseModel = parsed.model;
-                  if (traceId) {
-                    logger.info(
-                      `ModelRoute trace=${traceId} flow=tool-loop responseModel=${responseModel} iteration=${iteration + 1} attempt=${attempt + 1}`,
-                    );
+              const toolCallDeltas = choice.delta?.tool_calls;
+              if (toolCallDeltas && Array.isArray(toolCallDeltas)) {
+                markFirstDelta();
+                for (const tc of toolCallDeltas) {
+                  const idx = tc.index ?? 0;
+                  let acc = toolCallAccumulators.get(idx);
+                  if (!acc) {
+                    acc = { id: tc.id ?? '', type: 'function', function: { name: '', arguments: '' } };
+                    toolCallAccumulators.set(idx, acc);
                   }
+                  if (tc.id) acc.id = tc.id;
+                  if (tc.function?.name) acc.function.name += tc.function.name;
+                  if (tc.function?.arguments) acc.function.arguments += tc.function.arguments;
                 }
+                res.write(': keepalive\n\n');
+              }
 
-                const choice = parsed.choices?.[0];
-                if (!choice) continue;
+              if (choice.finish_reason) {
+                markFirstDelta();
+                finishReason = choice.finish_reason;
+              }
+            } catch {
+              // Partial chunk, ignore parse error
+            }
+          }
+        } else {
+          // OpenAI-compatible SSE parsing (existing path)
+          const decoder = new TextDecoder();
+          let buffer = '';
 
-                // Accumulate text content
-                const contentDelta = choice.delta?.content;
-                if (contentDelta) {
-                  markFirstDelta();
-                  iterContent += contentDelta;
-                  // Forward content to client as standard SSE
-                  res.write(`data: ${JSON.stringify({
-                    choices: [{ delta: { content: contentDelta } }],
-                    model: parsed.model,
-                  })}\n\n`);
-                }
+          while (true) {
+            const { done, value } = await rawReader.read();
+            if (done) break;
 
-                // Accumulate tool call fragments
-                const toolCallDeltas = choice.delta?.tool_calls;
-                if (toolCallDeltas && Array.isArray(toolCallDeltas)) {
-                  markFirstDelta();
-                  for (const tc of toolCallDeltas) {
-                    const idx = tc.index ?? 0;
-                    let acc = toolCallAccumulators.get(idx);
-                    if (!acc) {
-                      acc = {
-                        id: tc.id ?? '',
-                        type: 'function',
-                        function: { name: '', arguments: '' },
-                      };
-                      toolCallAccumulators.set(idx, acc);
+            abort.touch(); // Reset inactivity timer on each chunk
+            const chunk = decoder.decode(value, { stream: true });
+
+            buffer += chunk;
+            const lines = buffer.split('\n');
+            buffer = lines.pop() ?? '';
+
+            for (const line of lines) {
+              if (line.startsWith('data: ')) {
+                const data = line.slice(6);
+                if (data === '[DONE]') continue;
+
+                try {
+                  const parsed = JSON.parse(data);
+                  if (!responseModel && parsed.model) {
+                    responseModel = parsed.model;
+                    if (traceId) {
+                      logger.info(
+                        `ModelRoute trace=${traceId} flow=tool-loop responseModel=${responseModel} iteration=${iteration + 1} attempt=${attempt + 1}`,
+                      );
                     }
-                    if (tc.id) acc.id = tc.id;
-                    if (tc.function?.name) acc.function.name += tc.function.name;
-                    if (tc.function?.arguments) acc.function.arguments += tc.function.arguments;
                   }
-                  res.write(': keepalive\n\n');
-                }
 
-                // Capture finish reason
-                if (choice.finish_reason) {
-                  markFirstDelta();
-                  finishReason = choice.finish_reason;
+                  const choice = parsed.choices?.[0];
+                  if (!choice) continue;
+
+                  // Accumulate text content
+                  const contentDelta = choice.delta?.content;
+                  if (contentDelta) {
+                    markFirstDelta();
+                    iterContent += contentDelta;
+                    // Forward content to client as standard SSE
+                    res.write(`data: ${JSON.stringify({
+                      choices: [{ delta: { content: contentDelta } }],
+                      model: parsed.model,
+                    })}\n\n`);
+                  }
+
+                  // Accumulate tool call fragments
+                  const toolCallDeltas = choice.delta?.tool_calls;
+                  if (toolCallDeltas && Array.isArray(toolCallDeltas)) {
+                    markFirstDelta();
+                    for (const tc of toolCallDeltas) {
+                      const idx = tc.index ?? 0;
+                      let acc = toolCallAccumulators.get(idx);
+                      if (!acc) {
+                        acc = {
+                          id: tc.id ?? '',
+                          type: 'function',
+                          function: { name: '', arguments: '' },
+                        };
+                        toolCallAccumulators.set(idx, acc);
+                      }
+                      if (tc.id) acc.id = tc.id;
+                      if (tc.function?.name) acc.function.name += tc.function.name;
+                      if (tc.function?.arguments) acc.function.arguments += tc.function.arguments;
+                    }
+                    res.write(': keepalive\n\n');
+                  }
+
+                  // Capture finish reason
+                  if (choice.finish_reason) {
+                    markFirstDelta();
+                    finishReason = choice.finish_reason;
+                  }
+                } catch {
+                  // Partial chunk, ignore parse error
                 }
-              } catch {
-                // Partial chunk, ignore parse error
               }
             }
           }
@@ -855,6 +954,8 @@ export interface ToolLoopNonStreamOptions {
   defaultGoogleAuthProfile?: string;
   /** Current talk id for talk-scoped state tools. */
   talkId?: string;
+  /** Direct provider route — bypasses OpenClaw when set. */
+  directRoute?: DirectProviderRoute;
 }
 
 export interface ToolLoopNonStreamResult {
@@ -889,22 +990,50 @@ export async function runToolLoopNonStreaming(opts: ToolLoopNonStreamOptions): P
   }> = [];
 
   for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      ...(extraHeaders ?? {}),
-    };
-    if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+    const dr = opts.directRoute;
+    let fetchUrl: string;
+    let fetchHeaders: Record<string, string>;
+    let fetchBody: string;
 
-    const response = await fetch(`${gatewayOrigin}/v1/chat/completions`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
+    if (dr?.apiFormat === 'anthropic-messages') {
+      fetchUrl = dr.url;
+      fetchHeaders = { ...dr.headers };
+      const anthropicReq = translateRequestToAnthropic(
+        { messages: messages as any, tools, tool_choice: opts.toolChoice, stream: false },
+        dr.providerModelId,
+        dr.maxTokens,
+      );
+      fetchBody = JSON.stringify(anthropicReq);
+    } else if (dr?.apiFormat === 'openai-completions') {
+      fetchUrl = dr.url;
+      fetchHeaders = { ...dr.headers };
+      fetchBody = JSON.stringify({
+        model: dr.providerModelId,
+        messages,
+        tools: tools.length > 0 ? tools : undefined,
+        tool_choice: opts.toolChoice,
+        stream: false,
+      });
+    } else {
+      fetchUrl = `${gatewayOrigin}/v1/chat/completions`;
+      fetchHeaders = {
+        'Content-Type': 'application/json',
+        ...(extraHeaders ?? {}),
+      };
+      if (authToken) fetchHeaders['Authorization'] = `Bearer ${authToken}`;
+      fetchBody = JSON.stringify({
         model,
         messages,
         tools: tools.length > 0 ? tools : undefined,
         tool_choice: opts.toolChoice,
         stream: false,
-      }),
+      });
+    }
+
+    const response = await fetch(fetchUrl, {
+      method: 'POST',
+      headers: fetchHeaders,
+      body: fetchBody,
       signal: AbortSignal.timeout(timeoutMs),
       // Node.js undici dispatcher — disables default 5-min timeout on headersTimeout/bodyTimeout
       dispatcher: longTimeoutDispatcher,
@@ -915,17 +1044,20 @@ export async function runToolLoopNonStreaming(opts: ToolLoopNonStreamOptions): P
       throw new Error(`LLM call failed (${response.status}): ${errBody.slice(0, 200)}`);
     }
 
-    const json = await response.json() as {
-      choices?: Array<{
-        message?: {
-          content?: string;
-          tool_calls?: ToolCallInfo[];
-        };
-        finish_reason?: string;
-      }>;
-      model?: string;
-      usage?: { prompt_tokens?: number; completion_tokens?: number };
-    };
+    // For Anthropic non-streaming, translate response format
+    const json = dr?.apiFormat === 'anthropic-messages'
+      ? translateAnthropicResponse(await response.json() as any) as any
+      : await response.json() as {
+        choices?: Array<{
+          message?: {
+            content?: string;
+            tool_calls?: ToolCallInfo[];
+          };
+          finish_reason?: string;
+        }>;
+        model?: string;
+        usage?: { prompt_tokens?: number; completion_tokens?: number };
+      };
 
     if (!responseModel && json.model) responseModel = json.model;
     if (json.usage) {

@@ -18,6 +18,8 @@ import { sendJson, readJsonBody } from './http.js';
 import { composeSystemPrompt } from './system-prompt.js';
 import { scheduleContextUpdate } from './context-updater.js';
 import { runToolLoop } from './tool-loop.js';
+import { resolveDirectRoute } from './direct-provider-router.js';
+import type { DirectProviderRoute } from './direct-provider-router.js';
 import { collectRoutingDiagnostics } from './model-routing-diagnostics.js';
 import { getToolCatalog } from './tool-catalog.js';
 import { parseEventTrigger, validateSchedule } from './job-scheduler.js';
@@ -473,6 +475,8 @@ export interface TalkChatContext {
   registry: ToolRegistry;
   executor: ToolExecutor;
   dataDir?: string;
+  /** Returns fresh OpenClaw config for direct provider routing. */
+  getConfig?: () => import('./types.js').OpenClawConfig;
 }
 
 /** Extract ```job``` blocks from AI response text. */
@@ -718,6 +722,7 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
       authToken,
       store,
       logger,
+      getConfig: ctx.getConfig,
     });
     if (!res.writableEnded) {
       res.write('data: [DONE]\n\n');
@@ -848,6 +853,7 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
       authToken,
       store,
       logger,
+      getConfig: ctx.getConfig,
     });
     if (!res.writableEnded) {
       res.write('data: [DONE]\n\n');
@@ -960,6 +966,7 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
       authToken,
       store,
       logger,
+      getConfig: ctx.getConfig,
     });
     if (!res.writableEnded) {
       res.write('data: [DONE]\n\n');
@@ -1054,6 +1061,7 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
       authToken,
       store,
       logger,
+      getConfig: ctx.getConfig,
     });
     if (!res.writableEnded) {
       res.write('data: [DONE]\n\n');
@@ -1110,6 +1118,7 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
       authToken,
       store,
       logger,
+      getConfig: ctx.getConfig,
     });
     if (!res.writableEnded) {
       res.write('data: [DONE]\n\n');
@@ -1401,8 +1410,9 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
   const extraHeaders: Record<string, string> = {
     'x-openclaw-trace-id': traceId,
   };
-  // Always send session key. In full_control mode the key has no `agent:` prefix,
-  // so OpenClaw treats it as legacy_or_alias and skips embedded agent activation.
+  // Always send session key — OpenClaw requires it for request routing.
+  // In full_control mode the key has no `agent:` prefix, so OpenClaw treats it
+  // as legacy_or_alias and skips embedded agent activation.
   const sessionKey = talkExecutionMode === 'full_control'
     ? buildFullControlTalkSessionKey(talkId, runScopedSessionPart)
     : buildTalkSessionKey(talkId, resolvedSessionAgentId, runScopedSessionPart);
@@ -1503,12 +1513,33 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
       authToken,
       store,
       logger,
+      getConfig: ctx.getConfig,
     });
     if (!res.writableEnded) {
       res.write('data: [DONE]\n\n');
       res.end();
     }
     return;
+  }
+
+  // --- Direct provider routing (bypass OpenClaw in full_control mode) ---
+  let directRoute: DirectProviderRoute | undefined;
+  if (talkExecutionMode === 'full_control' && model.includes('/') && ctx.getConfig) {
+    const routeResult = resolveDirectRoute(model, ctx.getConfig(), logger);
+    if (routeResult.ok) {
+      directRoute = routeResult.data;
+      logger.info(
+        `DirectRoute: ${model} → ${directRoute.providerKey} (${directRoute.apiFormat}, bypassing OpenClaw)`,
+      );
+      emitStatusEvent(res, {
+        code: 'DIRECT_ROUTE',
+        message: `Direct routing to ${directRoute.providerKey} (bypassing OpenClaw queue)`,
+        level: 'info',
+        meta: { provider: directRoute.providerKey, apiFormat: directRoute.apiFormat },
+      });
+    } else {
+      logger.info(`DirectRoute: fallback to OpenClaw: ${routeResult.error}`);
+    }
   }
 
   store.setProcessing(talkId, true);
@@ -1534,7 +1565,8 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
       tools,
       gatewayOrigin,
       authToken,
-      extraHeaders,
+      // Skip OpenClaw session/agent headers when using direct routing
+      extraHeaders: directRoute ? undefined : extraHeaders,
       res,
       registry,
       executor,
@@ -1558,6 +1590,7 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
       onTtftObserved: (obs) => ttftTracker.record(obs),
       retryTtftMultiplier: 1.5,
       talkId,
+      directRoute,
     });
 
     fullContent = result.fullContent;
@@ -1725,6 +1758,7 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
         authToken,
         store,
         logger,
+        getConfig: ctx.getConfig,
       });
     }
   }
