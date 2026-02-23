@@ -318,24 +318,31 @@ export async function runToolLoop(opts: ToolLoopStreamOptions): Promise<ToolLoop
         level: 'info',
         meta: { model, iteration: iteration + 1, attempt: attempt + 1 },
       });
-      ttftWarn30 = setTimeout(() => {
-        if (sawFirstDelta) return;
-        opts.onStatus?.({
-          code: 'WAITING_FIRST_TOKEN_30S',
-          message: 'Still waiting for first model token (30s).',
-          level: 'warn',
-          meta: { model, iteration: iteration + 1, attempt: attempt + 1 },
-        });
-      }, Math.min(ttftMs - 1, 30_000));
-      ttftWarn60 = setTimeout(() => {
-        if (sawFirstDelta) return;
-        opts.onStatus?.({
-          code: 'WAITING_FIRST_TOKEN_60S',
-          message: 'Still waiting for first model token (60s).',
-          level: 'warn',
-          meta: { model, iteration: iteration + 1, attempt: attempt + 1 },
-        });
-      }, Math.min(ttftMs - 1, 60_000));
+      // Dynamic status warnings at 1/3 and 2/3 of the TTFT timeout
+      const warn1Ms = Math.round(ttftMs / 3);
+      const warn2Ms = Math.round((ttftMs * 2) / 3);
+      if (warn1Ms >= 5_000) {
+        ttftWarn30 = setTimeout(() => {
+          if (sawFirstDelta) return;
+          opts.onStatus?.({
+            code: 'WAITING_FIRST_TOKEN',
+            message: `Still waiting for first model token (${Math.round(warn1Ms / 1000)}s).`,
+            level: 'warn',
+            meta: { model, iteration: iteration + 1, attempt: attempt + 1 },
+          });
+        }, warn1Ms);
+      }
+      if (warn2Ms > warn1Ms && warn2Ms >= 10_000) {
+        ttftWarn60 = setTimeout(() => {
+          if (sawFirstDelta) return;
+          opts.onStatus?.({
+            code: 'WAITING_FIRST_TOKEN',
+            message: `Still waiting for first model token (${Math.round(warn2Ms / 1000)}s).`,
+            level: 'warn',
+            meta: { model, iteration: iteration + 1, attempt: attempt + 1 },
+          });
+        }, warn2Ms);
+      }
       ttftTimer = setTimeout(() => {
         if (sawFirstDelta) return;
         ttftAborted = true;

@@ -14,7 +14,7 @@ import type { Logger } from './types.js';
 // Model class classification
 // ---------------------------------------------------------------------------
 
-export type ModelClass = 'opus' | 'sonnet' | 'haiku' | 'gpt-4' | 'gpt-4o' | 'o-series' | 'gemini' | 'unknown';
+export type ModelClass = 'opus' | 'sonnet' | 'haiku' | 'gpt-4' | 'gpt-4o' | 'o-series' | 'gemini' | 'deepseek' | 'kimi' | 'unknown';
 
 const MODEL_CLASS_RULES: Array<{ pattern: RegExp; modelClass: ModelClass }> = [
   { pattern: /\bopus\b/i, modelClass: 'opus' },
@@ -24,6 +24,8 @@ const MODEL_CLASS_RULES: Array<{ pattern: RegExp; modelClass: ModelClass }> = [
   { pattern: /\bgpt-4o\b/i, modelClass: 'gpt-4o' },
   { pattern: /\bgpt-4\b/i, modelClass: 'gpt-4' },
   { pattern: /\bgemini\b/i, modelClass: 'gemini' },
+  { pattern: /\bdeepseek\b/i, modelClass: 'deepseek' },
+  { pattern: /\bkimi\b/i, modelClass: 'kimi' },
 ];
 
 export function classifyModelClass(modelId: string): ModelClass {
@@ -42,10 +44,12 @@ export function classifyModelClass(modelId: string): ModelClass {
 const COLD_START_DEFAULTS: Record<ModelClass, number | null> = {
   opus: 120_000,
   'o-series': 120_000,
+  deepseek: 90_000,
+  kimi: 90_000,
+  gemini: 90_000,
   'gpt-4': 60_000,
   sonnet: 45_000,
   'gpt-4o': 45_000,
-  gemini: 45_000,
   haiku: 30_000,
   unknown: null, // falls back to resolveTalkFirstTokenTimeoutMs()
 };
