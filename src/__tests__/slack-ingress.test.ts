@@ -75,7 +75,7 @@ function addSlackBindingWithId(scope: string): { talkId: string; bindingId: stri
 }
 
 describe('slack ingress delegation', () => {
-  it('delegates matching channel events to OpenClaw agent (returns pass)', async () => {
+  it('passes matching channel events for talk-bound channels', async () => {
     addSlackBinding('channel:c123');
 
     const hookResult = await handleSlackMessageReceivedHook(
@@ -94,7 +94,7 @@ describe('slack ingress delegation', () => {
       },
       buildDeps(),
     );
-    // Delegated channels return undefined (pass) — OpenClaw's managed agent handles
+    // Talk-bound channels return undefined (pass) — slack-event-proxy handles routing
     expect(hookResult).toBeUndefined();
   });
 
@@ -288,7 +288,7 @@ describe('slack ingress delegation', () => {
     };
     const result = routeSlackIngressEvent(event, deps);
     expect(result.payload.decision).toBe('pass');
-    expect(result.payload.reason).toBe('delegated-to-agent');
+    expect(result.payload.reason).toBe('talk-bound');
 
     // Give async mirror time to complete
     await new Promise(resolve => setTimeout(resolve, 100));
@@ -393,7 +393,7 @@ describe('slack ingress delegation', () => {
     };
     const result = routeSlackIngressEvent(event, deps);
     expect(result.payload.decision).toBe('pass');
-    expect(result.payload.reason).toBe('delegated-to-agent');
+    expect(result.payload.reason).toBe('talk-bound');
 
     const runtime = getSlackIngressTalkRuntimeSnapshot(talk.id);
     expect(runtime.counters.passed).toBe(1);

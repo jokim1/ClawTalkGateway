@@ -34,8 +34,6 @@ import {
   handleSlackMessageReceivedHook,
 } from './slack-ingress.js';
 import { normalizeSlackBindingScope } from './talks.js';
-import { findOpenClawSlackOwnershipConflicts } from './slack-ownership-doctor.js';
-import { reconcileSlackRoutingForTalks, buildManagedAgentId } from './slack-routing-sync.js';
 import { reconcileAnthropicProxyBaseUrls, reconcileGatewayResponsesEndpoint } from './provider-baseurl-sync.js';
 import { registerOpenClawNativeGoogleTools } from './openclaw-native-tools.js';
 import { listSlackAccountIds, resolveSlackBotTokenForAccount } from './slack-auth.js';
@@ -53,10 +51,8 @@ import {
 import {
   detectTailscaleFunnelUrl,
   resolveGatewayOrigin,
-  resolveClawTalkAgentIds,
   resolveSelfOrigin,
 } from './gateway-origin.js';
-import { buildTalkContextForAgent } from './talk-context-builder.js';
 import { DEFAULT_GATEWAY_PORT } from './constants.js';
 import {
   fetchSlackChannelsForAccount,
@@ -183,7 +179,7 @@ const plugin = {
     warmUsageLoader(api.logger);
 
     // Initialize Talk store (async)
-    type ReadyPhase = 'booting' | 'loading_talks' | 'reconciling_routes' | 'ready' | 'failed';
+    type ReadyPhase = 'booting' | 'loading_talks' | 'ready' | 'failed';
     let readyPhase: ReadyPhase = 'booting';
     let readyError: string | undefined;
     const readySinceMs = Date.now();
@@ -241,10 +237,7 @@ const plugin = {
     appendSyncEvent('gateway_phase', { phase: readyPhase });
     const readyBarrier = talkStore.init()
       .then(async () => {
-        readyPhase = 'reconciling_routes';
-        appendSyncEvent('gateway_phase', { phase: readyPhase });
         await configReconciled;
-        await reconcileSlackRoutingForTalks(talkStore.listTalks(), api.logger);
         // Check and log Slack event proxy setup status
         const proxyCfg = api.runtime.config.loadConfig();
         logSlackProxySetupStatus(talkStore, proxyCfg, api.logger);
@@ -257,27 +250,6 @@ const plugin = {
         appendSyncEvent('gateway_phase', { phase: readyPhase, error: readyError });
         api.logger.error(`TalkStore init failed: ${readyError}`);
       });
-
-    const logSlackOwnershipConflicts = () => {
-      const cfg0 = api.runtime.config.loadConfig();
-      const conflicts = findOpenClawSlackOwnershipConflicts({
-        talks: talkStore.listTalks(),
-        openClawConfig: cfg0,
-        clawTalkAgentIds: resolveClawTalkAgentIds(cfg0),
-      });
-      if (conflicts.length === 0) {
-        api.logger.info('ClawTalk: Slack ownership doctor found no conflicts');
-        return;
-      }
-      for (const conflict of conflicts) {
-        api.logger.warn(
-          'ClawTalk: Slack ownership conflict detected — ' +
-          `talk=${conflict.talkId} owns ${conflict.talkAccountId}/${conflict.talkScope}, ` +
-          `but OpenClaw binding routes ${conflict.openClawAccountId}/${conflict.openClawScope} ` +
-          `to agent "${conflict.openClawAgentId}"`,
-        );
-      }
-    };
 
     // Shared Slack reply path (direct Slack API).
     const slackDebugInstanceTag = computeSlackInstanceTag();
@@ -343,10 +315,6 @@ const plugin = {
         ),
     });
     refreshSlackIngressRoute();
-    const ownershipDoctorTimer = setTimeout(() => {
-      logSlackOwnershipConflicts();
-    }, 2000);
-    ownershipDoctorTimer.unref?.();
 
     // Initialize tool registry and executor
     const toolRegistry = new ToolRegistry(pluginCfg.dataDir, api.logger);
@@ -505,44 +473,6 @@ const plugin = {
       return undefined;
     });
 
-    // Inject Talk context into OpenClaw's agent before it runs.
-    // OpenClaw's agent handles Slack replies natively; the gateway is a context provider.
-    api.on('before_agent_start', async (event: any, ctx: any) => {
-      if (!isGatewayReady()) return undefined;
-
-      const sessionKey = typeof ctx?.sessionKey === 'string' ? ctx.sessionKey : '';
-      const agentId = typeof ctx?.agentId === 'string' ? ctx.agentId.trim() : '';
-
-      // Only inject for ClawTalk-managed agents (ct-XXXXXXXX)
-      if (!agentId.startsWith('ct-')) return undefined;
-
-      // Find the Talk that owns this agent
-      const talks = talkStore.listTalks();
-      const ownerTalk = talks.find(t => buildManagedAgentId(t.id) === agentId);
-      if (!ownerTalk) {
-        api.logger.debug(
-          `ClawTalk: before_agent_start no Talk found for agent=${agentId} session=${sessionKey}`,
-        );
-        return undefined;
-      }
-
-      try {
-        const contextBlock = await buildTalkContextForAgent(ownerTalk, talkStore, api.logger);
-        if (!contextBlock) return undefined;
-
-        api.logger.info(
-          `ClawTalk: before_agent_start injecting context for talk ${ownerTalk.id.slice(0, 8)} ` +
-          `agent=${agentId} bytes=${Buffer.byteLength(contextBlock, 'utf-8')}`,
-        );
-        return { prependContext: contextBlock };
-      } catch (err) {
-        api.logger.warn(
-          `ClawTalk: before_agent_start context build failed for talk=${ownerTalk.id}: ${String(err)}`,
-        );
-        return undefined;
-      }
-    });
-
     api.on('message_sent', (event: any, ctx: any) => {
       emitOpenClawMessageDebug('send_ok', event, ctx);
       return undefined;
@@ -567,8 +497,6 @@ const plugin = {
     // Register lifecycle hooks
     api.on('gateway_start', () => {
       refreshSlackIngressRoute();
-      logSlackOwnershipConflicts();
-      // Avoid duplicate config writes/reload churn: reconciliation runs after TalkStore init.
       api.logger.info('ClawTalk: gateway_start event received');
     });
 
@@ -934,24 +862,12 @@ const plugin = {
               talkStore,
               api.logger,
             );
-            const conflicts = findOpenClawSlackOwnershipConflicts({
-              talks: talkStore.listTalks(),
-              openClawConfig: cfg,
-              clawTalkAgentIds: resolveClawTalkAgentIds(cfg),
-            }).filter((conflict) => {
-              if (accountId && conflict.talkAccountId !== accountId) return false;
-              if (conflict.talkScope !== canonicalScope.toLowerCase() && conflict.talkScope !== 'slack:*') {
-                return false;
-              }
-              return true;
-            });
-
             sendJson(res, 200, {
               accountId: accountId ?? 'default',
               channelId: scopeTarget,
               canonicalScope,
               ownership,
-              openClawConflicts: conflicts,
+              openClawConflicts: [],
             });
             break;
           }
@@ -960,15 +876,10 @@ const plugin = {
               sendJson(res, 405, { error: 'Method not allowed' });
               break;
             }
-            const conflicts = findOpenClawSlackOwnershipConflicts({
-              talks: talkStore.listTalks(),
-              openClawConfig: cfg,
-              clawTalkAgentIds: resolveClawTalkAgentIds(cfg),
-            });
             sendJson(res, 200, {
-              ok: conflicts.length === 0,
-              conflictCount: conflicts.length,
-              conflicts,
+              ok: true,
+              conflictCount: 0,
+              conflicts: [],
             });
             break;
           }

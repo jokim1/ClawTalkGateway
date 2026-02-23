@@ -35,12 +35,9 @@ import {
 } from './talk-policy.js';
 import { isTransientError } from './tool-loop.js';
 import { isOpenClawNativeGoogleTool } from './openclaw-native-tools.js';
-import { assertRoutingHeaders, RoutingGuardError } from './routing-headers.js';
 import {
-  CLAWTALK_DEFAULT_AGENT_ID,
   sanitizeSessionPart,
   buildTalkSessionKey,
-  buildFullControlTalkSessionKey,
 } from './session-key.js';
 import {
   getToolAffinityStore,
@@ -69,7 +66,6 @@ const DEFAULT_TALK_INACTIVITY_TIMEOUT_MS = 300_000;
 type TalkErrorCode =
   | 'FIRST_TOKEN_TIMEOUT'
   | 'MODE_BLOCKED_BROWSER'
-  | 'ROUTING_GUARD'
   | 'TOOL_BLOCKED_POLICY'
   | 'PROVIDER_AUTH'
   | 'PROVIDER_ERROR'
@@ -1271,7 +1267,7 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
   res.write(`event: meta\ndata: ${JSON.stringify({ userMessageId: userMsg.id })}\n\n`);
   emitStatusEvent(res, {
     code: 'ROUTE_READY',
-    message: `Routing request via ${talkExecutionMode === 'full_control' ? 'ClawTalk Proxy' : 'OpenClaw Agent'}...`,
+    message: 'Routing request via ClawTalk Proxy...',
     level: 'info',
   });
 
@@ -1347,13 +1343,13 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
 
   const browserIntent = isBrowserIntent(body.message);
   const hasBrowserCapability = availableToolInfos.some((tool) => isBrowserTool(tool.name));
-  if (browserIntent && talkExecutionMode === 'full_control') {
+  if (browserIntent && !hasBrowserCapability) {
     const errPayload: TalkErrorPayload = {
       code: 'MODE_BLOCKED_BROWSER',
-      message: 'Browser control is unavailable in ClawTalk Proxy mode.',
-      hint: 'Switch Execution Mode to OpenClaw Agent, then retry.',
+      message: 'Browser control is not available.',
+      hint: 'No browser control tools are available in the current configuration.',
       transient: false,
-      retryable: true,
+      retryable: false,
     };
     emitStatusEvent(res, {
       code: 'BROWSER_PRECHECK_FAILED',
@@ -1367,13 +1363,6 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
       res.end();
     }
     return;
-  }
-  if (browserIntent && !hasBrowserCapability) {
-    emitStatusEvent(res, {
-      code: 'BROWSER_CAPABILITY_UNKNOWN',
-      message: 'No browser-specific tool is currently enabled for this talk. Response may be limited to guidance only.',
-      level: 'warn',
-    });
   }
 
   let fullContent = '';
@@ -1394,13 +1383,11 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
     ?? routeDiag.configuredAgentId
     ?? routeDiag.defaultAgentId
     ?? undefined;
-  // Keep `agent:<id>` stable and real so OpenClaw resolves workspace/identity correctly.
-  // Use a separate lane suffix for per-run isolation.
   const resolvedSessionAgentId =
     resolvedHeaderAgentId?.trim()
     || inboundAgentId
     || routedFallbackAgentId
-    || CLAWTALK_DEFAULT_AGENT_ID;
+    || 'clawtalk';
   const sessionRoutePart = resolvedSessionAgentId;
   const runScopedSessionPart = buildRunScopedSessionPart(
     routing.sessionAgentPart || resolvedSessionAgentId,
@@ -1410,62 +1397,10 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
   const extraHeaders: Record<string, string> = {
     'x-openclaw-trace-id': traceId,
   };
-  // Always send session key — OpenClaw requires it for request routing.
-  // In full_control mode the key has no `agent:` prefix, so OpenClaw treats it
+  // Session key uses `talk:` prefix (no `agent:` prefix), so OpenClaw treats it
   // as legacy_or_alias and skips embedded agent activation.
-  const sessionKey = talkExecutionMode === 'full_control'
-    ? buildFullControlTalkSessionKey(talkId, runScopedSessionPart)
-    : buildTalkSessionKey(talkId, resolvedSessionAgentId, runScopedSessionPart);
+  const sessionKey = buildTalkSessionKey(talkId, runScopedSessionPart);
   extraHeaders['x-openclaw-session-key'] = sessionKey;
-  // In full_control mode, suppress agent-id header so OpenClaw doesn't activate
-  // its embedded agent. Model routing happens via the `model` param instead.
-  if (talkExecutionMode !== 'full_control' && resolvedHeaderAgentId?.trim()) {
-    extraHeaders['x-openclaw-agent-id'] = resolvedHeaderAgentId.trim();
-  }
-  try {
-    assertRoutingHeaders({
-      flow: 'talk-chat',
-      executionMode: talkExecutionMode,
-      headers: extraHeaders,
-    });
-  } catch (err) {
-    if (err instanceof RoutingGuardError) {
-      store.openDiagnostic(talkId, {
-        code: err.code,
-        category: 'routing',
-        title: 'Routing guard blocked execution',
-        message:
-          'Execution Mode is ClawTalk Proxy, but disallowed OpenClaw routing headers were present. ' +
-          'The request was blocked to prevent proxy-to-agent misrouting.',
-        assumptionKey: `routing:${err.code.toLowerCase()}:${talkExecutionMode}`,
-        details: {
-          flow: err.flow,
-          executionMode: err.executionMode,
-        },
-      }, { modifiedBy: 'talk_chat' });
-      const errPayload: TalkErrorPayload = {
-        code: 'ROUTING_GUARD',
-        message: 'Routing guard blocked this run due to conflicting mode/header configuration.',
-        hint: 'Retry this turn. If it repeats, re-save Execution Mode and retry.',
-        transient: false,
-        retryable: true,
-      };
-      emitStatusEvent(res, {
-        code: err.code,
-        message: errPayload.message,
-        level: 'error',
-        meta: { flow: err.flow, executionMode: err.executionMode },
-      });
-      emitErrorEvent(res, errPayload);
-      store.setProcessing(talkId, false);
-      if (!res.writableEnded) {
-        res.write('data: [DONE]\n\n');
-        res.end();
-      }
-      return;
-    }
-    throw err;
-  }
   logger.info(
     `ModelRoute trace=${traceId} flow=talk-chat talkId=${talkId} requestedModel=${routeDiag.requestedModel} `
     + `sessionRoutePart=${sessionRoutePart} runScopedSessionPart=${runScopedSessionPart} executionMode=${talkExecutionMode} sessionKey=${extraHeaders['x-openclaw-session-key']} `
@@ -1522,18 +1457,18 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
     return;
   }
 
-  // --- Direct provider routing (bypass OpenClaw in full_control mode) ---
+  // --- Direct provider routing for lower latency ---
   let directRoute: DirectProviderRoute | undefined;
-  if (talkExecutionMode === 'full_control' && model.includes('/') && ctx.getConfig) {
+  if (model.includes('/') && ctx.getConfig) {
     const routeResult = resolveDirectRoute(model, ctx.getConfig(), logger);
     if (routeResult.ok) {
       directRoute = routeResult.data;
       logger.info(
-        `DirectRoute: ${model} → ${directRoute.providerKey} (${directRoute.apiFormat}, bypassing OpenClaw)`,
+        `DirectRoute: ${model} → ${directRoute.providerKey} (${directRoute.apiFormat}, direct provider routing)`,
       );
       emitStatusEvent(res, {
         code: 'DIRECT_ROUTE',
-        message: `Direct routing to ${directRoute.providerKey} (bypassing OpenClaw queue)`,
+        message: `Direct routing to ${directRoute.providerKey}`,
         level: 'info',
         meta: { provider: directRoute.providerKey, apiFormat: directRoute.apiFormat },
       });

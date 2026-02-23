@@ -34,7 +34,6 @@ import {
   startGoogleOAuthConnect,
   upsertGoogleDocsAuthConfig,
 } from './google-docs.js';
-import { reconcileSlackRoutingForTalks } from './slack-routing-sync.js';
 import { DEFAULT_GATEWAY_PORT } from './constants.js';
 import {
   requireTalkPreconditionVersion,
@@ -431,8 +430,6 @@ export async function handleUpdateTalkSkills(
     sendJson(ctx.res, 404, { error: 'Talk not found' });
     return;
   }
-  void reconcileSlackRoutingForTalks(store.listTalks(), ctx.logger);
-
   // Return same shape as GET
   const catalog = await fetchSkillsCatalog(ctx.logger);
   const allSkillsMode = updated.skills === undefined;

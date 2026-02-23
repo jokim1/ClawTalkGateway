@@ -2,8 +2,7 @@
  * Direct Provider Router
  *
  * Resolves a qualified model ID (e.g. "anthropic/claude-opus-4-6") to a
- * direct provider endpoint, bypassing OpenClaw's session queue in
- * full_control mode.
+ * direct provider endpoint for lower latency.
  *
  * Falls back gracefully — returns { ok: false } when the provider is
  * missing, API key unavailable, or model not found in config.

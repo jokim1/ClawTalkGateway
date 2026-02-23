@@ -10,7 +10,6 @@ import type {
   TalkMeta,
 } from './types.js';
 import { readJsonBody, sendJson } from './http.js';
-import { buildManagedAgentId } from './slack-routing-sync.js';
 import { SLACK_DEFAULT_ACCOUNT_ID, normalizeSlackAccountId } from './slack-auth.js';
 
 const EVENT_TTL_MS = 6 * 60 * 60_000;
@@ -605,64 +604,42 @@ export function routeSlackIngressEvent(
     };
   }
 
-  // All Talk-bound channels delegate to OpenClaw managed agents (ct-*).
-  // The before_agent_start hook injects Talk context into the managed agent.
-  const managedAgentId = buildManagedAgentId(ownership.talkId);
+  // Talk-bound channels pass through — the slack-event-proxy handles routing.
   const ownerTalk = deps.store.getTalk(ownership.talkId);
-  const isDelegated = Boolean(ownerTalk);  // managed agents exist for all Talks with write bindings
+  const reason = ownerTalk ? 'talk-bound' : 'talk-not-found';
+  deps.logger.info(
+    `SlackIngress: ${reason} event=${event.eventId} account=${event.accountId ?? 'unknown'} ` +
+    `channel=${event.channelId} talk=${ownership.talkId}`,
+  );
+  seenEvents.set(event.eventId, {
+    ts: Date.now(),
+    decision: 'pass',
+    talkId: ownership.talkId,
+    reason,
+  });
+  getTalkCounters(ownership.talkId).passed += 1;
 
-  if (isDelegated) {
-    const reason = 'delegated-to-agent';
-    deps.logger.info(
-      `SlackIngress: delegated event=${event.eventId} account=${event.accountId ?? 'unknown'} ` +
-      `channel=${event.channelId} talk=${ownership.talkId} agent=${managedAgentId}`,
-    );
-    seenEvents.set(event.eventId, {
-      ts: Date.now(),
-      decision: 'pass',
-      talkId: ownership.talkId,
-      reason,
-    });
-    getTalkCounters(ownership.talkId).passed += 1;
-
-    // Mirror inbound message to Talk history if configured (async, fire-and-forget)
-    const mirrorMode = ownership.behaviorMirrorToTalk ?? 'off';
-    if ((mirrorMode === 'inbound' || mirrorMode === 'full') && ownerTalk) {
-      const inboundContent = buildInboundMessage(event);
-      const userMsg: TalkMessage = {
-        id: randomUUID(),
-        role: 'user',
-        content: inboundContent,
-        timestamp: Date.now(),
-      };
-      deps.store.appendMessage(ownership.talkId, userMsg).catch(err => {
-        deps.logger.warn(`SlackIngress: mirror inbound failed for talk=${ownership.talkId}: ${String(err)}`);
-      });
-    }
-
-    return {
-      statusCode: 200,
-      payload: {
-        decision: 'pass',
-        reason,
-        talkId: ownership.talkId,
-        eventId: event.eventId,
-      },
+  // Mirror inbound message to Talk history if configured (async, fire-and-forget)
+  const mirrorMode = ownership.behaviorMirrorToTalk ?? 'off';
+  if ((mirrorMode === 'inbound' || mirrorMode === 'full') && ownerTalk) {
+    const inboundContent = buildInboundMessage(event);
+    const userMsg: TalkMessage = {
+      id: randomUUID(),
+      role: 'user',
+      content: inboundContent,
+      timestamp: Date.now(),
     };
+    deps.store.appendMessage(ownership.talkId, userMsg).catch(err => {
+      deps.logger.warn(`SlackIngress: mirror inbound failed for talk=${ownership.talkId}: ${String(err)}`);
+    });
   }
 
-  // All Talk-bound channels are delegated (managed agent exists for every Talk with write bindings).
-  // If we reach here, the Talk was not found in the store (shouldn't happen).
-  deps.logger.warn(
-    `SlackIngress: talk ${ownership.talkId} matched binding but not found in store ` +
-    `event=${event.eventId} channel=${event.channelId}`,
-  );
-  seenEvents.set(event.eventId, { ts: Date.now(), decision: 'pass', reason: 'talk-not-found' });
   return {
     statusCode: 200,
     payload: {
       decision: 'pass',
-      reason: 'talk-not-found',
+      reason,
+      talkId: ownership.talkId,
       eventId: event.eventId,
     },
   };

@@ -79,7 +79,7 @@ describe('delegated channel routing', () => {
     };
     const result = routeSlackIngressEvent(event, deps);
     expect(result.payload.decision).toBe('pass');
-    expect(result.payload.reason).toBe('delegated-to-agent');
+    expect(result.payload.reason).toBe('talk-bound');
     expect(result.payload.talkId).toBe(talkId);
   });
 

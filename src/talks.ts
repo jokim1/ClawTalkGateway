@@ -16,7 +16,6 @@ import type {
 } from './types.js';
 import type { ToolRegistry } from './tool-registry.js';
 import { sendJson, readJsonBody } from './http.js';
-import { reconcileSlackRoutingForTalks } from './slack-routing-sync.js';
 import {
   googleDocsAuthStatus,
 } from './google-docs.js';
@@ -619,7 +618,7 @@ async function handleCreateTalk(ctx: HandlerContext, store: TalkStore): Promise<
     ...(defaultStateStream !== undefined ? { defaultStateStream: defaultStateStream || undefined } : {}),
   });
 
-  void reconcileSlackRoutingForTalks(store.listTalks(), ctx.logger);
+
 
   sendJson(ctx.res, 201, store.getTalk(talk.id) ?? talk);
 }
@@ -912,7 +911,7 @@ async function handleUpdateTalk(ctx: HandlerContext, store: TalkStore, talkId: s
     sendJson(ctx.res, 404, { error: 'Talk not found' });
     return;
   }
-  void reconcileSlackRoutingForTalks(store.listTalks(), ctx.logger);
+
   sendJson(ctx.res, 200, updated);
 }
 
@@ -942,7 +941,7 @@ async function handleDeleteTalk(ctx: HandlerContext, store: TalkStore, talkId: s
     sendJson(ctx.res, 404, { error: 'Talk not found' });
     return;
   }
-  void reconcileSlackRoutingForTalks(store.listTalks(), ctx.logger);
+
   sendJson(ctx.res, 200, { ok: true });
 }
 

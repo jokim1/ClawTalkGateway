@@ -15,12 +15,6 @@ export interface ExecutionModeOption {
 
 export const EXECUTION_MODE_OPTIONS: ExecutionModeOption[] = [
   {
-    value: 'openclaw',
-    label: 'openclaw_agent',
-    title: 'OpenClaw Agent',
-    description: 'OpenClaw agent runtime, tools, and session behavior.',
-  },
-  {
     value: 'full_control',
     label: 'clawtalk_proxy',
     title: 'ClawTalk Proxy',
@@ -90,7 +84,7 @@ export function normalizeNetworkAccessInput(raw: unknown): NetworkAccess | undef
 }
 
 export function resolveExecutionMode(talk: Pick<TalkMeta, 'executionMode'>): ExecutionMode {
-  return talk.executionMode === 'full_control' ? 'full_control' : 'openclaw';
+  return 'full_control';
 }
 
 export function resolveFilesystemAccess(talk: Pick<TalkMeta, 'filesystemAccess'>): FilesystemAccess {
@@ -183,30 +177,18 @@ function deriveToolBlockedReason(
   if (allowSet.size > 0 && !allowSet.has(key)) {
     return { code: 'blocked_allowlist', reason: 'Not included in Talk allow-list.' };
   }
-  if (executionMode === 'openclaw') {
-    const nativeEnabled = options?.openClawNativeToolsEnabled === true;
-    const isNativeTool = options?.isOpenClawNativeTool ? options.isOpenClawNativeTool(key) : false;
-    if (nativeEnabled && isNativeTool) {
-      // Native OpenClaw bridge can execute this tool directly in embedded mode.
-    } else {
-    return {
-      code: 'blocked_execution_mode',
-      reason: 'Blocked by Execution Mode: OpenClaw Agent uses native OpenClaw tools only.',
-    };
-    }
-  }
   const proxyGatewayToolsEnabled = options?.proxyGatewayToolsEnabled === true;
   const isManagedTool = options?.isManagedTool ? options.isManagedTool(key) : false;
-  if (executionMode === 'full_control' && isManagedTool && !proxyGatewayToolsEnabled) {
+  if (isManagedTool && !proxyGatewayToolsEnabled) {
     return {
       code: 'blocked_execution_mode',
       reason: 'Blocked by Execution Mode: ClawTalk Proxy tool passthrough is unavailable.',
     };
   }
-  if (executionMode === 'full_control' && isBrowserTool(key)) {
+  if (isBrowserTool(key)) {
     return {
       code: 'blocked_execution_mode',
-      reason: 'Browser control requires Execution Mode: OpenClaw Agent.',
+      reason: 'Browser control is not available.',
     };
   }
   if (filesystemAccess === 'workspace_sandbox' && HOST_FILESYSTEM_TOOLS.has(key)) {

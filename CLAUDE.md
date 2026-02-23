@@ -23,7 +23,7 @@ Requires Node 20+. Voice features require at minimum `OPENAI_API_KEY`.
 
 4. **Fire-and-forget async** — `void someOp().catch(err => log.warn(...))` for background work. `.unref()` on all intervals/timers to avoid blocking process exit.
 
-5. **Session key prefixes** — `agent:` prefix activates OpenClaw's embedded agent (`buildTalkSessionKey` in `talk-chat.ts:423`). No `agent:` prefix = transparent proxy (`buildFullControlTalkSessionKey` in `talk-chat.ts:432`). `job:` prefix for scheduler (`buildTalkJobSessionKey` in `job-scheduler.ts:76`).
+5. **Session key prefixes** — `talk:` prefix for chat sessions (`buildTalkSessionKey` in `session-key.ts`), bypasses OpenClaw's embedded agent. `job:` prefix for scheduler (`buildTalkJobSessionKey` in `session-key.ts`).
 
 6. **Talk data storage** — Flat files under `~/.openclaw/plugins/clawtalk/talks/<id>/`: `talk.json` (metadata), `history.jsonl` (messages), `context.md` (AI-maintained), `reports.jsonl` (job reports), `state/` and `affinity/` subdirs.
 
@@ -38,12 +38,9 @@ Requires Node 20+. Voice features require at minimum `OPENAI_API_KEY`.
 
 ## Critical Warnings
 
-1. **Do not set `x-openclaw-agent-id` in `full_control` mode.** The `assertRoutingHeaders()` guard in `routing-headers.ts` will throw `RoutingGuardError`. Session keys ARE allowed in full_control mode but MUST NOT have an `agent:` prefix — non-agent keys (e.g., `talk:clawtalk:...`) are classified as `legacy_or_alias` by OpenClaw and bypass the embedded agent.
-2. **The `message_received` hook return value is IGNORED by OpenClaw.** Do not rely on `{ cancel: true }` to prevent message delivery. The hook is fire-and-forget (`runVoidHook`).
-3. **The `ctx.channelId` in OpenClaw's `message_received` hook is the platform name** (e.g., "slack"), not a Slack channel ID. Don't confuse it with the Slack channel ID in `SlackIngressEvent.channelId`.
-4. **`reconcileSlackRoutingForTalks()` only runs at startup.** New Talk bindings won't take effect until gateway restart. Managed agents (`ct-*` prefix) and their bindings are written to `agents.list` and `bindings` in `openclaw.json`.
-5. **Managed agent IDs use the `ct-` prefix** (e.g., `ct-8fabc85a`). Do not manually create agents with this prefix — they will be overwritten by the routing sync. Use `buildManagedAgentId()` and `isManagedAgentId()` from `slack-routing-sync.ts`.
-6. **The `before_agent_start` hook injects Talk context for managed agents.** It matches on `ct-*` agent IDs. The context block (~2KB) includes instructions, objective, rules, context.md, pins, and state paths. If no Talk is found for the agent ID, the hook passes through.
+1. **The `message_received` hook return value is IGNORED by OpenClaw.** Do not rely on `{ cancel: true }` to prevent message delivery. The hook is fire-and-forget (`runVoidHook`).
+2. **The `ctx.channelId` in OpenClaw's `message_received` hook is the platform name** (e.g., "slack"), not a Slack channel ID. Don't confuse it with the Slack channel ID in `SlackIngressEvent.channelId`.
+3. **All execution uses full_control mode.** The embedded agent (OpenClaw) path is removed. Session keys use `talk:` prefix (no `agent:` prefix), classified as `legacy_or_alias` by OpenClaw. Do not set `x-openclaw-agent-id` header.
 
 ## Context Files
 
@@ -55,6 +52,7 @@ Read these on-demand when working in a specific area:
 | `docs/refactoring.md` | Writing new code, refactoring, reviewing — patterns, anti-patterns, SOLID mapping |
 | `docs/slack-integration.md` | Touching `slack-*.ts` files, hooks, bindings, managed agents |
 | `docs/testing.md` | Adding or modifying tests — mocks, fixtures, conventions, coverage gaps |
+| `docs/openclaw-compatibility-surface.md` | Updating OpenClaw, checking config/hook/API dependencies |
 
 ## Related Projects
 
