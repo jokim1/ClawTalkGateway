@@ -1165,7 +1165,7 @@ export async function setGoogleDocsActiveProfile(profile: string): Promise<{ tok
 export async function startGoogleOAuthConnect(input: {
   redirectUri: string;
   profile?: string;
-}): Promise<{ sessionId: string; authUrl: string; profile?: string; expiresAt: number }> {
+}): Promise<{ sessionId: string; authUrl: string; redirectUri: string; profile?: string; expiresAt: number }> {
   const callerRedirectUri = input.redirectUri.trim();
   if (!callerRedirectUri) {
     throw new Error('redirectUri is required.');
@@ -1212,6 +1212,7 @@ export async function startGoogleOAuthConnect(input: {
   return {
     sessionId,
     authUrl: authUrl.toString(),
+    redirectUri,
     ...(requestedProfile ? { profile: requestedProfile } : {}),
     expiresAt: now + OAUTH_SESSION_TTL_MS,
   };
