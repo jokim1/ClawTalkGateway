@@ -1015,7 +1015,13 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
     }
     return;
   }
-  if (!isModelQuestion && googleDocId && hasGoogleDocsReadTool) {
+  // Only fast-path when the message is essentially just a URL (with minimal filler
+  // like "read this").  When the user asks a substantive question alongside the URL,
+  // let the LLM handle it so the agent reads the doc via tool call and responds to
+  // the actual question rather than dumping raw doc content.
+  const textBeyondUrl = stripUrlsForIntentMatching(body.message).replace(/\s+/g, ' ').trim();
+  const isUrlOnlyMessage = textBeyondUrl.split(/\s+/).length <= 4;
+  if (!isModelQuestion && googleDocId && hasGoogleDocsReadTool && isUrlOnlyMessage) {
     const userMessageId = randomUUID();
     const urlTabId = extractGoogleDocsTabIdFromUrl(body.message);
     const docsResult = await executor.execute('google_docs_read', JSON.stringify({
