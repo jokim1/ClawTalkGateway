@@ -70,6 +70,11 @@ const ADAPTIVE_FLOOR_MS = 15_000;
 const ADAPTIVE_CEILING_MS = 300_000;
 /** Escalation factor applied to cold-start default when all recent obs are timeouts. */
 const ALL_TIMEOUT_ESCALATION = 1.5;
+/** Per-model-class multiplier applied to the final computed timeout.
+ *  Models with known high TTFT variance get extra headroom. */
+const MODEL_CLASS_TIMEOUT_MULTIPLIER: Partial<Record<ModelClass, number>> = {
+  kimi: 1.5,
+};
 /** Number of recent observations to check for health/degradation. */
 const HEALTH_WINDOW = 5;
 /** Timeout rate threshold for degraded status. */
@@ -142,30 +147,31 @@ export class TtftTracker {
    */
   computeTimeout(model: string, fallbackMs: number): number {
     const modelClass = classifyModelClass(model);
+    const multiplier = MODEL_CLASS_TIMEOUT_MULTIPLIER[modelClass] ?? 1;
     const coldStart = COLD_START_DEFAULTS[modelClass] ?? fallbackMs;
     const window = this.windows.get(modelClass);
 
     // No observations → cold-start default
     if (!window || window.length === 0) {
-      return coldStart;
+      return Math.min(ADAPTIVE_CEILING_MS, Math.round(coldStart * multiplier));
     }
 
     // Not enough observations → cold-start default
     if (window.length < ADAPTIVE_MIN_OBSERVATIONS) {
-      return coldStart;
+      return Math.min(ADAPTIVE_CEILING_MS, Math.round(coldStart * multiplier));
     }
 
     // All recent observations are timeouts → escalated cold-start
     const successes = window.filter((e) => !e.timedOut);
     if (successes.length === 0) {
-      return Math.min(ADAPTIVE_CEILING_MS, coldStart * ALL_TIMEOUT_ESCALATION);
+      return Math.min(ADAPTIVE_CEILING_MS, Math.round(coldStart * ALL_TIMEOUT_ESCALATION * multiplier));
     }
 
     // Compute P95 of successful TTFTs
     const sorted = successes.map((e) => e.ttftMs).sort((a, b) => a - b);
     const p95Index = Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95) - 1);
     const p95 = sorted[p95Index];
-    const adaptive = Math.round(p95 * ADAPTIVE_MARGIN);
+    const adaptive = Math.round(p95 * ADAPTIVE_MARGIN * multiplier);
 
     // Clamp to [floor, ceiling]
     return Math.max(ADAPTIVE_FLOOR_MS, Math.min(ADAPTIVE_CEILING_MS, adaptive));
