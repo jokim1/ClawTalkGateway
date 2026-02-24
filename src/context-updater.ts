@@ -15,6 +15,7 @@ import type { KnowledgeIndexEntry, Logger, OpenClawConfig } from './types.js';
 import { isValidKnowledgeSlug, normalizeKnowledgeSlug } from './talk-store.js';
 import { resolveDirectRoute } from './direct-provider-router.js';
 import { translateRequestToAnthropic, translateAnthropicResponse } from './anthropic-format.js';
+import { getTtftTracker } from './ttft-tracker.js';
 
 const CONTEXT_UPDATE_PROMPT = `You maintain a running context document and optional knowledge files for an ongoing conversation.
 
@@ -57,6 +58,13 @@ Output the updated context document and any knowledge file updates using the for
 
 /** Rate-limit: minimum interval between context updates per talk. */
 const MIN_UPDATE_INTERVAL_MS = 30_000;
+
+/** Minimum timeout for the context update LLM call (non-streaming). */
+const CONTEXT_FETCH_TIMEOUT_FLOOR_MS = 30_000;
+/** Fixed buffer added to adaptive TTFT for non-streaming generation time. */
+const CONTEXT_FETCH_GENERATION_BUFFER_MS = 30_000;
+/** Maximum timeout — context updates shouldn't block indefinitely. */
+const CONTEXT_FETCH_TIMEOUT_CEILING_MS = 180_000;
 
 /** Maximum entries in the lastUpdateTime map. */
 const MAX_UPDATE_TIME_ENTRIES = 500;
@@ -248,11 +256,21 @@ async function doContextUpdate(opts: ContextUpdateOptions): Promise<void> {
     });
   }
 
+  // Adaptive timeout: TTFT (per model class) + generation buffer, clamped to [30s, 180s].
+  // Non-streaming requests need TTFT + full generation time, not just first-token.
+  const ttftTracker = getTtftTracker(logger);
+  const adaptiveTtft = ttftTracker.computeTimeout(model, CONTEXT_FETCH_TIMEOUT_FLOOR_MS);
+  const fetchTimeoutMs = Math.max(
+    CONTEXT_FETCH_TIMEOUT_FLOOR_MS,
+    Math.min(CONTEXT_FETCH_TIMEOUT_CEILING_MS, adaptiveTtft + CONTEXT_FETCH_GENERATION_BUFFER_MS),
+  );
+  logger.debug(`ContextUpdater: fetch timeout=${fetchTimeoutMs}ms (adaptiveTtft=${adaptiveTtft}ms) model=${model}`);
+
   const response = await fetch(fetchUrl, {
     method: 'POST',
     headers: fetchHeaders,
     body: fetchBody,
-    signal: AbortSignal.timeout(30_000),
+    signal: AbortSignal.timeout(fetchTimeoutMs),
   });
 
   if (!response.ok) {
