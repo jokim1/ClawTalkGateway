@@ -298,13 +298,18 @@ const GOOGLE_DOCS_READ_TOOL: ToolDefinition = {
   function: {
     name: 'google_docs_read',
     description:
-      'Read text content from a Google Doc. Accepts either a raw doc ID or full Google Docs URL.',
+      'Read text content from a Google Doc. Accepts either a raw doc ID or full Google Docs URL. ' +
+      'Supports reading a specific tab by tab_id.',
     parameters: {
       type: 'object',
       properties: {
         doc_id: {
           type: 'string',
           description: 'Google Docs document ID or full docs.google.com document URL.',
+        },
+        tab_id: {
+          type: 'string',
+          description: 'Optional tab ID to read a specific tab (e.g. "t.0"). If omitted, reads the first tab.',
         },
         max_chars: {
           type: 'number',

@@ -28,7 +28,7 @@ import {
   googleDocsUpdateTab,
   GOOGLE_DOCS_REQUIRED_SCOPES,
 } from './google-docs.js';
-import { extractGoogleDocsDocumentIdFromUrl } from './google-docs-url.js';
+import { extractGoogleDocsDocumentIdFromUrl, extractGoogleDocsTabIdFromUrl } from './google-docs-url.js';
 
 /** Maximum output size per tool execution (512KB). */
 const MAX_OUTPUT_BYTES = 512 * 1024;
@@ -430,6 +430,7 @@ export class ToolExecutor {
 
   private async execGoogleDocsRead(args: Record<string, unknown>): Promise<ToolExecResult> {
     const docId = String(args.doc_id ?? '').trim();
+    const tabId = args.tab_id === undefined ? undefined : String(args.tab_id).trim();
     const maxChars = args.max_chars === undefined ? undefined : Number(args.max_chars);
     const profile = args.profile === undefined ? undefined : String(args.profile).trim();
     if (!docId) {
@@ -437,15 +438,21 @@ export class ToolExecutor {
     }
 
     try {
-      const read = await googleDocsRead({ docId, maxChars, profile: profile || undefined });
+      const read = await googleDocsRead({ docId, tabId: tabId || undefined, maxChars, profile: profile || undefined });
+      let content =
+        `Google Doc: ${read.title}\n` +
+        `Document ID: ${read.documentId}\n` +
+        `URL: ${read.url}\n` +
+        (read.tabTitle ? `Tab: ${read.tabTitle}${tabId ? ` (${tabId})` : ''}\n` : '') +
+        `Truncated: ${read.truncated ? 'yes' : 'no'}\n`;
+      if (read.tabs && read.tabs.length > 0) {
+        const tabLines = read.tabs.map(t => `- ${t.title} (tabId=${t.tabId})`);
+        content += `\nAvailable tabs (${read.tabs.length}):\n${tabLines.join('\n')}\n`;
+      }
+      content += '\n' + read.text;
       return {
         success: true,
-        content:
-          `Google Doc: ${read.title}\n` +
-          `Document ID: ${read.documentId}\n` +
-          `URL: ${read.url}\n` +
-          `Truncated: ${read.truncated ? 'yes' : 'no'}\n\n` +
-          read.text,
+        content,
         durationMs: 0,
       };
     } catch (err) {
@@ -883,21 +890,29 @@ export class ToolExecutor {
     const googleDocId = extractGoogleDocsDocumentIdFromUrl(urlRaw);
 
     if (googleDocId) {
+      const tabId = extractGoogleDocsTabIdFromUrl(urlRaw);
       try {
         const read = await googleDocsRead({
           docId: googleDocId,
+          tabId: tabId || undefined,
           maxChars,
           profile: profile || undefined,
         });
+        let content =
+          `Auto-routed from web_fetch_extract to google_docs_read for authenticated Google Docs access.\n` +
+          `Google Doc: ${read.title}\n` +
+          `Document ID: ${read.documentId}\n` +
+          `URL: ${read.url}\n` +
+          (read.tabTitle ? `Tab: ${read.tabTitle}${tabId ? ` (${tabId})` : ''}\n` : '') +
+          `Truncated: ${read.truncated ? 'yes' : 'no'}\n`;
+        if (read.tabs && read.tabs.length > 0) {
+          const tabLines = read.tabs.map(t => `- ${t.title} (tabId=${t.tabId})`);
+          content += `\nAvailable tabs (${read.tabs.length}):\n${tabLines.join('\n')}\n`;
+        }
+        content += '\n' + read.text;
         return {
           success: true,
-          content:
-            `Auto-routed from web_fetch_extract to google_docs_read for authenticated Google Docs access.\n` +
-            `Google Doc: ${read.title}\n` +
-            `Document ID: ${read.documentId}\n` +
-            `URL: ${read.url}\n` +
-            `Truncated: ${read.truncated ? 'yes' : 'no'}\n\n` +
-            read.text,
+          content,
           durationMs: 0,
         };
       } catch (err) {

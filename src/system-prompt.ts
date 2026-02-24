@@ -87,7 +87,7 @@ export function composeSystemPrompt(input: SystemPromptInput): string | undefine
         '- **Do not use tools** for simple conversational/meta questions (e.g., "what model are you?", greetings, clarifications).\n' +
         '- If a tool call fails, tell the user what happened and suggest alternatives.\n' +
         '- For multi-step tasks, chain tool calls as needed — you can call tools multiple times in sequence.\n' +
-        '- For Google Docs URLs (`docs.google.com/document/...`), use `google_docs_read` instead of `web_fetch_extract`.\n' +
+        '- For Google Docs URLs (`docs.google.com/document/...`), use `google_docs_read` instead of `web_fetch_extract`. If the URL contains `?tab=`, pass the tab parameter as `tab_id`. If a doc has multiple tabs and no specific tab is requested, mention the available tabs to the user.\n' +
         '- For Google Docs/Drive actions, use gateway tools (`google_docs_*`, `google_drive_files`) via function calls.\n' +
         '- Do not use or mention `gog` CLI, local skills, or external auth flows for Google actions in this Talk.\n' +
         '- If Google tools are unavailable or blocked, say that explicitly and mention Execution Mode / OAuth readiness as the likely cause.\n' +

@@ -364,6 +364,29 @@ function collectTabs(
   }
 }
 
+function findTabById(tabs: unknown, tabId: string): Record<string, unknown> | undefined {
+  if (!Array.isArray(tabs)) return undefined;
+  for (const tab of tabs) {
+    if (!tab || typeof tab !== 'object') continue;
+    const rec = tab as Record<string, unknown>;
+    const props = (rec.tabProperties && typeof rec.tabProperties === 'object')
+      ? rec.tabProperties as Record<string, unknown>
+      : undefined;
+    if (typeof props?.tabId === 'string' && props.tabId === tabId) return rec;
+    const found = findTabById(rec.childTabs, tabId);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function extractTabDocumentText(tab: Record<string, unknown>): string {
+  const docTab = (tab.documentTab && typeof tab.documentTab === 'object')
+    ? tab.documentTab as Record<string, unknown>
+    : undefined;
+  if (!docTab) return '';
+  return extractDocumentText(docTab);
+}
+
 export async function googleDocsCreate(params: {
   title: string;
   content?: string;
@@ -613,28 +636,75 @@ export async function googleDocsDeleteTab(params: {
 
 export async function googleDocsRead(params: {
   docId: string;
+  tabId?: string;
   maxChars?: number;
   profile?: string;
-}): Promise<{ documentId: string; title: string; text: string; truncated: boolean; url: string }> {
+}): Promise<{
+  documentId: string;
+  title: string;
+  text: string;
+  truncated: boolean;
+  url: string;
+  tabTitle?: string;
+  tabs?: GoogleDocsTabSummary[];
+}> {
   const documentId = parseDocumentId(params.docId);
+  const tabId = params.tabId?.trim() || undefined;
   const maxChars = Math.max(500, Math.min(200_000, Number(params.maxChars) || 20_000));
 
   let title = 'Untitled';
   let fullText = '';
+  let tabTitle: string | undefined;
+  let tabSummaries: GoogleDocsTabSummary[] | undefined;
   try {
-    const doc = await googleFetchJson(
-      `https://docs.googleapis.com/v1/documents/${encodeURIComponent(documentId)}`,
-      { method: 'GET' },
-      params.profile,
-    );
+    const url = new URL(`https://docs.googleapis.com/v1/documents/${encodeURIComponent(documentId)}`);
+    url.searchParams.set('includeTabsContent', 'true');
+    const doc = await googleFetchJson(url.toString(), { method: 'GET' }, params.profile);
     title = String(doc?.title ?? 'Untitled');
-    fullText = extractDocumentText(doc);
+
+    const docTabs = Array.isArray(doc?.tabs) ? doc.tabs : [];
+
+    if (tabId && docTabs.length > 0) {
+      // Read specific tab
+      const matchedTab = findTabById(docTabs, tabId);
+      if (matchedTab) {
+        fullText = extractTabDocumentText(matchedTab);
+        const props = (matchedTab.tabProperties && typeof matchedTab.tabProperties === 'object')
+          ? matchedTab.tabProperties as Record<string, unknown>
+          : undefined;
+        tabTitle = typeof props?.title === 'string' ? props.title : undefined;
+      } else {
+        fullText = extractDocumentText(doc);
+      }
+    } else if (docTabs.length > 0) {
+      // Read first tab's documentTab content
+      const firstTab = docTabs[0] as Record<string, unknown>;
+      fullText = extractTabDocumentText(firstTab);
+      if (!fullText) {
+        // Fallback to doc.body for single-tab docs without documentTab
+        fullText = extractDocumentText(doc);
+      }
+      const firstProps = (firstTab.tabProperties && typeof firstTab.tabProperties === 'object')
+        ? firstTab.tabProperties as Record<string, unknown>
+        : undefined;
+      tabTitle = typeof firstProps?.title === 'string' ? firstProps.title : undefined;
+    } else {
+      // No tabs array (old API response?) — fall back to doc.body
+      fullText = extractDocumentText(doc);
+    }
+
+    // Collect tab summaries for multi-tab docs
+    const allTabs: GoogleDocsTabSummary[] = [];
+    collectTabs(docTabs, allTabs);
+    if (allTabs.length > 1) {
+      tabSummaries = allTabs;
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (!isDocsApiDisabledErrorMessage(msg)) throw err;
 
     // Fallback for projects with Drive OAuth configured but Docs API disabled:
-    // export as plain text through Drive API.
+    // export as plain text through Drive API. Tab-awareness not possible here.
     fullText = (await googleFetchText(
       `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(documentId)}/export?mimeType=text/plain`,
       { method: 'GET' },
@@ -663,6 +733,8 @@ export async function googleDocsRead(params: {
     text,
     truncated,
     url: `https://docs.google.com/document/d/${documentId}/edit`,
+    ...(tabTitle ? { tabTitle } : {}),
+    ...(tabSummaries ? { tabs: tabSummaries } : {}),
   };
 }
 

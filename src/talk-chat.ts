@@ -23,7 +23,7 @@ import type { DirectProviderRoute } from './direct-provider-router.js';
 import { collectRoutingDiagnostics } from './model-routing-diagnostics.js';
 import { getToolCatalog } from './tool-catalog.js';
 import { parseEventTrigger, validateSchedule } from './job-scheduler.js';
-import { extractGoogleDocsDocumentIdFromUrl, hasGoogleDocsDocumentUrl } from './google-docs-url.js';
+import { extractGoogleDocsDocumentIdFromUrl, extractGoogleDocsTabIdFromUrl, hasGoogleDocsDocumentUrl } from './google-docs-url.js';
 import { googleDocsAuthStatusForProfile } from './google-docs.js';
 import {
   evaluateToolAvailability,
@@ -252,6 +252,10 @@ function normalizeIntentText(message: string): string {
     .replace(/[\u0000-\u001f\u007f]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function stripUrlsForIntentMatching(text: string): string {
+  return text.replace(/https?:\/\/\S+/gi, '').trim();
 }
 
 function splitTabTitles(raw: string): string[] {
@@ -973,7 +977,7 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
 
   // Deterministic Google Docs read fast path:
   // bypass model/tool-chaining when the user directly provides a Google Docs URL.
-  const hasTabKeyword = /\btab(s)?\b/i.test(normalizeIntentText(body.message));
+  const hasTabKeyword = /\btab(s)?\b/i.test(stripUrlsForIntentMatching(normalizeIntentText(body.message)));
   const googleDocId = extractGoogleDocsDocumentIdFromUrl(body.message);
   if (!isModelQuestion && googleDocId && hasTabKeyword && !createIntent && !tabOnlyIntent) {
     const userMessageId = randomUUID();
@@ -1013,8 +1017,10 @@ export async function handleTalkChat(ctx: TalkChatContext): Promise<void> {
   }
   if (!isModelQuestion && googleDocId && hasGoogleDocsReadTool) {
     const userMessageId = randomUUID();
+    const urlTabId = extractGoogleDocsTabIdFromUrl(body.message);
     const docsResult = await executor.execute('google_docs_read', JSON.stringify({
       doc_id: googleDocId,
+      ...(urlTabId ? { tab_id: urlTabId } : {}),
       ...(meta.googleAuthProfile ? { profile: meta.googleAuthProfile } : {}),
     }));
     const directReply = docsResult.success

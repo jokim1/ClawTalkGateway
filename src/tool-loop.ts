@@ -17,7 +17,7 @@ import { Agent } from 'undici';
 import type { Logger, ToolCallInfo } from './types.js';
 import type { ToolRegistry, ToolDefinition } from './tool-registry.js';
 import type { ToolExecutor, ToolExecResult } from './tool-executor.js';
-import { extractGoogleDocsDocumentIdFromUrl } from './google-docs-url.js';
+import { extractGoogleDocsDocumentIdFromUrl, extractGoogleDocsTabIdFromUrl } from './google-docs-url.js';
 import type { DirectProviderRoute } from './direct-provider-router.js';
 import { translateRequestToAnthropic, translateAnthropicStream, translateAnthropicResponse } from './anthropic-format.js';
 
@@ -138,7 +138,9 @@ function routeToolCallForExecution(
       const url = typeof parsed?.url === 'string' ? parsed.url : '';
       const docId = extractGoogleDocsDocumentIdFromUrl(url);
       if (docId) {
+        const tabId = extractGoogleDocsTabIdFromUrl(url);
         const routedArgs: Record<string, unknown> = { doc_id: docId };
+        if (tabId) routedArgs.tab_id = tabId;
         if (parsed.max_chars !== undefined) routedArgs.max_chars = parsed.max_chars;
         if (typeof parsed.profile === 'string' && parsed.profile.trim()) routedArgs.profile = parsed.profile.trim();
         executeName = 'google_docs_read';
