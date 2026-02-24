@@ -9,6 +9,7 @@ type OAuthTokenFile = {
   client_secret?: string;
   refresh_token?: string;
   token_uri?: string;
+  redirect_uri?: string;
   access_token?: string;
   expiry_date?: number;
 };
@@ -1165,8 +1166,8 @@ export async function startGoogleOAuthConnect(input: {
   redirectUri: string;
   profile?: string;
 }): Promise<{ sessionId: string; authUrl: string; profile?: string; expiresAt: number }> {
-  const redirectUri = input.redirectUri.trim();
-  if (!redirectUri) {
+  const callerRedirectUri = input.redirectUri.trim();
+  if (!callerRedirectUri) {
     throw new Error('redirectUri is required.');
   }
   const { store } = await loadTokenStore().catch(() => ({
@@ -1181,6 +1182,9 @@ export async function startGoogleOAuthConnect(input: {
   const candidateProfile = requestedProfile ?? activeProfile;
   const record = (store.profiles ?? {})[candidateProfile] ?? {};
   const { clientId } = getOAuthClientConfig(candidateProfile, record);
+  // Prefer redirect_uri from token file (registered in Google Cloud Console)
+  // over the dynamically-derived one from the request Host header.
+  const redirectUri = record.redirect_uri?.trim() || callerRedirectUri;
 
   const sessionId = randomUUID();
   const state = randomUUID();

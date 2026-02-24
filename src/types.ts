@@ -453,8 +453,6 @@ export interface ClawTalkPluginConfig {
   realtimeVoice?: RealtimeVoicePluginConfig;
   pairPassword?: string;
   externalUrl?: string;
-  /** Fixed Google OAuth redirect URI. If unset, derived from the request Host header. */
-  googleOAuthRedirectUri?: string;
   name?: string;
   dataDir?: string;
   uploadDir?: string;

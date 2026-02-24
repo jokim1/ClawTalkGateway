@@ -497,12 +497,10 @@ export async function handleToolRoutes(ctx: HandlerContext, registry: ToolRegist
       sendJson(res, 400, { error: 'profile must be a non-empty string when provided' });
       return;
     }
-    const redirectUri = ctx.pluginCfg.googleOAuthRedirectUri ?? (() => {
-      const proto = (ctx.req.headers['x-forwarded-proto'] as string | undefined)?.split(',')[0]?.trim()
-        || ((ctx.req.socket as any)?.encrypted ? 'https' : 'http');
-      const host = ctx.req.headers.host ?? `localhost:${DEFAULT_GATEWAY_PORT}`;
-      return `${proto}://${host}/api/tools/google/oauth/callback`;
-    })();
+    const proto = (ctx.req.headers['x-forwarded-proto'] as string | undefined)?.split(',')[0]?.trim()
+      || ((ctx.req.socket as any)?.encrypted ? 'https' : 'http');
+    const host = ctx.req.headers.host ?? `localhost:${DEFAULT_GATEWAY_PORT}`;
+    const redirectUri = `${proto}://${host}/api/tools/google/oauth/callback`;
     try {
       const started = await startGoogleOAuthConnect({ redirectUri, profile: profile || undefined });
       sendJson(res, 200, started);
