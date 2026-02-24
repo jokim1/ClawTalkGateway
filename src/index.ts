@@ -38,7 +38,7 @@ import { reconcileAnthropicProxyBaseUrls, reconcileGatewayResponsesEndpoint } fr
 import { registerOpenClawNativeGoogleTools } from './openclaw-native-tools.js';
 import { listSlackAccountIds, resolveSlackBotTokenForAccount } from './slack-auth.js';
 import { handleSlackEventProxy } from './slack-event-proxy.js';
-import { checkSlackProxySetup, logSlackProxySetupStatus } from './slack-proxy-setup.js';
+import { checkSlackProxySetup, logSlackProxySetupStatus, ensureSlackSocketMode } from './slack-proxy-setup.js';
 import { isRateLimited } from './pair-rate-limiter.js';
 import {
   type SlackDebugPath,
@@ -238,8 +238,10 @@ const plugin = {
     const readyBarrier = talkStore.init()
       .then(async () => {
         await configReconciled;
-        // Check and log Slack event proxy setup status
+        // Auto-correct Slack accounts using HTTP mode to socket mode
         const proxyCfg = api.runtime.config.loadConfig();
+        await ensureSlackSocketMode(proxyCfg, api.logger);
+        // Check and log Slack event proxy setup status
         logSlackProxySetupStatus(talkStore, proxyCfg, api.logger);
         readyPhase = 'ready';
         appendSyncEvent('gateway_phase', { phase: readyPhase });

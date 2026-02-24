@@ -11,6 +11,8 @@ import type { TalkStore } from './talk-store.js';
 import type { Logger, TalkPlatformBinding } from './types.js';
 import { collectSigningSecrets, resolveOpenClawWebhookUrl } from './slack-event-proxy.js';
 import { withOpenClawConfigLock } from './openclaw-config-lock.js';
+import { patchOpenClawConfig } from './openclaw-config-lock.js';
+import { resolveTemplateSecret } from './slack-auth.js';
 import { DEFAULT_GATEWAY_PORT, OPENCLAW_CONFIG_PATH } from './constants.js';
 
 // ---------------------------------------------------------------------------
@@ -305,4 +307,57 @@ export async function saveSlackSigningSecret(
     await fs.rename(tmpPath, configPath);
     logger.info('ClawTalk: saved Slack signing secret to openclaw.json');
   });
+}
+
+// ---------------------------------------------------------------------------
+// Ensure Slack accounts use socket mode when app tokens are available
+// ---------------------------------------------------------------------------
+
+/**
+ * Detects Slack accounts configured with `mode: "http"` that have app tokens
+ * and auto-corrects them to socket mode (the default). HTTP mode requires a
+ * publicly reachable URL, which is fragile. Socket mode uses an outbound
+ * WebSocket and works behind NAT/firewalls.
+ *
+ * Call at startup before OpenClaw connects Slack providers.
+ */
+export async function ensureSlackSocketMode(
+  cfg: Record<string, unknown>,
+  logger: Logger,
+): Promise<string[]> {
+  const channels = cfg.channels as Record<string, unknown> | undefined;
+  const slack = channels?.slack as Record<string, unknown> | undefined;
+  const accounts = slack?.accounts as Record<string, Record<string, unknown>> | undefined;
+  if (!accounts) return [];
+
+  const fixable: string[] = [];
+  for (const [id, acc] of Object.entries(accounts)) {
+    if (acc.mode !== 'http') continue;
+    const appToken = resolveTemplateSecret(acc.appToken as string | undefined);
+    if (appToken) fixable.push(id);
+  }
+  if (fixable.length === 0) return [];
+
+  const patched = await patchOpenClawConfig((obj) => {
+    const ch = obj.channels as Record<string, unknown> | undefined;
+    const sl = ch?.slack as Record<string, unknown> | undefined;
+    const accts = sl?.accounts as Record<string, Record<string, unknown>> | undefined;
+    if (!accts) return false;
+    let changed = false;
+    for (const id of fixable) {
+      if (accts[id]?.mode === 'http') {
+        delete accts[id].mode;
+        changed = true;
+      }
+    }
+    return changed;
+  }, logger);
+
+  if (patched) {
+    logger.warn(
+      `ClawTalk: auto-corrected Slack accounts to socket mode: ${fixable.join(', ')}. ` +
+      'HTTP mode requires a public URL; socket mode works behind NAT. Restart required.',
+    );
+  }
+  return fixable;
 }
