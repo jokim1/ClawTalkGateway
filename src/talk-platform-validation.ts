@@ -40,7 +40,7 @@ export type PlatformBindingsValidationOptions = {
   resolveSlackScope?: (scope: string, accountId?: string) => Promise<SlackScopeResolutionResult>;
 };
 
-const TALK_AGENT_ROLES = new Set(['analyst', 'critic', 'strategist', 'devils-advocate', 'synthesizer', 'editor']);
+const TALK_AGENT_ROLES = new Set(['assistant', 'analyst', 'critic', 'strategist', 'devils-advocate', 'synthesizer', 'editor']);
 
 function canWrite(permission: PlatformPermission): boolean {
   return permission === 'write' || permission === 'read+write';

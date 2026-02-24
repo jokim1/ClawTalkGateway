@@ -487,6 +487,10 @@ function normalizeDiagnostics(input: unknown): TalkDiagnosticIssue[] {
   return normalized.sort((a, b) => b.lastSeenAt - a.lastSeenAt);
 }
 
+function buildDefaultAgent(model: string): TalkAgent {
+  return { name: 'Default', model, role: 'assistant', isPrimary: true };
+}
+
 export class TalkStore {
   private readonly talksDir: string;
   private readonly talks: Map<string, TalkMeta> = new Map();
@@ -577,6 +581,9 @@ export class TalkStore {
           meta.pinnedMessageIds ??= [];
           meta.jobs = normalizeJobs(meta.jobs);
           meta.agents ??= [];
+          if (meta.agents.length === 0 && meta.model) {
+            meta.agents.push(buildDefaultAgent(meta.model));
+          }
           meta.directives = normalizeDirectives(meta.directives);
           meta.platformBindings = normalizeTalkPlatformBindings(meta.platformBindings);
           meta.platformBehaviors = normalizePlatformBehaviors(meta.platformBehaviors, meta.platformBindings);
@@ -665,6 +672,7 @@ export class TalkStore {
       pinnedMessageIds: [],
       jobs: [],
       processing: false,
+      agents: model ? [buildDefaultAgent(model)] : [],
       directives: [],
       platformBindings: [],
       platformBehaviors: [],
@@ -759,6 +767,23 @@ export class TalkStore {
     if (updates.defaultStateStream !== undefined) {
       meta.defaultStateStream = normalizeOptionalStateStream(updates.defaultStateStream);
     }
+
+    // Bidirectional sync between talk.model and primary agent
+    if (updates.model && (!meta.agents || meta.agents.length === 0)) {
+      meta.agents = [buildDefaultAgent(updates.model)];
+    } else if (meta.agents && meta.agents.length > 0) {
+      const primary = meta.agents.find(a => a.isPrimary);
+      if (primary) {
+        if (updates.agents !== undefined) {
+          // Agents were explicitly updated — primary agent's model wins
+          meta.model = primary.model;
+        } else if (updates.model !== undefined) {
+          // Model updated without agents — propagate to primary agent
+          primary.model = meta.model!;
+        }
+      }
+    }
+
     this.touchMeta(meta, 'updated', { modifiedBy: options?.modifiedBy });
     return meta;
   }
@@ -1376,6 +1401,9 @@ export class TalkStore {
       }
     }
     meta.agents.push(agent);
+    if (agent.isPrimary) {
+      meta.model = agent.model;
+    }
     this.touchMeta(meta, 'agent_added', { modifiedBy: options?.modifiedBy });
     return agent;
   }
@@ -1383,7 +1411,9 @@ export class TalkStore {
   async removeAgent(talkId: string, agentName: string, options?: { modifiedBy?: string }): Promise<void> {
     const meta = this.talks.get(talkId);
     if (!meta) throw new Error('Talk not found');
-    const idx = (meta.agents ?? []).findIndex(a => a.name === agentName);
+    const agents = meta.agents ?? [];
+    if (agents.length <= 1) throw new Error('Cannot remove the last agent');
+    const idx = agents.findIndex(a => a.name === agentName);
     if (idx === -1) throw new Error('Agent not found');
     meta.agents!.splice(idx, 1);
     this.touchMeta(meta, 'agent_removed', { modifiedBy: options?.modifiedBy });
@@ -1398,6 +1428,10 @@ export class TalkStore {
     const meta = this.talks.get(talkId);
     if (!meta) throw new Error('Talk not found');
     meta.agents = agents;
+    const primary = agents.find(a => a.isPrimary);
+    if (primary) {
+      meta.model = primary.model;
+    }
     this.touchMeta(meta, 'agents_set', { modifiedBy: options?.modifiedBy });
   }
 

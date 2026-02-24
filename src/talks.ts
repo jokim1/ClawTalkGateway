@@ -1145,8 +1145,13 @@ async function handleDeleteAgent(ctx: HandlerContext, store: TalkStore, talkId: 
 
   try {
     await store.removeAgent(talkId, agentName, { modifiedBy });
-  } catch {
-    sendJson(ctx.res, 404, { error: 'Agent not found' });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message === 'Cannot remove the last agent') {
+      sendJson(ctx.res, 409, { error: message });
+    } else {
+      sendJson(ctx.res, 404, { error: 'Agent not found' });
+    }
     return;
   }
   sendJson(ctx.res, 200, { ok: true });
