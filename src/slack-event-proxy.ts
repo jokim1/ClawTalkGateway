@@ -458,9 +458,19 @@ export async function handleSlackEventProxy(
       }
       return;
     }
+
+    // ── Message with no Talk binding → drop silently ──
+    // Talk bindings are the sole authority for Slack message routing.
+    // Without a binding, the channel is silent (no forwarding to OpenClaw).
+    deps.logger.debug(
+      `SlackEventProxy: no Talk binding for message channel=${payload.event.channel} ` +
+      `event_id=${payload.event_id ?? '-'} — dropping`,
+    );
+    sendJson(res, 200, { ok: true, routed: 'dropped', reason: 'no-talk-binding' });
+    return;
   }
 
-  // ── Not ClawTalk-owned or not a message event → forward to OpenClaw ──
+  // ── Non-message event → forward to OpenClaw ──
   deps.logger.debug(
     `SlackEventProxy: forwarding to OpenClaw event_type=${eventType ?? 'unknown'} ` +
     `channel=${payload.event?.channel ?? '-'} event_id=${payload.event_id ?? '-'}`,
