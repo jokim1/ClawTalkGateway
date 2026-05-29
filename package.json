@@ -28,7 +28,7 @@
   "dependencies": {
     "busboy": "^1.6.0",
     "undici": "^7.22.0",
-    "ws": "^8.18.0"
+    "ws": "^8.20.1"
   },
   "devDependencies": {
     "@types/busboy": "^1.5.0",
